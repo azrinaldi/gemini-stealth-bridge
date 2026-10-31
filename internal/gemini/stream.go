@@ -362,6 +362,7 @@ func (ac *AccountClient) streamGenerateLocked(
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
 	defLang := ac.locale
+	authUser := ac.authUser
 	ac.mu.RUnlock()
 	if leasedCookie != "" {
 		cookie = leasedCookie
@@ -377,6 +378,9 @@ func (ac *AccountClient) streamGenerateLocked(
 	q := url.Values{}
 	q.Set("hl", lang)
 	q.Set("_reqid", strconv.FormatInt(ac.nextReqID(), 10))
+	if authUser > 0 {
+		q.Set("authuser", strconv.Itoa(authUser))
+	}
 	if bl != "" {
 		q.Set("bl", bl)
 	}
@@ -789,6 +793,7 @@ func (ac *AccountClient) deleteConversationAsync(cid string) {
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
 	lang := ac.locale
+	authUser := ac.authUser
 	ac.mu.RUnlock()
 	if lang == "" {
 		lang = "en"
@@ -797,7 +802,14 @@ func (ac *AccountClient) deleteConversationAsync(cid string) {
 	freqBytes, _ := json.Marshal([][][]any{{{"GzXR5e", string(payloadBytes), nil, "generic"}}})
 	q := url.Values{}
 	q.Set("rpcids", "GzXR5e")
-	q.Set("source-path", "/app")
+	sourcePath := "/app"
+	if authUser > 0 {
+		sourcePath = "/u/" + strconv.Itoa(authUser) + "/app"
+	}
+	q.Set("source-path", sourcePath)
+	if authUser > 0 {
+		q.Set("authuser", strconv.Itoa(authUser))
+	}
 	if bl != "" {
 		q.Set("bl", bl)
 	}

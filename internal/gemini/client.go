@@ -105,6 +105,7 @@ type AccountClient struct {
 	locale           string
 	blOverride       string
 	protocolMode     string
+	authUser         int
 }
 
 // NewAccountClient creates an AccountClient for a specific Google account.
@@ -139,6 +140,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.at = rec.AT
 	ac.bl = rec.BL
 	ac.fSid = rec.FSid
+	ac.authUser = rec.AuthUser
 	ac.fileMtimeMs = mtime
 	ac.capturedAt = rec.CapturedAt
 	ac.rotatedAt = rec.RotatedAt
@@ -277,6 +279,8 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	if rec.FSid != "" {
 		ac.fSid = rec.FSid
 	}
+	ac.authUser = rec.AuthUser
+
 	if rec.CapturedAt != "" {
 		ac.capturedAt = rec.CapturedAt
 	}
@@ -406,6 +410,7 @@ func (ac *AccountClient) persistState() {
 		AT:               ac.at,
 		BL:               ac.bl,
 		FSid:             ac.fSid,
+		AuthUser:         ac.authUser,
 		CapturedAt:       ac.capturedAt,
 		RotatedAt:        ac.rotatedAt,
 		CookieDB:         ac.cookieDB,
@@ -474,10 +479,17 @@ func (ac *AccountClient) Bootstrap(ctx context.Context) error {
 }
 
 func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.StealthClient) error {
-	doFetchApp := func() (*transport.Response, error) {
+	ac.mu.RLock()
+	authUser := ac.authUser
+	ac.mu.RUnlock()
+	appURL := Origin + "/app"
+	if authUser > 0 {
+		appURL = Origin + "/u/" + strconv.Itoa(authUser) + "/app"
+	}
+	doFetchURL := func(target string) (*transport.Response, error) {
 		res, err := sc.Do(ctx, transport.RequestOptions{
 			Method:  "GET",
-			URL:     Origin + "/app",
+			URL:     target,
 			Kind:    transport.ReqKindNavigate,
 			Headers: map[string]string{"cookie": ac.CookieHeader()},
 			Timeout: 30 * time.Second,
@@ -488,10 +500,21 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 		ac.absorbAndPersistCookies(res.SetCookies)
 		return res, nil
 	}
+	doFetchApp := func() (*transport.Response, error) { return doFetchURL(appURL) }
 
 	res, err := doFetchApp()
 	if err != nil {
 		return err
+	}
+	// A stored authUser may not resolve (e.g. the account is no longer on the
+	// Google account chooser, or the cookies belong to the profile's primary
+	// account). Fall back to the default /app surface instead of failing.
+	if authUser > 0 && (res.Status == 301 || res.Status == 302 || res.Status == 303 || res.Status == 307 || res.Status == 308) {
+		appURL = Origin + "/app"
+		res, err = doFetchApp()
+		if err != nil {
+			return err
+		}
 	}
 
 	at := ""
@@ -677,20 +700,29 @@ func (ac *AccountClient) doBatchExec(ctx context.Context, sc *transport.StealthC
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
 	hl := ac.locale
+	authUser := ac.authUser
 	ac.mu.RUnlock()
 	if hl == "" {
 		hl = "en"
 	}
 
+	sourcePath := "/app"
+	if authUser > 0 {
+		sourcePath = "/u/" + strconv.Itoa(authUser) + "/app"
+	}
+
 	reqID := ac.nextReqID()
 	q := url.Values{}
 	q.Set("rpcids", rpcID)
-	q.Set("source-path", "/app")
+	q.Set("source-path", sourcePath)
 	q.Set("bl", bl)
 	q.Set("f.sid", fSid)
 	q.Set("hl", hl)
 	q.Set("_reqid", strconv.FormatInt(reqID, 10))
 	q.Set("rt", "c")
+	if authUser > 0 {
+		q.Set("authuser", strconv.Itoa(authUser))
+	}
 
 	freq, _ := json.Marshal([][][]any{{{rpcID, payloadJSON, nil, "generic"}}})
 	form := url.Values{}

@@ -39,6 +39,7 @@ type CredentialFile struct {
 	AT               string            `json:"at,omitempty"`
 	BL               string            `json:"bl,omitempty"`
 	FSid             string            `json:"fSid,omitempty"`
+	AuthUser         int               `json:"authUser,omitempty"`
 	CapturedAt       string            `json:"capturedAt"`
 	RotatedAt        string            `json:"rotatedAt,omitempty"`
 	CookieDB         string            `json:"cookieDb,omitempty"`
