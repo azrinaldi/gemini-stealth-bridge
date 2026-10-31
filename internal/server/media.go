@@ -8,8 +8,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"math"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -256,28 +262,115 @@ type mediaGenParams struct {
 	OutputPath  string
 }
 
-func normalizeAspectRatio(ar, size string) string {
-	switch strings.TrimSpace(strings.ToLower(ar)) {
-	case "16:9", "landscape", "widescreen":
-		return "16:9"
-	case "9:16", "portrait", "vertical":
-		return "9:16"
-	case "4:3":
-		return "4:3"
-	case "3:4":
-		return "3:4"
-	case "1:1", "square":
-		return "1:1"
+// supportedAspectRatios are the ratios the Gemini Web image generator accepts.
+// They are passed to the model as prompt qualifiers, not as a structured API
+// field, so anything outside this set has to be snapped to the nearest entry.
+var supportedAspectRatios = []struct {
+	label string
+	value float64
+}{
+	{"1:1", 1.0},
+	{"4:3", 4.0 / 3.0},
+	{"3:4", 3.0 / 4.0},
+	{"16:9", 16.0 / 9.0},
+	{"9:16", 9.0 / 16.0},
+}
+
+// aspectRatioAliases maps loose client spellings onto a canonical ratio.
+var aspectRatioAliases = map[string]string{
+	"landscape": "16:9", "widescreen": "16:9", "horizontal": "16:9",
+	"portrait": "9:16", "vertical": "9:16",
+	"square": "1:1",
+	"4:3":    "4:3", "3:4": "3:4",
+	"16:9": "16:9", "9:16": "9:16", "1:1": "1:1",
+}
+
+// snapAspectRatio returns the supported ratio closest to the requested value.
+func snapAspectRatio(value float64) string {
+	best := supportedAspectRatios[0]
+	bestDelta := math.Abs(value - best.value)
+	for _, candidate := range supportedAspectRatios[1:] {
+		if delta := math.Abs(value - candidate.value); delta < bestDelta {
+			best, bestDelta = candidate, delta
+		}
 	}
-	switch strings.TrimSpace(strings.ToLower(size)) {
-	case "1792x1024", "1536x1024", "1920x1080":
-		return "16:9"
-	case "1024x1792", "1024x1536", "1080x1920":
-		return "9:16"
-	case "1024x1024":
-		return "1:1"
+	return best.label
+}
+
+// parseAspectRatioLabel canonicalises a "W:H" / alias string.
+func parseAspectRatioLabel(raw string) (string, bool) {
+	key := strings.TrimSpace(strings.ToLower(raw))
+	if key == "" {
+		return "", false
 	}
-	return ""
+	if canonical, ok := aspectRatioAliases[key]; ok {
+		return canonical, true
+	}
+	parts := strings.SplitN(key, ":", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	w, errW := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	h, errH := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return "", false
+	}
+	return snapAspectRatio(w / h), true
+}
+
+// parseSizeDimensions reads a "WxH" (or "W*H") size string.
+func parseSizeDimensions(raw string) (float64, float64, bool) {
+	key := strings.TrimSpace(strings.ToLower(raw))
+	if key == "" {
+		return 0, 0, false
+	}
+	normalised := strings.ReplaceAll(key, "*", "x")
+	normalised = strings.ReplaceAll(normalised, "×", "x")
+	parts := strings.SplitN(normalised, "x", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	w, errW := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	h, errH := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+// resolveAspectRatio reconciles the two shape hints a client may send.
+//
+// aspect_ratio is authoritative; size is accepted as a convenience and is
+// translated from its pixel dimensions rather than from a fixed allow-list, so
+// any real ratio (1280x720, 2560x1440, 1200x630, ...) resolves correctly. When
+// both are supplied and disagree, the request is rejected instead of silently
+// dropping one of them.
+func resolveAspectRatio(ar, size string) (string, error) {
+	fromAR, hasAR := parseAspectRatioLabel(ar)
+
+	var fromSize string
+	hasSize := false
+	if w, h, ok := parseSizeDimensions(size); ok {
+		fromSize = snapAspectRatio(w / h)
+		hasSize = true
+	} else if strings.TrimSpace(size) != "" {
+		return "", fmt.Errorf("invalid size %q: expected pixel dimensions such as \"1024x1024\"", size)
+	}
+
+	if strings.TrimSpace(ar) != "" && !hasAR {
+		return "", fmt.Errorf("invalid aspect_ratio %q: expected one of 1:1, 4:3, 3:4, 16:9, 9:16", ar)
+	}
+
+	switch {
+	case hasAR && hasSize && fromAR != fromSize:
+		return "", fmt.Errorf("conflicting shape hints: aspect_ratio %q (%s) contradicts size %q (%s); send only one of them", ar, fromAR, size, fromSize)
+	case hasAR:
+		return fromAR, nil
+	case hasSize:
+		return fromSize, nil
+	default:
+		return "", nil
+	}
 }
 
 func applyGoogleImageURLFormat(rawURL, format string) (string, string, string) {
@@ -316,7 +409,7 @@ func (s *Server) runMediaGenerationOnAccount(
 		return nil, "", transport.NewUpstreamError("prompt is required for media generation", 400, "invalid_request_error", nil, nil)
 	}
 
-	ar := normalizeAspectRatio(params.AspectRatio, "")
+	ar := params.AspectRatio
 	fmtHint := strings.ToLower(strings.TrimSpace(params.Format))
 	var qualifiers []string
 	if ar != "" {
@@ -621,6 +714,30 @@ func formatDirectMediaToolContinuation(images []gemini.GeneratedImage, videos []
 	return fmt.Sprintf(" %s\n\nUser: [Harness tool result for %s]:\n%s\n\nAssistant:", string(synthCallBytes), toolbridge.BuiltinMediaToolName, string(b))
 }
 
+// describeActualAspectRatio inspects the generated bytes and returns the real
+// pixel dimensions plus the ratio they actually resolve to. The generator
+// decides the final size, so reporting the request back would be a lie: a
+// request for 16:9 can legitimately come back as 1376x768.
+func (s *Server) describeActualAspectRatio(ctx context.Context, entry *mediaEntry, declared string) (width, height int, ratio string) {
+	ratio = declared
+	if entry == nil {
+		return 0, 0, ratio
+	}
+	raw, _, err := s.ensureMediaBytes(ctx, entry)
+	if err != nil || len(raw) == 0 {
+		return 0, 0, ratio
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, ratio
+	}
+	width, height = cfg.Width, cfg.Height
+	if snapped := snapAspectRatio(float64(width) / float64(height)); snapped != "" {
+		ratio = snapped
+	}
+	return width, height, ratio
+}
+
 // HandleImageGeneration implements POST /v1/images/generations (OpenAI Images API).
 func (s *Server) HandleImageGeneration(ctx context.Context, w http.ResponseWriter, body map[string]any, scope AuthScope) {
 	s.handleMediaGenerationEndpoint(ctx, w, body, scope, "image")
@@ -655,10 +772,15 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 	if d, ok := body["duration"].(float64); ok {
 		durSec = int(d)
 	}
+	resolvedAR, arErr := resolveAspectRatio(arStr, sizeStr)
+	if arErr != nil {
+		sendChatError(w, false, transport.NewUpstreamError(arErr.Error(), 400, "invalid_request_error", nil, nil))
+		return
+	}
 	mParams := mediaGenParams{
 		MediaType:   mediaType,
 		Prompt:      promptStr,
-		AspectRatio: normalizeAspectRatio(arStr, sizeStr),
+		AspectRatio: resolvedAR,
 		Format:      outFmt,
 		DurationSec: durSec,
 	}
@@ -711,8 +833,14 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 			"revised_prompt": revPrompt,
 			"mime_type":      it.MimeType,
 		}
-		if it.AspectRatio != "" {
-			itemMap["aspect_ratio"] = it.AspectRatio
+		width, height, actualRatio := s.describeActualAspectRatio(ctx, it.Entry, it.AspectRatio)
+		if actualRatio != "" {
+			itemMap["aspect_ratio"] = actualRatio
+		}
+		if width > 0 && height > 0 {
+			itemMap["width"] = width
+			itemMap["height"] = height
+			itemMap["size"] = fmt.Sprintf("%dx%d", width, height)
 		}
 		if it.ThumbnailURL != "" {
 			itemMap["thumbnail_url"] = it.ThumbnailURL
