@@ -803,6 +803,26 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 	}
 
 	items, replyText, err := s.runMediaGenerationOnAccount(ctx, prep.account, prep.model, mediaType, promptStr, mParams)
+	if (err != nil || len(items) == 0) && scope.AccountID == "" {
+		tried := map[string]bool{prep.account.ID: true}
+		fallbackModelName := prep.model.ModelName
+		if strings.EqualFold(strings.TrimSpace(mediaType), "video") {
+			fallbackModelName = "gemini-flash"
+		}
+		for range len(prep.accts) {
+			nextAcct, nextModel := s.pickFallbackAccount(prep.accts, tried, "", fallbackModelName, nil)
+			if nextAcct == nil || nextModel == nil {
+				break
+			}
+			tried[nextAcct.ID] = true
+			items, replyText, err = s.runMediaGenerationOnAccount(ctx, nextAcct, nextModel, mediaType, promptStr, mParams)
+			if err == nil && len(items) > 0 {
+				prep.account = nextAcct
+				prep.model = nextModel
+				break
+			}
+		}
+	}
 	if err != nil {
 		sendChatError(w, false, err)
 		return

@@ -1289,12 +1289,19 @@ func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, h
 		}
 	}
 
-	// Sticky: the cursor account keeps serving until it cannot.
-	for i := 0; i < len(accts); i++ {
-		a := at(i)
-		if _, ok := s.accountReady(a, requested); ok {
-			s.setRotateCursor(a.ID)
-			return a
+	// Two-pass selection:
+	// Pass 0: Prefer an account that is ready AND not currently busy.
+	// Pass 1: If all ready accounts are busy, accept a busy account to queue.
+	for pass := 0; pass < 2; pass++ {
+		for i := 0; i < len(accts); i++ {
+			a := at(i)
+			if _, ok := s.accountReady(a, requested); ok {
+				if pass == 0 && s.isAccountBusy(a.ID) {
+					continue
+				}
+				s.setRotateCursor(a.ID)
+				return a
+			}
 		}
 	}
 
