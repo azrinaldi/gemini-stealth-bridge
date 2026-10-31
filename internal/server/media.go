@@ -346,6 +346,15 @@ func parseSizeDimensions(raw string) (float64, float64, bool) {
 // both are supplied and disagree, the request is rejected instead of silently
 // dropping one of them.
 func resolveAspectRatio(ar, size string) (string, error) {
+	// OpenAI's images API allows size "auto" (gpt-image-1), and pass-through
+	// clients forward it. It carries no shape information, so treat it — in
+	// either field — as absent rather than rejecting the request.
+	if strings.EqualFold(strings.TrimSpace(ar), "auto") {
+		ar = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(size), "auto") {
+		size = ""
+	}
 	fromAR, hasAR := parseAspectRatioLabel(ar)
 
 	var fromSize string
@@ -588,13 +597,14 @@ func (s *Server) executeServerSideMediaCalls(
 		}
 		items, replyText, genErr := s.runMediaGenerationOnAccount(ctx, account, model, mType, mPrompt, mParams)
 		if (genErr != nil || len(items) == 0) && scope.AccountID == "" {
+			originGroup := account.AccountGroup
 			tried := map[string]bool{account.ID: true}
 			fallbackModelName := model.ModelName
 			if strings.EqualFold(strings.TrimSpace(mType), "video") {
 				fallbackModelName = "gemini-flash"
 			}
 			for range len(accts) {
-				nextAcct, nextModel := s.pickFallbackAccount(accts, tried, "", fallbackModelName, nil)
+				nextAcct, nextModel := s.pickFallbackAccount(accts, tried, originGroup, fallbackModelName, nil)
 				if nextAcct == nil || nextModel == nil {
 					break
 				}
@@ -804,13 +814,14 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 
 	items, replyText, err := s.runMediaGenerationOnAccount(ctx, prep.account, prep.model, mediaType, promptStr, mParams)
 	if (err != nil || len(items) == 0) && scope.AccountID == "" {
+		originGroup := prep.account.AccountGroup
 		tried := map[string]bool{prep.account.ID: true}
 		fallbackModelName := prep.model.ModelName
 		if strings.EqualFold(strings.TrimSpace(mediaType), "video") {
 			fallbackModelName = "gemini-flash"
 		}
 		for range len(prep.accts) {
-			nextAcct, nextModel := s.pickFallbackAccount(prep.accts, tried, "", fallbackModelName, nil)
+			nextAcct, nextModel := s.pickFallbackAccount(prep.accts, tried, originGroup, fallbackModelName, nil)
 			if nextAcct == nil || nextModel == nil {
 				break
 			}
