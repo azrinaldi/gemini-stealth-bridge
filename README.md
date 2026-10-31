@@ -985,8 +985,10 @@ Fields:
 | `prompt` | Required |
 | `model` | Optional. Empty, `dall-e*`, `gpt-image*`, `imagen*`, and `veo*` map to `gemini-pro` |
 | `response_format` | `url` (default) or `b64_json` |
-| `size` | OpenAI sizes mapped to aspect ratios: `1792x1024`/`1536x1024`/`1920x1080` → `16:9`; `1024x1792`/`1024x1536`/`1080x1920` → `9:16`; `1024x1024` → `1:1` |
-| `aspect_ratio` | `1:1`, `16:9`, `9:16`, `4:3`, `3:4` (also `square`, `landscape`, `portrait`) |
+| `size` | Parsed as `WxH` and snapped to the nearest supported ratio (e.g. `1280x720` → `16:9`); `auto` is accepted and ignored |
+| `aspect_ratio` | `1:1`, `16:9`, `9:16`, `4:3`, `3:4` (also `square`, `landscape`, `portrait`, or any `W:H`, snapped to the nearest supported ratio) |
+
+`size` and `aspect_ratio` must agree when both are sent; a conflict or a malformed value returns `400 invalid_request_error`. The generator decides the final dimensions, so the response reports the *produced* `width`, `height`, `size`, and the ratio they resolve to rather than echoing the request.
 | `format` / `output_format` | `png` (lossless `=s0-rp`), `jpeg` (original `=s0-d`), or `gif` |
 
 Response:
@@ -999,7 +1001,10 @@ Response:
       "url": "http://127.0.0.1:20133/v1/media/<id>.png",
       "revised_prompt": "…",
       "mime_type": "image/png",
-      "aspect_ratio": "16:9"
+      "aspect_ratio": "16:9",
+      "width": 1376,
+      "height": 768,
+      "size": "1376x768"
     }
   ]
 }

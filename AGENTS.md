@@ -176,6 +176,8 @@ Supported: Chrome, Chromium, Brave, Edge, Vivaldi, Arc, Firefox.
 - Linux keyring-backed cookies may require `secret-tool` and an unlocked keyring.
 - Windows DPAPI requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export.
 
+**Multi-account Chrome profiles:** a profile signed in to several Google accounts always imports the profile's *primary* account, because Chromium stores one cookie set per domain. To target a secondary account, set `"authUser": <N>` in the account JSON after import (the index from Google's `/u/N/app` surface). Bootstrap fetches `/u/N/app` and falls back to `/app` if the index no longer resolves. There is no auto-detection: Chrome's `account_info` order does not reliably map to `/u/N`, so guessing could attribute the session to the wrong account.
+
 Cookie export is the fallback when browser decryption is unavailable:
 
 ```sh
@@ -544,7 +546,7 @@ MIME type is detected from magic bytes, not trusted from the URL.
    - `gsb` enables media extensions and rewrites upstream media URLs to local `/v1/media/<id>` URLs.
 
 3. **Dedicated endpoints**
-   - `POST /v1/images/generations` — `prompt`, `model`, `response_format` (`url`|`b64_json`), `size`, `aspect_ratio`, `format`/`output_format`.
+   - `POST /v1/images/generations` — `prompt`, `model`, `response_format` (`url`|`b64_json`), `size`, `aspect_ratio`, `format`/`output_format`. `size` is parsed as `WxH` and snapped to the nearest supported ratio (`auto` is accepted and ignored); when both shape hints are sent they must agree, and a conflict or malformed value returns `400`. The response reports the produced `width`/`height`/`size` instead of echoing the request.
    - `POST /v1/videos/generations` — `prompt`, `aspect_ratio`, `duration`, returns MP4 `url` plus `thumbnail_url`.
 
 ### 11.3 Media URLs
@@ -848,7 +850,7 @@ $BRIDGE_HOME/
     └── acc2.json
 ```
 
-Account files contain: `kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
+Account files contain: `kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `authUser`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
 
 Permissions: `0600` for account files, `session-cache.json`, and `config.env`; `0700` for directories.
 
