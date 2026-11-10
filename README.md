@@ -73,6 +73,11 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.1
+- **Frontier model rename handled**: upstream renamed the top tier from `gemini-argon` to `gemini-carbon` on 2026-11-10. `gemini-carbon` is now recognised as a reasoning model, so it no longer falls back to the lowest thinking level, and it carries a documented 1M/64k limit instead of the configured guess. Pin clients from `GET /v1/models`; a name upstream has dropped returns `404 model_not_found`.
+- **Documented limits actually apply**: the limit table was keyed from `displayName`, but the live registry carries the versioned name in `description` and a UI label in `displayName`, so every model silently reported `limitsSource: config`. Each candidate is now tried in turn.
+- **Frontier quota attribution**: the quota bucket behind the top tier is still named "Gemini Pro", so both the current and previous tier names map to it when reporting an exhausted bucket.
+
 ### What's new in v0.4.0
 
 - **Web search grounding**: answers include a `Sources:` list; `BRIDGE_INCLUDE_GROUNDING=0` suppresses it.
