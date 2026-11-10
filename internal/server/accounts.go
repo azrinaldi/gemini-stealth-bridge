@@ -745,8 +745,12 @@ func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName s
 func modelFamilyTokens(modelName string) []string {
 	name := strings.ToLower(modelName)
 	var family []string
-	if strings.Contains(name, "argon") {
-		family = append(family, "argon", "pro")
+	// The frontier tier is billed against the "Gemini Pro" quota bucket. Upstream
+	// renamed it (Argon, now Carbon) while keeping that bucket name, so both names
+	// must map to the same family or an exhausted bucket is reported against the
+	// wrong model.
+	if strings.Contains(name, "argon") || strings.Contains(name, "carbon") {
+		family = append(family, "argon", "carbon", "pro")
 	}
 	for _, tok := range []string{"pro", "flash", "thinking"} {
 		if strings.Contains(name, tok) {

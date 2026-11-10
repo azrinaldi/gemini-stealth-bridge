@@ -278,7 +278,7 @@ Sources: `batchexecute` RPC `qpEbW` (`CHECK_GEMINI_QUOTA`) plus GraphQL `GetUser
 
 The 5-hour window is nested under the weekly allowance, so effective 5-hour remaining is capped at weekly remaining.
 
-When an account reaches `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or downgraded until `resetAt`; `gemini-flash-lite` remains usable.
+When an account reaches `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded until `resetAt`; `gemini-flash-lite` remains usable.
 
 ### 7.2 Synthetic cooldowns
 
@@ -597,7 +597,7 @@ A grounded answer is a **full model turn**, not a search-API lookup. Measured se
 | Argument | Required | Notes |
 |---|---|---|
 | `query` | Yes | Search query or question |
-| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon` |
+| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-carbon` |
 | `timeout_seconds` | No | 10–600; default from `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
 
 Client config:
@@ -618,7 +618,7 @@ Search behavior:
 
 - runs as a temporary chat, so it does not add threads to the user's Gemini history,
 - uses the same account pool, quota accounting, and failover as chat,
-- model preference order when no override: `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon`, then the account's first model,
+- model preference order when no override: `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-carbon`, then the account's first model,
 - returns `search failed: …` as an MCP tool error (`isError: true`), not a JSON-RPC error,
 - diagnostic headers: `X-GSB-Account`, `X-GSB-Model`, `X-GSB-Duration-Ms`, `X-GSB-Sources`.
 

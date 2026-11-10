@@ -61,22 +61,53 @@ var documentedModelLimits = map[string]ModelLimits{
 	"gemini-3.8-flash":       {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro":         {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro-preview": {ContextWindow: 1048576, MaxOutput: 65536},
-	"gemini-4-argon":         {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-carbon":        {ContextWindow: 1048576, MaxOutput: 65536},
+	// Retained so an account that still serves the pre-rename catalogue keeps its
+	// documented limits rather than falling back to the configured guess.
+	"gemini-4-argon": {ContextWindow: 1048576, MaxOutput: 65536},
+}
+
+// DocumentedModelKeys lists the documented model ids a registry entry could
+// correspond to, most specific first.
+//
+// The live registry carries the versioned name in the description field ("4
+// Carbon") while the display name holds the UI label ("Most complex work"), and
+// older registries had the two the other way round. Every candidate is tried so
+// a labels-are-descriptive response does not silently downgrade all models to
+// the configured fallback.
+func DocumentedModelKeys(m ModelInfo) []string {
+	seen := make(map[string]bool, 3)
+	keys := make([]string, 0, 3)
+	for _, raw := range []string{m.Description, m.DisplayName, m.ModelName} {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		name = strings.TrimPrefix(name, "gemini-")
+		slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
+		if slug == "" {
+			continue
+		}
+		key := "gemini-" + slug
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // DocumentedModelKey derives the documented model id for a registry entry, e.g.
-// "3.5 Flash-Lite" becomes "gemini-3.5-flash-lite".
+// "3.5 Flash-Lite" becomes "gemini-3.5-flash-lite". It returns the first
+// candidate, which is only meaningful for display; use DocumentedModelKeys when
+// the value drives a lookup.
 func DocumentedModelKey(m ModelInfo) string {
-	name := strings.TrimSpace(m.DisplayName)
-	if name == "" {
-		name = strings.TrimSpace(m.ModelName)
-		name = strings.TrimPrefix(name, "gemini-")
-	}
-	slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
-	if slug == "" {
+	keys := DocumentedModelKeys(m)
+	if len(keys) == 0 {
 		return ""
 	}
-	return "gemini-" + slug
+	return keys[0]
 }
 
 // ResolveModelLimits returns the documented limits for a model, falling back to
@@ -84,8 +115,10 @@ func DocumentedModelKey(m ModelInfo) string {
 // reports which of the two was used so callers can tell a verified number from a
 // configured guess.
 func ResolveModelLimits(m ModelInfo, fallbackContext, fallbackOutput int) (ModelLimits, string) {
-	if lim, ok := documentedModelLimits[DocumentedModelKey(m)]; ok {
-		return lim, "documented"
+	for _, key := range DocumentedModelKeys(m) {
+		if lim, ok := documentedModelLimits[key]; ok {
+			return lim, "documented"
+		}
 	}
 	if fallbackContext <= 0 {
 		fallbackContext = 1048576
@@ -208,12 +241,14 @@ var ThinkingLevels = map[string]int{
 // SupportedThinkingEfforts lists the 3 valid thinking effort levels in order.
 var SupportedThinkingEfforts = []string{"low", "medium", "high"}
 
-var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|flash`)
+var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|carbon|flash`)
 
 var explicitReasoningModels = map[string]bool{
 	"gemini-pro":                true,
 	"gemini-flash":              true,
 	"gemini-thinking":           true,
+	"gemini-carbon":             true,
+	"gemini-4-carbon":           true,
 	"gemini-argon":              true,
 	"gemini-4-argon":            true,
 	"gemini-3-pro":              true,

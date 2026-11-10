@@ -284,7 +284,7 @@ func mcpWebSearchToolDef() map[string]any {
 				},
 				"model": map[string]any{
 					"type":        "string",
-					"description": "Optional model override (gemini-flash, gemini-flash-lite, gemini-pro, gemini-argon).",
+					"description": "Optional model override (gemini-flash, gemini-flash-lite, gemini-pro, gemini-carbon).",
 				},
 				"timeout_seconds": map[string]any{
 					"type":        "integer",
@@ -298,7 +298,7 @@ func mcpWebSearchToolDef() map[string]any {
 
 // searchModelPreferences lists the models that can ground a web search, most
 // capable first. A caller-supplied model wins when the account serves it.
-var searchModelPreferences = []string{"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-argon"}
+var searchModelPreferences = []string{"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-carbon"}
 
 // resolveSearchModel picks the model used for a web search on one account.
 func resolveSearchModel(a *AccountState, requested string) *gemini.ModelInfo {
