@@ -260,6 +260,10 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		"authMode":     authMode,
 		"poolKey":      s.displayPoolKey(cfg.APIKey),
 		"rotateCursor": rotCursor,
+		// The live model ids, so the Web UI can show the connection copy chips
+		// from the same registry the API serves. A hardcoded list there went
+		// stale the moment upstream renamed a model.
+		"models": modelNames(s.allModels()),
 		"metrics": map[string]any{
 			"cacheEntries":   s.sessionCacheLen(),
 			"cacheHits":      s.cacheHits.Load(),

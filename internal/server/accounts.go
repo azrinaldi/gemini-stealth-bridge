@@ -372,6 +372,18 @@ func (s *Server) EnsureModels(ctx context.Context, force bool) []*AccountState {
 	return accts
 }
 
+// modelNames returns the model ids in registry order, for callers that need the
+// same list the API serves rather than a written-out copy that can go stale.
+func modelNames(models []gemini.ModelInfo) []string {
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		if name := strings.TrimSpace(m.ModelName); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func (s *Server) allModels() []gemini.ModelInfo {
 	accts := s.Accounts()
 	seen := make(map[string]bool)

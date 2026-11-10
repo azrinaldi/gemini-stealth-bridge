@@ -1320,7 +1320,7 @@
           <div class="conn-pills mono">
             <button type="button" class="copy-chip" data-copy-id="conn-base-url"><span>Base URL:</span> <span class="chip-val" id="conn-base-url">http://127.0.0.1:20133/v1</span></button>
             <button type="button" class="copy-chip" data-copy-id="conn-pool-key"><span>API Key:</span> <span class="chip-val" id="conn-pool-key">gsb-pool</span></button>
-            <button type="button" class="copy-chip" data-copy-text="gemini-flash-lite,gemini-flash,gemini-pro,gemini-argon"><span>Models:</span> <span class="chip-val">gemini-flash-lite, gemini-flash, gemini-pro, gemini-argon</span></button>
+            <button type="button" class="copy-chip" data-copy-id="conn-models"><span>Models:</span> <span class="chip-val" id="conn-models">loading…</span></button>
           </div>
         </div>
 
@@ -2154,6 +2154,13 @@
         document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
         document.getElementById('conn-base-url').textContent = window.location.origin + '/v1';
         document.getElementById('conn-pool-key').textContent = adm.poolKey || 'gsb-pool';
+        // Filled from the live registry, never from a written-out list: a rename
+        // upstream must not leave a stale model id in the copy chip.
+        const liveModels = Array.isArray(adm.models) ? adm.models : [];
+        const modelsChip = document.getElementById('conn-models');
+        if (modelsChip) {
+          modelsChip.textContent = liveModels.length ? liveModels.join(', ') : 'no models loaded yet';
+        }
         document.getElementById('conn-mcp-url').textContent = window.location.origin + '/mcp';
         document.getElementById('conn-mcp-key').textContent = adm.poolKey || 'gsb-pool';
         btnAuthModal.hidden = (adm.authMode === 'local_public');
