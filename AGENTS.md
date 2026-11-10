@@ -597,7 +597,7 @@ A grounded answer is a **full model turn**, not a search-API lookup. Measured se
 | Argument | Required | Notes |
 |---|---|---|
 | `query` | Yes | Search query or question |
-| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-carbon` |
+| `model` | No | Any id from `GET /v1/models`; omit to use the account's default model |
 | `timeout_seconds` | No | 10–600; default from `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
 
 Client config:
@@ -618,7 +618,7 @@ Search behavior:
 
 - runs as a temporary chat, so it does not add threads to the user's Gemini history,
 - uses the same account pool, quota accounting, and failover as chat,
-- model preference order when no override: `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-carbon`, then the account's first model,
+- with no override it uses the account's default model, the same one an unspecified chat request gets, so there is no separate search list to keep in sync,
 - returns `search failed: …` as an MCP tool error (`isError: true`), not a JSON-RPC error,
 - diagnostic headers: `X-GSB-Account`, `X-GSB-Model`, `X-GSB-Duration-Ms`, `X-GSB-Sources`.
 

@@ -284,7 +284,7 @@ func mcpWebSearchToolDef() map[string]any {
 				},
 				"model": map[string]any{
 					"type":        "string",
-					"description": "Optional model override (gemini-flash, gemini-flash-lite, gemini-pro, gemini-carbon).",
+					"description": "Optional model override. Omit to use the account's default model; any id from GET /v1/models is accepted.",
 				},
 				"timeout_seconds": map[string]any{
 					"type":        "integer",
@@ -296,27 +296,14 @@ func mcpWebSearchToolDef() map[string]any {
 	}
 }
 
-// searchModelPreferences lists the models that can ground a web search, most
-// capable first. A caller-supplied model wins when the account serves it.
-var searchModelPreferences = []string{"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-carbon"}
-
 // resolveSearchModel picks the model used for a web search on one account.
+//
+// With no override it uses the same model an unspecified chat request gets, so
+// there is one rule for "the account's default model" instead of a second,
+// written-out list of names here. A caller that wants a specific tier passes it
+// as the tool's `model` argument.
 func resolveSearchModel(a *AccountState, requested string) *gemini.ModelInfo {
-	if requested != "" {
-		return resolveModelOnAccount(a, requested)
-	}
-	for _, name := range searchModelPreferences {
-		if m := resolveModelOnAccount(a, name); m != nil {
-			return m
-		}
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if len(a.Models) == 0 {
-		return nil
-	}
-	m := a.Models[0]
-	return &m
+	return resolveModelOnAccount(a, requested)
 }
 
 // mcpWebSearch runs one grounded search and returns the answer plus its

@@ -1068,7 +1068,7 @@ Behavior:
 | Argument | Required | Notes |
 |---|---|---|
 | `query` | Yes | Search query or question |
-| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-carbon` |
+| `model` | No | Any id from `GET /v1/models`; omit to use the account's default model |
 | `timeout_seconds` | No | 10–600 seconds; defaults to `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
 
 A search runs as a temporary chat on the same account pool, quota accounting, and failover as normal requests. It does not add threads to the user's Gemini history. The result text is the synthesized answer followed by a `Sources:` list; snippets are included when Gemini provided them.

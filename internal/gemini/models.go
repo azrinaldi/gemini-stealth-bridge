@@ -482,9 +482,80 @@ func resolveDefaultThinkingLevel(defaultEffort string) int {
 	}
 }
 
+// ThinkingLevelForModel resolves the thinking level for a registry entry.
+//
+// It exists so the level comes from what upstream published for this model
+// rather than from its name. The name-based heuristics in ThinkingLevelFor are a
+// fallback for a registry that carries no thinking policy; when the registry
+// does answer, a model that was renamed or newly introduced is described
+// correctly without a code change.
+func ThinkingLevelForModel(rawEffort any, m ModelInfo, defaultEffort string) int {
+	caps := ResolveModelCapabilities(m)
+	if len(caps.EffortLevels) == 0 {
+		// No levels advertised for this entry: it cannot think, so any effort the
+		// caller asked for would be a request upstream cannot represent.
+		return 1
+	}
+	want := ""
+	if rawEffort != nil {
+		if s, ok := rawEffort.(string); ok {
+			want = strings.ToLower(strings.TrimSpace(s))
+		}
+	}
+	if want == "" {
+		want = strings.ToLower(strings.TrimSpace(defaultEffortOf(caps, defaultEffort)))
+	}
+	level := normalizeEffortKey(want)
+	for _, advertised := range caps.EffortLevels {
+		if advertised == level {
+			return ThinkingLevels[advertised]
+		}
+	}
+	// The requested level is not one this model offers (a tier may carry only
+	// low/high). Use the model's own advertised default instead of inventing one.
+	if def := caps.DefaultEffort; def != "" {
+		if lvl, ok := ThinkingLevels[def]; ok {
+			return lvl
+		}
+	}
+	if lvl, ok := ThinkingLevels[caps.EffortLevels[0]]; ok {
+		return lvl
+	}
+	return 1
+}
+
+// defaultEffortOf prefers the daemon default when the model offers it, else the
+// model's own advertised default.
+func defaultEffortOf(caps ModelCapabilities, daemonDefault string) string {
+	want := normalizeEffortKey(daemonDefault)
+	for _, advertised := range caps.EffortLevels {
+		if advertised == want {
+			return advertised
+		}
+	}
+	return caps.DefaultEffort
+}
+
+// normalizeEffortKey maps the loose spellings a client may send onto the three
+// Gemini level names.
+func normalizeEffortKey(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "medium", "4", "med":
+		return "medium"
+	case "high", "2", "max", "xhigh", "extended", "enabled", "adaptive", "true":
+		return "high"
+	case "low", "1", "0", "min", "minimal", "none", "off", "disabled", "false":
+		return "low"
+	}
+	return ""
+}
+
 // ThinkingLevelFor resolves the thinking level from a request body effort value
 // and model ID, strictly using Gemini Web's 3 levels: low (1), medium (4), high (2),
 // with default low (1).
+//
+// Prefer ThinkingLevelForModel when a ModelInfo is available: this variant has
+// only a name to go on, so it falls back to name heuristics.
 func ThinkingLevelFor(rawEffort any, modelName, defaultEffort string) int {
 	defLvl := resolveDefaultThinkingLevel(defaultEffort)
 	if rawEffort == nil || rawEffort == "" {

@@ -1748,7 +1748,7 @@ func (s *Server) prepareGeneration(
 		effortVal = "low"
 		tempReq = true
 	}
-	thinkLvl := gemini.ThinkingLevelFor(effortVal, mid, strconv.Itoa(s.Cfg.DefaultThinking))
+	thinkLvl := gemini.ThinkingLevelForModel(effortVal, *model, strconv.Itoa(s.Cfg.DefaultThinking))
 	effortStr := "low"
 	switch thinkLvl {
 	case 4:

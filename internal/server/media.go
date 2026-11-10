@@ -441,9 +441,6 @@ func (s *Server) runMediaGenerationOnAccount(
 	}
 
 	mediaModel := model
-	if flash := resolveModelOnAccount(account, "gemini-flash"); flash != nil {
-		mediaModel = flash
-	}
 	opts := gemini.StreamOptions{
 		Model:           mediaModel,
 		ThinkingLevel:   1,
@@ -600,9 +597,6 @@ func (s *Server) executeServerSideMediaCalls(
 			originGroup := account.AccountGroup
 			tried := map[string]bool{account.ID: true}
 			fallbackModelName := model.ModelName
-			if strings.EqualFold(strings.TrimSpace(mType), "video") {
-				fallbackModelName = "gemini-flash"
-			}
 			for range len(accts) {
 				nextAcct, nextModel := s.pickFallbackAccount(accts, tried, originGroup, fallbackModelName, nil)
 				if nextAcct == nil || nextModel == nil {
@@ -803,7 +797,12 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		"messages": []any{msgs[0]},
 	}
 	if requestedModel == "" || strings.HasPrefix(strings.ToLower(requestedModel), "dall-e") || strings.HasPrefix(strings.ToLower(requestedModel), "gpt-image") || strings.HasPrefix(strings.ToLower(requestedModel), "imagen") || strings.HasPrefix(strings.ToLower(requestedModel), "veo") {
-		prepBody["model"] = "gemini-pro"
+		// The client named an image or video model this bridge does not serve, or
+		// named none. Leave the model unset so prepareGeneration resolves it from
+		// the account's live registry; runMediaGenerationOnAccount then picks the
+		// entry that can actually produce media. Naming one here went stale on the
+		// last upstream rename.
+		delete(prepBody, "model")
 	}
 
 	prep, prepErr := s.prepareGeneration(ctx, prepBody, scope, msgs, nil, nil)
@@ -817,9 +816,6 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		originGroup := prep.account.AccountGroup
 		tried := map[string]bool{prep.account.ID: true}
 		fallbackModelName := prep.model.ModelName
-		if strings.EqualFold(strings.TrimSpace(mediaType), "video") {
-			fallbackModelName = "gemini-flash"
-		}
 		for range len(prep.accts) {
 			nextAcct, nextModel := s.pickFallbackAccount(prep.accts, tried, originGroup, fallbackModelName, nil)
 			if nextAcct == nil || nextModel == nil {
