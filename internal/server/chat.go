@@ -584,7 +584,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" {
+			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
@@ -867,6 +867,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"account_switches":   accountSwitches.Load(),
 				"requested_model":    mid,
 				"served_model":       servedID,
+				"served_label":       servedLabel,
+				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
 				sendChatError(w, headersSent, runCheck)
@@ -933,9 +935,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				content = appendGroundingCitations(textStr, grounding)
 			}
 		}
+		// A relabel is not a substitution: the backend id still names the slot the
+		// client asked for, so the request succeeds, but the label that came back
+		// named a different tier. Reporting it keeps the difference visible
+		// instead of letting "gemini-carbon" silently answer as "4 Argon".
+		labelMismatch := gemini.ServedLabelMismatch(*model, servedID, servedLabel)
 		var served map[string]any
 		if servedID != "" {
 			served = map[string]any{"id": servedID, "label": servedLabel}
+			if labelMismatch {
+				served["label_mismatch"] = true
+			}
 		}
 
 		usage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
@@ -1003,7 +1013,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 			}
-			if served != nil && servedID != model.ModelID {
+			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
 			emit(sseDeltaEmpty{}, finish, usage)
@@ -1038,7 +1048,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				},
 				"usage": usage,
 			}
-			if served != nil && servedID != model.ModelID {
+			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				payload["requested_model"] = mid
 				payload["model_served"] = served
 			}
@@ -1082,6 +1092,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"account_switches":   accountSwitches.Load(),
 			"requested_model":    mid,
 			"served_model":       servedID,
+			"served_label":       servedLabel,
+			"label_mismatch":     labelMismatch,
 		})
 
 		account.mu.Lock()
@@ -1128,6 +1140,18 @@ func (s *Server) evaluateAttemptCompletion(
 			subErr.Headers = qHdrs
 		}
 		return nil, subErr
+	}
+	if s.Cfg.RejectLabelMismatch && gemini.ServedLabelMismatch(model, servedID, servedLabel) {
+		// Opt-in strictness: the id named the requested slot, but the label says a
+		// different tier answered. That is only detectable from the label, so a
+		// deployment that needs certainty about the tier must fail here.
+		return nil, transport.NewUpstreamError(
+			fmt.Sprintf("requested %s but upstream answered as %q on account %s", mid, servedLabel, account.ID),
+			502,
+			"model_label_mismatch",
+			nil,
+			nil,
+		)
 	}
 	if streamErr != nil && !errors.Is(streamErr, transport.ErrStopStreaming) {
 		return nil, streamErr

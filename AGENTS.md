@@ -769,6 +769,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | `0` disables |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | `0` disables |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject silent substitution |
+| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included |
 | `BRIDGE_QUIET_HOURS` | empty | `HH:MM-HH:MM`; pauses background work only |
 
 ### 15.6 Generation, history, tools

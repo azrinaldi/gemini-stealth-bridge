@@ -89,6 +89,12 @@ type Config struct {
 	EnvFile                 string
 	FieldSources            map[string]string
 	Warnings                []string
+	// RejectLabelMismatch turns a relabel into an error instead of a reported
+	// fact. Upstream can rename a tier in place (same backend id, new catalogue
+	// name), so the served label is the only evidence of what actually answered.
+	// Reporting is the default because rejecting would take the renamed tier
+	// offline; strict deployments can opt in.
+	RejectLabelMismatch bool
 }
 
 // ThinkingLevels maps Gemini Web's 3 thinking levels ("low", "medium", "high") to
@@ -293,6 +299,7 @@ func FromEnv() *Config {
 		SearchTimeout:           time.Duration(lookupPositiveInt("BRIDGE_SEARCH_TIMEOUT_MS", 180000, 10000)) * time.Millisecond,
 		Temporary:               lookupBool("BRIDGE_TEMPORARY", false),
 		RejectDowngrade:         lookupBool("BRIDGE_REJECT_DOWNGRADE", true),
+		RejectLabelMismatch:     lookupBool("BRIDGE_REJECT_LABEL_MISMATCH", false),
 		LiveThoughts:            lookupBool("BRIDGE_LIVE_THOUGHTS", true),
 		SessionCache:            lookupBool("BRIDGE_SESSION_CACHE", true),
 		KeepToolPreamble:        lookupBool("BRIDGE_TOOL_PREAMBLE", false),

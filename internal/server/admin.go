@@ -275,6 +275,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 			"accountStrategy":         cfg.AccountStrategy,
 			"accountPriority":         prio,
 			"rejectDowngrade":         cfg.RejectDowngrade,
+			"rejectLabelMismatch":     cfg.RejectLabelMismatch,
 			"quotaPreflight":          cfg.QuotaPreflight,
 			"maxRpmPerAccount":        cfg.MaxRPMPerAccount,
 			"maxConcurrentPerAccount": cfg.MaxConcurrentPerAccount,
@@ -288,6 +289,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 			"accountStrategy":         sourceOrDefault(sources, "BRIDGE_ACCOUNT_STRATEGY"),
 			"accountPriority":         sourceOrDefault(sources, "BRIDGE_ACCOUNT_PRIORITY"),
 			"rejectDowngrade":         sourceOrDefault(sources, "BRIDGE_REJECT_DOWNGRADE"),
+			"rejectLabelMismatch":     sourceOrDefault(sources, "BRIDGE_REJECT_LABEL_MISMATCH"),
 			"quotaPreflight":          sourceOrDefault(sources, "BRIDGE_QUOTA_PREFLIGHT"),
 			"maxRpmPerAccount":        sourceOrDefault(sources, "BRIDGE_MAX_RPM_PER_ACCOUNT"),
 			"maxConcurrentPerAccount": sourceOrDefault(sources, "BRIDGE_MAX_CONCURRENT_PER_ACCOUNT"),
@@ -516,6 +518,7 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 		target  *bool
 	}{
 		{"rejectDowngrade", "BRIDGE_REJECT_DOWNGRADE", &cfg.RejectDowngrade},
+		{"rejectLabelMismatch", "BRIDGE_REJECT_LABEL_MISMATCH", &cfg.RejectLabelMismatch},
 		{"liveThoughts", "BRIDGE_LIVE_THOUGHTS", &cfg.LiveThoughts},
 		{"liveToolCalls", "BRIDGE_LIVE_TOOL_CALLS", &cfg.LiveToolCalls},
 		{"keepToolPreamble", "BRIDGE_TOOL_PREAMBLE", &cfg.KeepToolPreamble},

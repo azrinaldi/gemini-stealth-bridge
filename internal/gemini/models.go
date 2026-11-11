@@ -419,6 +419,65 @@ func MatchesModel(m ModelInfo, wanted string) bool {
 	return false
 }
 
+// normalizeServedLabel reduces a served model label to a comparable slug:
+// "Gemini 4 Argon High" -> "argon", "3.5 Flash-Lite" -> "flash-lite".
+func normalizeServedLabel(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	s = strings.TrimPrefix(s, "gemini")
+	s = strings.TrimLeft(s, " -")
+	return strings.Join(strings.Fields(s), "-")
+}
+
+// stripVersionTokens removes pure version tokens ("4", "3.5") from a label slug
+// so "4 Carbon" and "carbon" compare equal.
+func stripVersionTokens(s string) string {
+	parts := strings.Split(s, "-")
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		isVer := true
+		for i := range len(p) {
+			if (p[i] < '0' || p[i] > '9') && p[i] != '.' {
+				isVer = false
+				break
+			}
+		}
+		if !isVer {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "-")
+}
+
+// servedLabelNames lists the slugs a served label may legitimately carry for
+// this registry entry: the model name, the display name, and the versioned
+// description. The registry moved the tier name into the description ("4
+// Carbon") while the display name became a UI phrase ("Most complex work"), so
+// comparing against the display name alone would reject every real answer.
+func servedLabelNames(m ModelInfo) []string {
+	names := make([]string, 0, 3)
+	for _, raw := range []string{m.ModelName, m.DisplayName, m.Description} {
+		if s := normalizeServedLabel(raw); s != "" {
+			names = append(names, s)
+		}
+	}
+	return names
+}
+
+// stripThinkingSuffix drops a trailing thinking-level word from a label slug.
+// Upstream labels an answer with the effort it used ("4 Argon High"), and that
+// suffix says nothing about which tier answered.
+func stripThinkingSuffix(s string) string {
+	for _, suffix := range []string{"-low", "-medium", "-high", "-thinking"} {
+		if strings.HasSuffix(s, suffix) {
+			return strings.TrimSuffix(s, suffix)
+		}
+	}
+	return s
+}
+
 // IsMatchingServedModel checks whether the upstream frame's answeredModelId /
 // answeredModelLabel matches the requested ModelInfo (preventing silent downgrades).
 func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
@@ -428,46 +487,53 @@ func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
 		}
 	}
 	if servedLabel != "" {
-		norm := func(s string) string {
-			s = strings.TrimSpace(strings.ToLower(s))
-			s = strings.TrimPrefix(s, "gemini")
-			s = strings.TrimLeft(s, " -")
-			return strings.Join(strings.Fields(s), "-")
-		}
-		stripVer := func(s string) string {
-			parts := strings.Split(s, "-")
-			var kept []string
-			for _, p := range parts {
-				if p == "" {
-					continue
-				}
-				isVer := true
-				for i := range len(p) {
-					if (p[i] < '0' || p[i] > '9') && p[i] != '.' {
-						isVer = false
-						break
-					}
-				}
-				if !isVer {
-					kept = append(kept, p)
-				}
+		s := stripThinkingSuffix(normalizeServedLabel(servedLabel))
+		for _, name := range servedLabelNames(m) {
+			if s == name {
+				return true
 			}
-			return strings.Join(kept, "-")
-		}
-		s := norm(servedLabel)
-		d := norm(m.DisplayName)
-		n := norm(m.ModelName)
-		if s != "" && (s == d || s == n) {
-			return true
 		}
 		if servedID == "" || m.ModelID == "" {
-			sv := stripVer(s)
-			if sv != "" && (sv == stripVer(d) || sv == stripVer(n)) {
-				return true
+			sv := stripVersionTokens(s)
+			for _, name := range servedLabelNames(m) {
+				if sv != "" && sv == stripVersionTokens(name) {
+					return true
+				}
 			}
 		}
 	}
 	return false
+}
+
+// ServedLabelMismatch reports whether the upstream answer was labelled with a
+// different tier than the registry entry names, while the model id still
+// matched. Upstream renames a tier in place: on 2026-11-10 the slot kept id
+// 95a4c0abcba24364 but the catalogue called it Carbon while answers still said
+// "4 Argon". The id comparison alone accepted that silently, so a client asking
+// for the new tier could not tell it was still served the old one.
+func ServedLabelMismatch(m ModelInfo, servedID, servedLabel string) bool {
+	if servedLabel == "" {
+		return false
+	}
+	if servedID != "" && m.ModelID != "" && !strings.EqualFold(servedID, m.ModelID) {
+		// A different backend id is a substitution, not a relabel; the
+		// downgrade check already covers it.
+		return false
+	}
+	s := stripThinkingSuffix(normalizeServedLabel(servedLabel))
+	if s == "" {
+		return false
+	}
+	sv := stripVersionTokens(s)
+	for _, name := range servedLabelNames(m) {
+		if s == name {
+			return false
+		}
+		if sv != "" && sv == stripVersionTokens(name) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveDefaultThinkingLevel maps a default effort string or enum number to 1 (low), 4 (medium), or 2 (high).

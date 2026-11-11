@@ -1056,7 +1056,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 			if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" {
+			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
@@ -1333,6 +1333,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"account_switches":   accountSwitches.Load(),
 				"requested_model":    mid,
 				"served_model":       servedID,
+				"served_label":       servedLabel,
+				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
 				sendChatError(w, headersSent, runCheck)
@@ -1689,6 +1691,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"account_switches":   accountSwitches.Load(),
 			"requested_model":    mid,
 			"served_model":       servedID,
+			"served_label":       servedLabel,
+			"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 		})
 
 		account.mu.Lock()
