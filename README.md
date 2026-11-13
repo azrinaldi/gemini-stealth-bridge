@@ -73,6 +73,8 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.4
+- **The SSE grace timer actually runs in a default deployment**: `BRIDGE_EARLY_SSE_GRACE_MS` was gated on downgrade rejection being disabled, and that guard is on by default, so the timer never fired where it was needed. A thinking-heavy tier therefore held its response headers for minutes and a reverse proxy abandoned the request with "timeout awaiting response headers" while the bridge was still working. The grace flush now applies whenever buffering would otherwise outlast it; the downgrade guard keeps running on the stream body, which stops a mismatch just as the status line did.
 ### What's new in v0.4.3
 - **The published model id is the versioned one**: the catalogue keeps the short tier name in the category (`Carbon`) while the description carries the product name (`4 Carbon`). `GET /v1/models` now publishes `gemini-4-carbon`, `gemini-3.1-pro` and `gemini-3.5-flash-lite`, which is what a capability table downstream is keyed by. The bare spellings (`gemini-carbon`, `gemini-pro`, `gemini-flash-lite`) remain as aliases and still resolve.
 - **Why it mattered**: a bare id matched no versioned capability row in front of the bridge, so `reasoning_effort` was dropped before it arrived and the model was advertised with a 128k window and no thinking levels. Requests to a bare id now reach the bridge with the effort the client asked for.
@@ -674,7 +676,7 @@ Chat, Responses, and MCP responses can include:
 | `Retry-After` | Seconds to wait when quota/rate limited |
 | `X-Resets-At` | RFC 3339 quota reset timestamp, when known |
 
-Chat and Responses stream headers flush as soon as the served model identity is verified. When downgrade rejection is disabled or `BRIDGE_STREAM_BUFFER=eager` is set, `BRIDGE_EARLY_SSE` and `BRIDGE_EARLY_SSE_GRACE_MS` can flush them earlier so long thinking turns do not hit proxy header timeouts.
+Chat and Responses stream headers flush as soon as the served model identity is verified. If that takes longer than `BRIDGE_EARLY_SSE_GRACE_MS` (20000 by default), the headers and a keep-alive ping flush anyway and the downgrade check continues on the stream body, so a thinking-heavy tier does not lose the client to a reverse proxy's response-header timeout. `0` disables the early flush and holds the headers until the first frame.
 
 ### 8.3 Error format and codes
 
@@ -1294,8 +1296,8 @@ Models with documented limits always use the documented value; `capabilities.lim
 | `BRIDGE_TOOL_SCHEMA_COMPACT` | `true` | Compact tool schemas in the prompt contract |
 | `BRIDGE_TOOL_DESC_MAX_CHARS` | `400` | Maximum tool-description length in the compact contract (minimum 64) |
 | `BRIDGE_STREAM_BUFFER` | `verified` | `verified` buffers until model identity is verified; `eager` streams earlier |
-| `BRIDGE_EARLY_SSE` | `false` | Flush streaming headers immediately when downgrade rejection is disabled or `BRIDGE_STREAM_BUFFER=eager` |
-| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Under the same conditions, flush headers after this long even if the first frame has not arrived; `0` keeps them buffered |
+| `BRIDGE_EARLY_SSE` | `false` | Flush streaming headers immediately instead of waiting for the identity check (requires `BRIDGE_STREAM_BUFFER=eager` or downgrade rejection off) |
+| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Flush headers after this long even if identity is unverified and no frame has arrived; the downgrade check then runs on the body. `0` keeps them buffered |
 | `BRIDGE_MAX_ATTEMPTS` | `3` | Total attempts per request, including failover (1–10) |
 | `BRIDGE_MAX_UPSTREAM_ATTEMPTS` | `3` | Maximum upstream calls per request (1–10) |
 | `BRIDGE_RETRY_BUDGET_MS` | `150000` | Total wall-clock budget for retries; `0` disables the deadline |

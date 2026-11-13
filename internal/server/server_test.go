@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2003,13 +2004,21 @@ func TestRotateFallbackAdvancesAndWraps(t *testing.T) {
 	}
 }
 
-func TestGraceDoesNotCommitStrictHeadersBeforeIdentity(t *testing.T) {
+// The grace timer exists so a proxy with a response-header timeout does not
+// abandon a request the upstream is still thinking about. It used to be gated
+// on `!RejectDowngrade`, which is on by default, so the timer never ran in a
+// default deployment and a slow model still lost its client at the proxy's
+// timeout. Headers must now flush once the grace elapses in strict mode too; the
+// downgrade guard keeps working on the stream body.
+func TestGraceFlushesStrictHeadersBeforeIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
 
+	frameSent := make(chan time.Time, 1)
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
+			frameSent <- time.Now()
 			_ = onFrame(&gemini.LineParseResult{
 				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
 				Frames: []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
@@ -2034,13 +2043,60 @@ func TestGraceDoesNotCommitStrictHeadersBeforeIdentity(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	if headerAt < 90*time.Millisecond {
-		t.Fatalf("expected strict headers after identity-bearing frame, got %v", headerAt)
+	if headerAt > 150*time.Millisecond {
+		t.Fatalf("expected headers after the 20ms grace, not after the first frame, got %v", headerAt)
 	}
+	select {
+	case at := <-frameSent:
+		if at.Sub(start) <= headerAt {
+			t.Fatalf("frame landed at %v, before headers at %v: the stream did not start early", at.Sub(start), headerAt)
+		}
+	default:
+	}
+	// The headers carry a keep-alive ping, so the client has bytes before the
+	// upstream produces anything.
 	buf := make([]byte, 64)
 	n, _ := resp.Body.Read(buf)
 	if !strings.Contains(string(buf[:n]), ": ping") {
 		t.Fatalf("expected keep-alive ping after commit, got %q", string(buf[:n]))
+	}
+}
+
+// A downgrade detected after the early flush must still stop the stream: the
+// body check is what replaces the status-line check once headers are gone.
+func TestGraceFlushStillStopsOnDowngrade(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
+
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			time.Sleep(80 * time.Millisecond)
+			err := onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: "some-other-model",
+				AnsweredModelLabel: "9.9 Mystery",
+				Frames:             []gemini.Frame{makeFrame("wrong", "", true, "some-other-model")},
+			})
+			if err == nil {
+				t.Errorf("expected the downgrade guard to stop the stream, got nil")
+			}
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = client
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer audit")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "wrong") {
+		t.Fatalf("downgraded content reached the client: %q", string(body))
 	}
 }
 

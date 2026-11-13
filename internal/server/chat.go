@@ -266,12 +266,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 && (eagerStream || !s.Cfg.RejectDowngrade) {
-		// Buffered mode normally holds the response headers until the first frame so
-		// a detected model downgrade can still become an HTTP error. Thinking-heavy
-		// models can exceed a proxy's response-header timeout, so flush headers once
-		// the grace period elapses and keep the remaining downgrade check on the
-		// stream body instead.
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+		// Buffered mode normally holds the response headers until the first frame
+		// so a detected model downgrade can still become an HTTP error. That only
+		// works while the upstream answers inside the proxy's response-header
+		// timeout: a thinking-heavy model can sit for minutes, and the client
+		// abandons the request with "timeout awaiting response headers" while gsb
+		// is still waiting. Flush headers once the grace period elapses and keep
+		// the remaining downgrade check on the stream body instead — the body
+		// check is strictly stronger than the status-line one, because a
+		// downgrade detected there still stops the stream and the client sees the
+		// mismatch in the frames.
 		go func() {
 			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
 			defer timer.Stop()
