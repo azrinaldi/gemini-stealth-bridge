@@ -73,6 +73,9 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.3
+- **The published model id is the versioned one**: the catalogue keeps the short tier name in the category (`Carbon`) while the description carries the product name (`4 Carbon`). `GET /v1/models` now publishes `gemini-4-carbon`, `gemini-3.1-pro` and `gemini-3.5-flash-lite`, which is what a capability table downstream is keyed by. The bare spellings (`gemini-carbon`, `gemini-pro`, `gemini-flash-lite`) remain as aliases and still resolve.
+- **Why it mattered**: a bare id matched no versioned capability row in front of the bridge, so `reasoning_effort` was dropped before it arrived and the model was advertised with a 128k window and no thinking levels. Requests to a bare id now reach the bridge with the effort the client asked for.
 ### What's new in v0.4.2
 - **The 2026-11-13 catalogue release**: Google renamed the everyday tier from `3.8 Flash` to `4 Hydrogen`, moved `4 Argon` to code-and-analysis, and kept `4 Carbon` for the most complex work. The new names resolve, keep their thinking levels, and still map to the `Gemini Flash` and `Gemini Pro` quota buckets, so an exhausted bucket is reported against the model that spends it.
 - **Router tiers are exempt from the label guard**: `gemini-auto` picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is correct behaviour. It had been reported as `label_mismatch` on every response, and `BRIDGE_REJECT_LABEL_MISMATCH=1` would have taken those accounts offline entirely.

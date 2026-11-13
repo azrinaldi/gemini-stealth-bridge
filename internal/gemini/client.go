@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -796,6 +797,42 @@ func ParseBatch(text string) []BatchEntry {
 	return out
 }
 
+// registryModelNames derives the published id and aliases for one registry
+// entry.
+//
+// The catalogue keeps the short tier name in the category ("Carbon") while the
+// description carries the versioned product name ("4 Carbon"). Clients and
+// routers resolve capabilities from the model id, so the versioned spelling is
+// the one published as the id: a bare "gemini-carbon" matches no versioned
+// capability row downstream and silently loses its reasoning flags and 1M
+// window. The short spelling stays as an alias so pinned configurations and the
+// UI keep resolving.
+func registryModelNames(modelID, category, displayName, description string) (string, []string) {
+	catSlug := whitespaceRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(category)), "-")
+	modelName := "gemini-" + modelID
+	if catSlug != "" {
+		modelName = "gemini-" + catSlug
+	}
+	aliases := make([]string, 0, 2)
+	for _, key := range DocumentedModelKeys(ModelInfo{Description: description, DisplayName: displayName, ModelName: modelName}) {
+		if key == "" || key == "gemini-"+modelID {
+			continue
+		}
+		if key != modelName {
+			aliases = append(aliases, modelName)
+			modelName = key
+		}
+		break
+	}
+	dispSlug := whitespaceRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(displayName)), "-")
+	if dispSlug != "" {
+		if alias := "gemini-" + dispSlug; alias != modelName && !slices.Contains(aliases, alias) {
+			aliases = append(aliases, alias)
+		}
+	}
+	return modelName, aliases
+}
+
 // AvailableModels queries the live otAQ7b RPC (`GET_USER_STATUS`), re-bootstrapping
 // on code 1016 if needed, and computes the account's live model catalog and capacity.
 func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*AvailableModelsResult, error) {
@@ -895,16 +932,7 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 			modelNumber = n
 		}
 
-		catSlug := whitespaceRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(category)), "-")
-		modelName := "gemini-" + modelID
-		if catSlug != "" {
-			modelName = "gemini-" + catSlug
-		}
-		dispSlug := whitespaceRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(displayName)), "-")
-		var aliases []string
-		if dispSlug != "" && "gemini-"+dispSlug != modelName {
-			aliases = append(aliases, "gemini-"+dispSlug)
-		}
+		modelName, aliases := registryModelNames(modelID, category, displayName, description)
 		disp := displayName
 		if disp == "" {
 			disp = category
