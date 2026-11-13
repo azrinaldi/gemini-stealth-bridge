@@ -124,6 +124,7 @@ func TestResolveModelLimitsUsesDocumentedValues(t *testing.T) {
 		{DisplayName: "3.8 Flash"},
 		{DisplayName: "3.1 Pro"},
 		{DisplayName: "4 Argon"},
+		{DisplayName: "4 Hydrogen"},
 	}
 	for _, m := range cases {
 		lim, source := ResolveModelLimits(m, 1, 1)
@@ -152,10 +153,59 @@ func TestDocumentedModelKey(t *testing.T) {
 		"3.8 Flash":      "gemini-3.8-flash",
 		"3.1 Pro":        "gemini-3.1-pro",
 		"4 Argon":        "gemini-4-argon",
+		"4 Hydrogen":     "gemini-4-hydrogen",
 	}
 	for in, want := range cases {
 		if got := DocumentedModelKey(ModelInfo{DisplayName: in}); got != want {
 			t.Fatalf("DocumentedModelKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13. A name
+// missing from the reasoning tables silently forces thinking level low, so a
+// registry that carries no thinking policy would strip the new tier's thinking.
+func TestHydrogenIsReasoningModel(t *testing.T) {
+	for _, name := range []string{"gemini-hydrogen", "gemini-4-hydrogen"} {
+		if !IsReasoningModel(name) {
+			t.Fatalf("%s must be a reasoning model", name)
+		}
+		if got := ThinkingLevelFor(nil, name, "high"); got != 2 {
+			t.Fatalf("%s default thinking = %d, want 2 (high)", name, got)
+		}
+	}
+}
+
+// The registry exposes the tier as `gemini-hydrogen` while the versioned id a
+// client reads is `gemini-4-hydrogen`. Matching only aliases left the versioned
+// id unresolved and returned 404 model_not_found.
+func TestMatchesModelAcceptsVersionedDescription(t *testing.T) {
+	m := ModelInfo{
+		ModelID:     "hydrogen-id",
+		ModelName:   "gemini-hydrogen",
+		DisplayName: "Everyday help",
+		Description: "4 Hydrogen",
+	}
+	for _, wanted := range []string{"gemini-hydrogen", "gemini-4-hydrogen", "gsb/gemini-4-hydrogen@think=high"} {
+		if !MatchesModel(m, wanted) {
+			t.Fatalf("MatchesModel(%q) = false, want true", wanted)
+		}
+	}
+}
+
+// The live catalogue advertises both `4 Hydrogen` and `4 Hydrogen Thinking`;
+// each must resolve to the same documented limits rather than a config guess.
+func TestResolveModelLimitsCoversHydrogenThinking(t *testing.T) {
+	m := ModelInfo{
+		ModelName:   "gemini-hydrogen-thinking",
+		DisplayName: "Solves complex problems",
+		Description: "4 Hydrogen Thinking",
+	}
+	lim, source := ResolveModelLimits(m, 1, 1)
+	if source != "documented" {
+		t.Fatalf("source = %q, want documented", source)
+	}
+	if lim.ContextWindow != 1048576 || lim.MaxOutput != 65536 {
+		t.Fatalf("limits = %+v", lim)
 	}
 }

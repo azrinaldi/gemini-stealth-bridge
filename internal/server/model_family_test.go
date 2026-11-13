@@ -24,3 +24,22 @@ func TestModelFamilyTokensCoversFrontierTier(t *testing.T) {
 		}
 	}
 }
+
+// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13. It is
+// still billed against the "Gemini Flash" bucket, so the new name must keep the
+// flash token or an exhausted bucket is reported against the wrong model.
+func TestModelFamilyTokensCoversHydrogen(t *testing.T) {
+	for _, name := range []string{"gemini-hydrogen", "gemini-4-hydrogen"} {
+		family := modelFamilyTokens(name)
+		found := false
+		for _, tok := range family {
+			if tok == "flash" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s: family = %v, want a flash token", name, family)
+		}
+	}
+}

@@ -73,6 +73,11 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.2
+- **The 2026-11-13 catalogue release**: Google renamed the everyday tier from `3.8 Flash` to `4 Hydrogen`, moved `4 Argon` to code-and-analysis, and kept `4 Carbon` for the most complex work. The new names resolve, keep their thinking levels, and still map to the `Gemini Flash` and `Gemini Pro` quota buckets, so an exhausted bucket is reported against the model that spends it.
+- **Router tiers are exempt from the label guard**: `gemini-auto` picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is correct behaviour. It had been reported as `label_mismatch` on every response, and `BRIDGE_REJECT_LABEL_MISMATCH=1` would have taken those accounts offline entirely.
+- **Thinking-suffixed tier names match themselves**: `4 Hydrogen Thinking` was stripped to `4-hydrogen` before comparison, so it never matched its own catalogue entry. Both sides of the comparison are now expanded.
+- **The offline fallback matches the live registry**: `gsb --models-json` with no loaded accounts previously reported invented model IDs and marked Flash-Lite as non-reasoning while the registry gives it all three levels.
 ### What's new in v0.4.1
 - **Frontier model tier tracked through the rename**: upstream renamed the top tier from `gemini-argon` to `gemini-carbon` on 2026-11-10. Thinking level and model selection now come from the live registry instead of name tables, so a renamed or newly introduced tier is described correctly without a code change. The name tables remain only as a fallback for a registry that publishes no thinking policy. Pin clients from `GET /v1/models`; a name upstream has dropped returns `404 model_not_found`.
 - **Documented limits actually apply**: the limit table was keyed from `displayName`, but the live registry carries the versioned name in `description` and a UI label in `displayName`, so every model silently reported `limitsSource: config`. Each candidate is now tried in turn.
@@ -283,7 +288,7 @@ The resulting buckets are exposed in `/v1/accounts`, `/v1/quota`, `gsb --account
 
 The 5-hour window is nested under the weekly allowance, so `gsb` caps effective 5-hour remaining credits to the weekly remaining credits when the weekly pool runs lower.
 
-When an account reaches `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable. `gsb` also records synthetic per-model cooldowns when upstream silently substitutes a model, escalating `1m → 5m → 15m → 1h → 6h → 24h` across repeated observations.
+When an account reaches `0` credits, non-lite models (`gemini-hydrogen`, `gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable. `gsb` also records synthetic per-model cooldowns when upstream silently substitutes a model, escalating `1m → 5m → 15m → 1h → 6h → 24h` across repeated observations.
 
 `quotaWindow` in `/v1/accounts` describes what the numbers cover, including `weeklyExposed`, `weeklyRemaining`, `weeklyTotal`, `nextResetAt`, and `nextResetInSeconds`.
 
@@ -741,9 +746,11 @@ Returns an OpenAI-style list plus OpenRouter-style metadata:
 
 Responses carry an `ETag`; send `If-None-Match` to get `304`. The HTTP response is cacheable for 60 seconds (`Cache-Control: max-age=60`), while the per-account upstream model registry is cached for 10 minutes and refreshed in the background every `BRIDGE_MODEL_REFRESH_MS`. `?fresh=1` forces live discovery.
 
-Model IDs are whatever Gemini Web currently advertises, for example `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, or `gemini-carbon`. Aliases and display names are matched too. Prefixes `gsb/`, `google/`, `models/`, `vx/`, and `vertex/` are stripped before matching; a `@think=<level>` suffix sets thinking effort for that request.
+Model IDs are whatever Gemini Web currently advertises, for example `gemini-4-hydrogen`, `gemini-hydrogen-thinking`, `gemini-pro`, `gemini-flash-lite`, `gemini-argon`, `gemini-carbon`, or the free tier's `gemini-auto`. Aliases and display names are matched too. Prefixes `gsb/`, `google/`, `models/`, `vx/`, and `vertex/` are stripped before matching; a `@think=<level>` suffix sets thinking effort for that request.
 
-Upstream renames a model in place without notice: on 2026-11-10 the frontier tier moved from `gemini-argon` to `gemini-carbon`. A name that upstream has stopped advertising no longer resolves and returns `404 model_not_found`. Pin clients to a name after checking `GET /v1/models` rather than assuming one lasts across an upstream release.
+`gemini-auto` is an aggregator tier rather than one fixed model: upstream picks a backing model per request and labels the answer with the model it chose, so an `Auto` request commonly comes back labelled `3.5 Flash-Lite`. That is its documented behaviour, not a substitution, and the label guard and `BRIDGE_REJECT_LABEL_MISMATCH` both leave it alone. Every other tier answers under its own label.
+
+Upstream renames a model in place without notice: on 2026-11-10 the frontier tier moved from `gemini-argon` to `gemini-carbon`, and on 2026-11-13 the everyday tier moved from `3.8 Flash` to `4 Hydrogen` while `4 Argon` became the code-and-analysis tier. A name that upstream has stopped advertising no longer resolves and returns `404 model_not_found`. Pin clients to a name after checking `GET /v1/models` rather than assuming one lasts across an upstream release.
 
 `gsb --models-json` prints the same payload without starting the daemon. With no loaded accounts it prints a static fallback list.
 
@@ -902,7 +909,7 @@ Streaming behavior:
 ```
 
 If the served model differs from the requested one, the payload also includes `requested_model` and `model_served`.
-The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`.
+The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`. Router tiers are exempt: `gemini-auto` (the free tier's `Auto — adapts to your needs` entry, id `cf41b0e0dd7d53e5` on the 2026-11-13 registry) picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is its documented behaviour rather than a relabel.
 
 #### Function calling behavior
 

@@ -58,13 +58,16 @@ type ModelLimits struct {
 // with a smaller window must not silently inherit another model's limit.
 var documentedModelLimits = map[string]ModelLimits{
 	"gemini-3.5-flash-lite":  {ContextWindow: 1048576, MaxOutput: 65536},
-	"gemini-3.8-flash":       {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro":         {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro-preview": {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-4-carbon":        {ContextWindow: 1048576, MaxOutput: 65536},
-	// Retained so an account that still serves the pre-rename catalogue keeps its
+	// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13.
+	"gemini-4-hydrogen":          {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-hydrogen-thinking": {ContextWindow: 1048576, MaxOutput: 65536},
+	// Retained so an account that still serves an older catalogue keeps its
 	// documented limits rather than falling back to the configured guess.
-	"gemini-4-argon": {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-3.8-flash": {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-argon":   {ContextWindow: 1048576, MaxOutput: 65536},
 }
 
 // DocumentedModelKeys lists the documented model ids a registry entry could
@@ -241,7 +244,7 @@ var ThinkingLevels = map[string]int{
 // SupportedThinkingEfforts lists the 3 valid thinking effort levels in order.
 var SupportedThinkingEfforts = []string{"low", "medium", "high"}
 
-var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|carbon|flash`)
+var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|carbon|hydrogen|flash`)
 
 var explicitReasoningModels = map[string]bool{
 	"gemini-pro":                true,
@@ -251,6 +254,8 @@ var explicitReasoningModels = map[string]bool{
 	"gemini-4-carbon":           true,
 	"gemini-argon":              true,
 	"gemini-4-argon":            true,
+	"gemini-hydrogen":           true,
+	"gemini-4-hydrogen":         true,
 	"gemini-3-pro":              true,
 	"gemini-2.5-pro":            true,
 	"gemini-2.5-flash":          true,
@@ -416,6 +421,14 @@ func MatchesModel(m ModelInfo, wanted string) bool {
 			return true
 		}
 	}
+	// The registry keeps the tier name in the description ("4 Hydrogen") while
+	// the category holds the short name ("Hydrogen"), so a client using the
+	// versioned id from /v1/models must match through the documented key too.
+	for _, key := range DocumentedModelKeys(m) {
+		if strings.EqualFold(key, w) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -478,6 +491,36 @@ func stripThinkingSuffix(s string) string {
 	return s
 }
 
+// labelVariants lists the forms of a label that may be compared: the slug as
+// published, and the same slug without one trailing effort word.
+//
+// Both sides of a comparison are expanded, never just the served label. A tier
+// whose own name ends in "Thinking" ("4 Hydrogen Thinking") would otherwise be
+// stripped down to "4-hydrogen" and could never match its own catalogue entry,
+// producing a false relabel report on a request upstream answered correctly.
+func labelVariants(slug string) []string {
+	out := []string{slug}
+	if stripped := stripThinkingSuffix(slug); stripped != slug {
+		out = append(out, stripped)
+	}
+	return out
+}
+
+// labelMatches reports whether a served slug names one of the entry's labels,
+// comparing the raw and effort-suffix-free forms on both sides.
+func labelMatches(served string, names []string) bool {
+	for _, name := range names {
+		for _, a := range labelVariants(served) {
+			for _, b := range labelVariants(name) {
+				if a == b {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // IsMatchingServedModel checks whether the upstream frame's answeredModelId /
 // answeredModelLabel matches the requested ModelInfo (preventing silent downgrades).
 func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
@@ -487,18 +530,33 @@ func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
 		}
 	}
 	if servedLabel != "" {
-		s := stripThinkingSuffix(normalizeServedLabel(servedLabel))
-		for _, name := range servedLabelNames(m) {
-			if s == name {
-				return true
-			}
+		s := normalizeServedLabel(servedLabel)
+		names := servedLabelNames(m)
+		if labelMatches(s, names) {
+			return true
 		}
 		if servedID == "" || m.ModelID == "" {
-			sv := stripVersionTokens(s)
-			for _, name := range servedLabelNames(m) {
-				if sv != "" && sv == stripVersionTokens(name) {
+			sv := stripVersionTokens(stripThinkingSuffix(s))
+			for _, name := range names {
+				if sv != "" && sv == stripVersionTokens(stripThinkingSuffix(name)) {
 					return true
 				}
+			}
+		}
+	}
+	return false
+}
+
+// isRouterTier reports whether the catalogue entry is an aggregator tier rather
+// than one fixed model. `gemini-auto` ("Auto — adapts to your needs") picks a
+// backing model per request, so an answer labelled "3.5 Flash-Lite" is its
+// documented behaviour, not a relabel. Without this exemption every auto request
+// was reported as a tier mismatch even though the id named the requested slot.
+func isRouterTier(m ModelInfo) bool {
+	for _, raw := range []string{m.ModelName, m.DisplayName} {
+		for _, seg := range strings.Split(normalizeServedLabel(raw), "-") {
+			if seg == "auto" {
+				return true
 			}
 		}
 	}
@@ -512,7 +570,7 @@ func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
 // "4 Argon". The id comparison alone accepted that silently, so a client asking
 // for the new tier could not tell it was still served the old one.
 func ServedLabelMismatch(m ModelInfo, servedID, servedLabel string) bool {
-	if servedLabel == "" {
+	if servedLabel == "" || isRouterTier(m) {
 		return false
 	}
 	if servedID != "" && m.ModelID != "" && !strings.EqualFold(servedID, m.ModelID) {
@@ -520,17 +578,20 @@ func ServedLabelMismatch(m ModelInfo, servedID, servedLabel string) bool {
 		// downgrade check already covers it.
 		return false
 	}
-	s := stripThinkingSuffix(normalizeServedLabel(servedLabel))
+	s := normalizeServedLabel(servedLabel)
 	if s == "" {
 		return false
 	}
-	sv := stripVersionTokens(s)
-	for _, name := range servedLabelNames(m) {
-		if s == name {
-			return false
-		}
-		if sv != "" && sv == stripVersionTokens(name) {
-			return false
+	names := servedLabelNames(m)
+	if labelMatches(s, names) {
+		return false
+	}
+	sv := stripVersionTokens(stripThinkingSuffix(s))
+	if sv != "" {
+		for _, name := range names {
+			if sv == stripVersionTokens(stripThinkingSuffix(name)) {
+				return false
+			}
 		}
 	}
 	return true

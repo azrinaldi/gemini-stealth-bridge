@@ -764,6 +764,11 @@ func modelFamilyTokens(modelName string) []string {
 	if strings.Contains(name, "argon") || strings.Contains(name, "carbon") {
 		family = append(family, "argon", "carbon", "pro")
 	}
+	// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13. It
+	// still spends the "Gemini Flash" bucket, so the new name keeps that token.
+	if strings.Contains(name, "hydrogen") {
+		family = append(family, "hydrogen", "flash")
+	}
 	for _, tok := range []string{"pro", "flash", "thinking"} {
 		if strings.Contains(name, tok) {
 			family = append(family, tok)
