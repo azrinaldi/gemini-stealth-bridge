@@ -256,12 +256,8 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	inner[7] = 1  // enable_token_streaming
 	inner[10] = 1 // request_source
 	isPureWeb := strings.EqualFold(protoMode, "web") && !opts.HasTools && !opts.DisableTools
-	if !isPureWeb && (opts.DisableTools || opts.HasTools || !strings.EqualFold(protoMode, "web")) {
-		if opts.DisableTools || opts.HasTools {
-			inner[11] = 1 // disable_tools (strip consumer Workspace/YouTube/Maps extensions)
-		} else {
-			inner[11] = 0
-		}
+	if opts.DisableTools {
+		inner[11] = 1 // disable_tools (only when explicitly requested; never set on HasTools because upstream injects <prohibit_tool_calling>)
 	} else {
 		inner[11] = 0
 	}
@@ -270,7 +266,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	inner[27] = 1 // return_request_routing_early
 	inner[30] = []int{4}
 	inner[41] = []int{1}
-	if opts.Temporary && (inner[11] != 0 || !PromptRequestsVideo(prompt)) {
+	if opts.Temporary && (inner[11] != 0 || opts.HasTools || !PromptRequestsVideo(prompt)) {
 		inner[45] = 1
 	}
 	inner[53] = 0

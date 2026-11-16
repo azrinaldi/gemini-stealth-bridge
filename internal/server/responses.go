@@ -1000,7 +1000,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								emitTextDelta(text[len(sentText):])
 								sentText = text
 						} else if hasTools && !mediaToolUsed && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
+							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
 								}
@@ -1062,7 +1062,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}

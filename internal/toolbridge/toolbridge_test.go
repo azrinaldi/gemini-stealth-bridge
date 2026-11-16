@@ -31,6 +31,30 @@ func sampleTools() []any {
 	}
 }
 
+func TestToolInstructionsDoNotImposeArbitraryBatchLimits(t *testing.T) {
+	builders := []struct {
+		name  string
+		build func(any, any) (string, error)
+	}{
+		{"instructions", BuildToolInstructions},
+		{"reminder", BuildToolReminder},
+		{"continuation", BuildContinuationToolReminder},
+	}
+	for _, b := range builders {
+		t.Run(b.name, func(t *testing.T) {
+			got, err := b.build(sampleTools(), "auto")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"1–2", "2–4", "3+"} {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("unexpected batch restriction %q", forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateToolRequestAndInstructions(t *testing.T) {
 	instr, err := BuildToolInstructions(sampleTools(), "none")
 	if err != nil || instr != "" {

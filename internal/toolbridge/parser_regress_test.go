@@ -253,3 +253,105 @@ func TestToolProtocolRefusalDetection(t *testing.T) {
 		t.Fatalf("expected normal prose to pass through without error, got res=%+v err=%v", res, err)
 	}
 }
+
+func TestDetectsUpstreamToolCallBudgetNotice(t *testing.T) {
+	refusals := []string{
+		"You have exceeded the maximum number of tool and search calls (0 remaining).",
+		"You have reached the maximum number of tool calls.",
+		"0 tool calls remaining.",
+		"<prohibit_tool_calling>",
+	}
+	for _, r := range refusals {
+		if !IsToolProtocolRefusal(r) {
+			t.Errorf("expected refusal detection for %q", r)
+		}
+	}
+
+	legitimate := []string{
+		"Listo: ejecuté las 3 llamadas a herramientas y todas respondieron bien.",
+		"The kernel is Linux and the directory exists.",
+		"I called the tool twice and both results were empty.",
+	}
+	for _, a := range legitimate {
+		if IsToolProtocolRefusal(a) {
+			t.Errorf("false positive for %q", a)
+		}
+	}
+}
+
+func TestDetectsToolCallGuardInsideLongReply(t *testing.T) {
+	long := strings.Repeat("Contexto irrelevante sobre el trabajo realizado. ", 60) +
+		"<prohibit_tool_calling>\nYou have exceeded the maximum number of tool and search calls (0 remaining).\n" +
+		"Synthesize your final response to the user based on the information you have gathered.\n</prohibit_tool_calling>"
+	if len(long) <= 1200 {
+		t.Fatalf("fixture must exceed the short-reply guard, got %d bytes", len(long))
+	}
+	if !IsToolProtocolRefusal(long) {
+		t.Error("expected guard marker to be detected inside a long reply")
+	}
+
+	benign := strings.Repeat("Ejecuté las comprobaciones y todas respondieron correctamente. ", 40)
+	if IsToolProtocolRefusal(benign) {
+		t.Error("false positive on a long benign reply")
+	}
+}
+
+func TestInterpretReplyTreatsUpstreamGuardAsRetryableToolError(t *testing.T) {
+	guard := "<prohibit_tool_calling>\nYou have exceeded the maximum number of tool and search calls (0 remaining).\nSynthesize your final response to the user based on the information you have gathered.\n</prohibit_tool_calling>"
+	wrapped := strings.Repeat("Reporte previo del agente sobre lo ejecutado. ", 40) + guard
+	for _, reply := range []string{guard, wrapped} {
+		if _, err := InterpretReply(reply, sampleReproTools(), "auto"); err == nil {
+			t.Fatalf("expected a retryable tool error for guard reply of %d bytes", len(reply))
+		} else if !strings.Contains(err.Error(), "refused the tool-calling protocol") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if _, err := InterpretReply("Todo listo: las comprobaciones respondieron correctamente.", sampleReproTools(), "auto"); err != nil {
+		t.Fatalf("plain answer must not error: %v", err)
+	}
+}
+
+func TestStripToolGuardRemovesInventedBudgetNotice(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "xml guard block",
+			in:   "Listo.\n<prohibit_tool_calling>\nYou have exceeded the maximum number of tool and search calls (0 remaining).\nSynthesize your final response.\n</prohibit_tool_calling>",
+			want: "Listo.",
+		},
+		{
+			name: "bare sentence",
+			in:   "Reporte completo.\nYou have exceeded the maximum number of tool and search calls (0 remaining).",
+			want: "Reporte completo.",
+		},
+		{
+			name: "zero remaining line",
+			in:   "Sin cambios.\n0 tool calls remaining.",
+			want: "Sin cambios.",
+		},
+		{
+			name: "clean text untouched",
+			in:   "Ejecuté las tres comprobaciones y todas respondieron bien.",
+			want: "Ejecuté las tres comprobaciones y todas respondieron bien.",
+		},
+	}
+	for _, c := range cases {
+		if got := StripToolGuard(c.in); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestInterpretReplyUsesSharedRefusalErrorText(t *testing.T) {
+	_, err := InterpretReply("<prohibit_tool_calling>\nYou have exceeded the maximum number of tool and search calls (0 remaining).\n</prohibit_tool_calling>", sampleReproTools(), "auto")
+	if err == nil {
+		t.Fatal("expected a retryable tool error")
+	}
+	if !strings.Contains(err.Error(), ToolProtocolRefusalError) {
+		t.Fatalf("expected the shared refusal text %q, got %v", ToolProtocolRefusalError, err)
+	}
+}
