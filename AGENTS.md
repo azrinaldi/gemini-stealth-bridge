@@ -213,6 +213,7 @@ Each account has its own cookie state, model list, quota state, transport sessio
 ## 5. Never recommend
 
 - Copying cookies from a browser that was never signed in to Gemini. Those cookies expire almost immediately and surface later as `401 upstream_auth_error` or upstream `code 1016`.
+- Importing cookies from a Chromium profile that has Device Bound Session Credentials (DBSC) active. Recent Chrome, Edge and Brave bind the session to the machine's key, so the exported cookies stay valid for only a few hours and cannot be renewed by `--rotate`. `gsb --login` disables DBSC in the browser it launches, and a Firefox profile has no equivalent; use one of those when imports keep expiring.
 - Pasting cookies, `Cookie` headers, account JSON, or `session-cache.json` into chat, issues, logs, commits, or shell history.
 - `--rotate` as a fix for an expired session. It only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
 - Committing `$BRIDGE_HOME` (default `~/.gemini-stealth-bridge`) to version control.
@@ -238,7 +239,7 @@ Statuses are computed in this precedence order and are shared by `/v1/accounts`,
 | `expired` | Expired | Saved session invalid (`upstream_auth_error`, `auth_redirect`, `code 1016`, `snlm0e`, …) | `gsb --login <name>` |
 | `exhausted` | Exhausted | A real quota window is spent until `resetAt`, or a model stayed exhausted across retries | Wait for reset, use another account/model, or use `gemini-flash-lite` |
 | `cooling` | Cooling | Failed within the last 60 seconds | Wait; the pool routes around it |
-| `degraded` | Degraded | Cooldown elapsed but the failure counter is still nonzero | A success or a manual reset clears it |
+| `degraded` | Degraded | Cooldown elapsed but the failure counter is still nonzero | Automatic: the account is re-checked within ~2 minutes and a healthy re-check clears it. No manual refresh needed |
 | `unknown` | Unprobed | No quota check has run in this process | `gsb --accounts --accounts-live` or query a running daemon |
 | `ok` | Ready | Loaded, authenticated, no known limit | None |
 
@@ -249,6 +250,13 @@ Statuses are computed in this precedence order and are shared by `/v1/accounts`,
 | `401 upstream_auth_error` | Session expired or rejected | `gsb --login <name>`, then `gsb --probe` |
 | upstream `code 1016` | Same as above | Same |
 | `403 account_banned` / `TOS_VIOLATION` | Account restricted upstream | Stop retrying; the account is quarantined |
+| `403 account_banned` with `code 1021` | Account access rejected | Fix the account on gemini.google.com; retrying does not help |
+| `403 account_banned` with `code 1033` | Account failed Google's safety/trust checks | Same |
+| `403 account_banned` with `code 1040` / `1042` | Terms of Service must be accepted (or are stale) | Sign in to the account and accept the current terms |
+| `403 account_banned` with `code 1054` / `1057` | Blocked by, or awaiting, parent/guardian approval | Same |
+| `403 account_banned` with `code 1060` | Gemini unavailable in the account's country | Use an account or egress in a supported region |
+| `502 upstream_degraded` with `code 1014` | Temporary regional or session restriction | Retry later; the pool fails over meanwhile |
+| `503 upstream_transient` with `code 1013` | Random temporary model error | Retried automatically; no action |
 | `no SAPISID cookie found` | Selected browser profile is not signed in | Use `gsb --login` |
 | `401 authentication_error` from `gsb` | Wrong API key, not a Google problem | Check pool/group/account key |
 | `503 auth_unavailable` | No accounts loaded | Check `BRIDGE_HOME`, import an account, `/v1/refresh` |
@@ -402,7 +410,14 @@ Accepted body fields:
 | `thinkingConfig`, `generationConfig.thinkingConfig` | `thinkingLevel` / `thinkingBudget` |
 | `output_config` | `effort` |
 
-Ignored: `temperature`, `top_p`, `max_tokens`, `stop`, and other sampling controls. Do not present them as working output limits.
+Ignored: `temperature`, `top_p`, and `seed` — Gemini Web has no upstream equivalent. Do **not** describe those as working.
+
+Enforced locally by gsb (they are real, not advisory):
+- `max_tokens` / `max_completion_tokens` truncate the answer and set `finish_reason: "length"`.
+- `stop` (string or array) cuts the answer at the first matching sequence.
+- `response_format` `{"type":"json_object"}` or `{"type":"json_schema"}` returns the JSON object without Gemini's ```` ```json ```` fence.
+
+`max_tokens` and `stop` keep incremental streaming: the bridge emits only the prefix still inside the limit, so no bytes reach the client that the final answer would not contain. `response_format` is the exception — a JSON object cannot be unwrapped until it is complete, so that request is delivered once at the end.
 
 Streaming: `chat.completion.chunk` events, final chunk with `finish_reason` and `usage`, then `data: [DONE]`. `: ping` comments every 15 seconds.
 
@@ -489,7 +504,11 @@ Coercion only applies when the raw value fails validation and the coerced value 
 - Repairs JSON string escapes and HTML-sanitized content inside string values.
 - Detects truncated `{"tool_calls":[...` arrays and retries.
 - Extracts valid calls even when preceded by refusal prose.
-- Retries when the model refuses a required tool turn or invents a tool-budget limit.
+- Retries when the model refuses a required tool turn or invents a tool-budget limit. Detection runs on the opening of the reply (first 2000 bytes, whitespace-collapsed so a phrase wrapped across lines still matches) and combines two mechanisms:
+  - Named phrase patterns in `toolProtocolRefusalPatterns` for the wordings seen in the field: hallucinated budget/quota in English and Indonesian (`tool-call budget`, `kuota pemanggilan tool sudah habis`, `Eksekusi tool sedang tidak tersedia di turn ini`), a claim that the tool surface is off for this turn, a claim that the protocol cannot be invoked, and labelling the `tool_calls` format as prompt injection.
+  - A structural rule (`zeroQuotaRefusal`) that catches wordings the phrase list missed. It fires when one sentence contains a standalone zero **and** a tool word **and** an availability word. This exists because enumerating phrases did not converge: the same question produced `0 tool calls tersisa`, then `calls remaining: **0**`, then `There are **0** built-in tool and search calls remaining`, and each new wording shipped a refusal as the final answer.
+  - Prose that merely reports a zero result (`returned 0 matches`, `0 errors were found`) has no availability word in that sentence and stays a plain answer.
+  - `TestRefusalPatternNamesHaveCoverage` fails if a phrase pattern is added without a sample that fires, so no entry can be dead code.
 - Keeps raw JSON envelopes out of plain answer text.
 - Does not mark an account `degraded` for client/schema `tool_call_error`.
 
@@ -773,7 +792,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | `0` disables |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | `0` disables |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject silent substitution |
-| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included. Router tiers such as `gemini-auto` are never rejected: they label the answer with whichever backing model they chose |
+| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included. The relabel is detected on the first frame that carries the label, so a pool request fails over instead of waiting out the whole generation and returning `502`. Router tiers such as `gemini-auto` are never rejected: they label the answer with whichever backing model they chose |
 | `BRIDGE_QUIET_HOURS` | empty | `HH:MM-HH:MM`; pauses background work only |
 
 ### 15.6 Generation, history, tools
@@ -807,7 +826,8 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | Variable | Default | Notes |
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | First byte |
-| `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames |
+| `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames (keepalive envelopes do not count as a frame) |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Whole request |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Rotation interval (60s–3600s) |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh |
@@ -961,6 +981,17 @@ Build or download the new binary, replace `gsb`, restart the service. The data d
 8. Is the client reading SSE correctly? (Errors can arrive after HTTP 200.)
 9. Is a proxy or tunnel in the path? Is `127.0.0.1` the right host from that process?
 10. Is the client timeout shorter than the model's real latency?
+
+### 19.1a When carbon on `high` stalls repeatedly
+
+`gemini-4-carbon` with `reasoning_effort: high` and a large prompt is the one workload that trips `upstream_stalled` in practice. A measured sample over 24 hours: 40 successes out of 111 attempts, with failures clustering at exactly the no-frame deadline and producing no candidate frame at all.
+
+Two things that do **not** work, each measured:
+
+- **Raising `BRIDGE_NO_FRAME_TIMEOUT_MS`.** At 150000 ms the same request went from stalling at 75 s to stalling at 150 s, six times out of six. The stream is silent, not slow; the larger number only moves the wall.
+- **Blaming the queue.** A captured frame for this workload is `[["wrb.fr",null,"[{\"37\":[0]}]"]]`: three elements, no `part[5]`, so there is no queue-status block to distinguish it from a dead stream.
+
+What does change the outcome is account selection. Per-account success rates for this workload are not uniform: over seven days the spread ran from 8% on one account to 59% on another, with the weakest account carrying most of the stalls. Retry on another account, or pin the workload to a pool whose accounts are known to serve it, rather than stretching the deadline.
 
 ### 19.2 Symptom → action
 

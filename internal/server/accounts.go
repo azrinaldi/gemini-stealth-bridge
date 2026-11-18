@@ -320,6 +320,14 @@ func (s *Server) clientFor(a *AccountState) UpstreamClient {
 	return ac
 }
 
+// shouldClearTransientFailure reports whether a recorded failure is the kind a
+// healthy registry read proves gone. A stall, a timeout or a transport hiccup is
+// evidence about one request; a rejected session or a restricted account is a
+// verdict that a successful model listing does not overturn.
+func shouldClearTransientFailure(lastError string) bool {
+	return !looksLikeAuthFailure(lastError) && !looksLikeAccountBan(lastError)
+}
+
 // RefreshAccount refreshes the live model list and quota for a single account,
 // preserving the last known good state on failure.
 func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool) *AccountState {
@@ -350,6 +358,21 @@ func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool
 	a.Capacity = am.Capacity
 	a.ModelsAt = time.Now()
 	a.ModelsError = nil
+	// A successful registry read is proof the account is reachable and
+	// authenticated right now. Without this, a transient failure leaves the
+	// account labelled degraded with nothing that ever clears it: only a served
+	// request resets the failure counters, and the scheduler - the one component
+	// that touches every account on a timer - never serves a request. The label
+	// then outlives the condition it described until an operator presses Refresh.
+	// Only transient evidence is cleared. A rejected session or a restricted
+	// account is not disproved by a registry read, so those keep their own
+	// record and their own remedy; clearing them here would hide the very
+	// condition the operator needs to see.
+	if shouldClearTransientFailure(a.LastError) {
+		a.Fails = 0
+		a.LastFail = time.Time{}
+		a.LastError = ""
+	}
 	a.mu.Unlock()
 	if len(quota) > 0 {
 		s.mergeAccountQuota(a, quota)
@@ -1154,10 +1177,20 @@ func (s *Server) lookupQuotaResetHeaders(_ context.Context, a *AccountState, mod
 }
 
 func (s *Server) markAccountFailure(a *AccountState, msg string) {
+	now := s.now()
 	a.mu.Lock()
 	a.Fails++
-	a.LastFail = s.now()
+	a.LastFail = now
 	a.LastError = msg
+	// Pull the next model refresh forward. The refresh is the probe that clears a
+	// transient failure, and the account may have been scheduled for the slow
+	// cadence before this failure existed: without this, the shortened interval
+	// only ever applies to accounts that were already failing when their timer
+	// was last set, which is never the account that just broke.
+	recheck := failureRecheckInterval + randDuration(failureRecheckInterval/5)
+	if due := now.Add(recheck); a.NextModelRefAt.IsZero() || a.NextModelRefAt.After(due) {
+		a.NextModelRefAt = due
+	}
 	a.mu.Unlock()
 }
 
@@ -1627,6 +1660,10 @@ type preparedGeneration struct {
 	// cacheSplit is the message index at which the cached continuation was
 	// selected. It is zero when no continuation was used.
 	cacheSplit int
+	// limits are the OpenAI controls Gemini Web cannot express: output budget,
+	// stop sequences, and structured-output intent. They are enforced on the
+	// assembled answer in the request handler.
+	limits answerLimits
 }
 
 func (s *Server) prepareGeneration(
@@ -1770,6 +1807,7 @@ func (s *Server) prepareGeneration(
 		HasTools:        hasTools,
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,
+		NoFrameTimeout:  s.Cfg.NoFrameTimeout,
 	}
 
 	curPrompt := fullPrompt
@@ -1822,6 +1860,7 @@ func (s *Server) prepareGeneration(
 		hasher:              hasher,
 		cacheKey:            cacheKey,
 		cacheSplit:          cacheSplit,
+		limits:              parseAnswerLimits(body),
 	}, nil
 }
 

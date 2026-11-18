@@ -896,7 +896,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+				earlyMismatch := shouldAbortForModelRejection(s.Cfg, mediaToolUsed, *model, servedID, servedLabel)
 				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
@@ -999,8 +999,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								emitTextDelta(text[len(sentText):])
 								sentText = text
-						} else if hasTools && !mediaToolUsed && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
+							} else if hasTools && !mediaToolUsed && len(text) > 240 {
+								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
 								}
@@ -1078,9 +1078,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 			inStreamRetryable := (errCode == "tool_call_error" ||
 				errCode == "upstream_error_reply" ||
+				errCode == "upstream_transient" ||
 				errCode == "empty_upstream_response" ||
 				errCode == "incomplete_upstream_response" ||
 				(scope.AccountID == "" && (errCode == "model_substitution" ||
+					errCode == "model_label_mismatch" ||
 					errStatus == 429 ||
 					errCode == "rate_limit_error" ||
 					errCode == "session_busy" ||
@@ -1211,7 +1213,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					attachmentParts = fullAttachmentParts
 					continue
 				}
-				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
+				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" ||
+					errCode == "model_label_mismatch" {
 					lastRetryReason = errCode
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {

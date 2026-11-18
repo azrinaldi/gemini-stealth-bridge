@@ -624,3 +624,98 @@ func TestExtractStreamEnvelopesSingleArrayNoNewlines(t *testing.T) {
 		t.Fatalf("expected ['di',...] to mark StreamEnd=true, got %+v err=%v", pEnd, err)
 	}
 }
+
+// Gemini leaves a placeholder link where a rendered attachment belongs. The path
+// can carry several segments - an image search returns
+// `image_collection/image_retrieval/<id>` - and the single-segment pattern that
+// shipped leaked the placeholder into the visible answer.
+func TestPlaceholderStrippedForMultiSegmentPath(t *testing.T) {
+	for _, ph := range []string{
+		"https://googleusercontent.com/image_generation_content/abc123",
+		"https://googleusercontent.com/image_collection/image_retrieval/123456",
+		"https://googleusercontent.com/generated_video_content/xyz",
+		"https://googleusercontent.com/some/new/path/42",
+	} {
+		inner := `[null,["c_1","r_1"],null,null,[["rc_1",["Here you go\n` + ph + `"],null,null,null,{"9":[2]}]]]`
+		innerEsc, _ := marshalJSONString(inner)
+		line := `[["wrb.fr",null,` + innerEsc + `]]`
+
+		res, err := ParseFrameLine(line)
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v", ph, err)
+		}
+		if len(res.Frames) == 0 {
+			t.Fatalf("%s: no frames parsed", ph)
+		}
+		if got := res.Frames[0].Text; strings.Contains(got, "googleusercontent.com") {
+			t.Errorf("%s: placeholder survived into text: %q", ph, got)
+		}
+	}
+}
+
+// A card reply puts only a card_content link in the text slot; the answer body
+// is field 22. Stripping the link without substituting the body delivered an
+// empty answer to the client.
+func TestCardContentReplacedByBody(t *testing.T) {
+	inner := `[null,["c_1","r_1"],null,null,[["rc_1",["https://googleusercontent.com/card_content/987654"],null,null,null,{"9":[2],"23":["The card body answer."]}]]]`
+	innerEsc, _ := marshalJSONString(inner)
+	line := `[["wrb.fr",null,` + innerEsc + `]]`
+
+	res, err := ParseFrameLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if len(res.Frames) == 0 {
+		t.Fatal("no frames parsed")
+	}
+	got := res.Frames[0].Text
+	if strings.Contains(got, "card_content") {
+		t.Errorf("card link survived: %q", got)
+	}
+	if !strings.Contains(got, "The card body answer.") {
+		t.Errorf("card body was not substituted; got %q", got)
+	}
+}
+
+// Gemini leaves a placeholder link where a rendered attachment belongs. The path
+// can carry several segments - an image search returns
+// `image_collection/image_retrieval/<id>` - and the single-segment pattern that
+// shipped leaked the placeholder into the visible answer.
+func TestPlaceholderDoesNotEatRealMedia(t *testing.T) {
+	for _, keep := range []string{
+		"https://lh3.googleusercontent.com/gg-dl/abc=s2048",
+		"https://contribution.usercontent.google.com/download?c=xyz",
+	} {
+		inner := `[null,["c_1","r_1"],null,null,[["rc_1",["![img](` + keep + `)"],null,null,null,{"9":[2]}]]]`
+		esc, _ := marshalJSONString(inner)
+		res, err := ParseFrameLine(`[["wrb.fr",null,` + esc + `]]`)
+		if err != nil {
+			t.Fatalf("%s: %v", keep, err)
+		}
+		if len(res.Frames) == 0 {
+			t.Fatalf("%s: no frames parsed", keep)
+		}
+		if !strings.Contains(res.Frames[0].Text, keep) {
+			t.Errorf("real media URL was stripped: %s -> %q", keep, res.Frames[0].Text)
+		}
+	}
+}
+
+// When a card reply carries no body in field 22, the link must survive rather
+// than be stripped to nothing. An empty answer costs a retry; a followable link
+// does not. Image and grounding extraction must still run.
+func TestCardContentKeepsLinkWhenBodyMissing(t *testing.T) {
+	inner := `[null,["c_1","r_1"],null,null,[["rc_1",["https://googleusercontent.com/card_content/555"],null,null,null,{"9":[2]}]]]`
+	esc, _ := marshalJSONString(inner)
+	res, err := ParseFrameLine(`[["wrb.fr",null,` + esc + `]]`)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if len(res.Frames) == 0 {
+		t.Fatal("no frames parsed")
+	}
+	got := res.Frames[0].Text
+	if !strings.Contains(got, "card_content") {
+		t.Errorf("card link was stripped even though field 22 was empty: %q", got)
+	}
+}

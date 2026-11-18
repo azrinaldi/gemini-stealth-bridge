@@ -129,10 +129,17 @@ var (
 			`i\s+(?:can't|cannot)\s+help[^\n]*because\s+(?:i'm|i\s+am)\s+(?:only|just|a)\s+(?:a\s+)?language\s+model` +
 			`)[.!]?$`,
 	)
-	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
-	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
-	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
+	hex16Re             = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
+	googleUserContentRe = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
+	imageSizeSuffixRe   = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	// Placeholder links Gemini leaves in reply text where a rendered attachment
+	// belongs. The path can carry several segments - a web image search returns
+	// `image_collection/image_retrieval/<id>` - so a single-segment pattern left
+	// the placeholder visible in the answer. The real media hosts are
+	// `lh3.googleusercontent.com` (handled separately), so a path on the bare
+	// host is always a placeholder.
+	cardContentRe                 = regexp.MustCompile(`(?i)^https?://googleusercontent\.com/card_content/\d+$`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:[\w-]+/)+[\w-]+`)
 	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe              = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe              = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -883,7 +890,24 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
-	if googleGenContentPlaceholderRe.MatchString(text) {
+	// A card reply puts nothing but a card_content link in the text slot; the
+	// actual answer sits in field 22. Stripping the link alone would deliver an
+	// empty answer, so the card body replaces it. When field 22 is empty the link
+	// is kept: a visible link the client can follow beats a silently empty reply,
+	// and the caller already treats an empty candidate as a retryable failure.
+	keepCardLink := false
+	if cardContentRe.MatchString(strings.TrimSpace(text)) {
+		if alt, ok := jspbField(c, 22).([]any); ok && len(alt) > 0 {
+			if s, _ := alt[0].(string); strings.TrimSpace(s) != "" {
+				text = s
+			} else {
+				keepCardLink = true
+			}
+		} else {
+			keepCardLink = true
+		}
+	}
+	if !keepCardLink && googleGenContentPlaceholderRe.MatchString(text) {
 		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
 	}
 
@@ -1232,6 +1256,17 @@ func classifyRPCErrorCode(code int, raw any) error {
 			fmt.Sprintf("upstream error code 1185: Gemini Web failed the turn upstream; retrying on another account usually succeeds: %s", snippet),
 			502,
 			"upstream_degraded",
+			nil,
+			nil,
+		)
+	case 1013:
+		// Raised at random when generating with certain models and gone on the
+		// next attempt. It is not a quota or auth signal, so it must be retried
+		// rather than presented to the caller as a generic upstream failure.
+		return transport.NewUpstreamError(
+			"upstream error code 1013: Gemini reported a temporary model error; retrying usually succeeds",
+			503,
+			"upstream_transient",
 			nil,
 			nil,
 		)

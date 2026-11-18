@@ -318,6 +318,16 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	serverMediaRounds := 0
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
+		var limitFinish string
+		// limitReached stops incremental emission once the client's budget or a
+		// stop sequence has fired. Continuing to watch the upstream answer after
+		// that point would compare frames against text the client never got and
+		// could surface a spurious revision error instead of the real verdict.
+		var limitReached bool
+		// limitedText is the answer frozen at the moment a limit fired. Later
+		// upstream frames are revisions of text the client never received, so the
+		// committed answer must be this snapshot, not the final frame.
+		var limitedText string
 		var (
 			candidateID           string
 			selected              bool
@@ -415,7 +425,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+				earlyMismatch := shouldAbortForModelRejection(s.Cfg, mediaToolUsed, *model, servedID, servedLabel)
 				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
@@ -476,22 +486,46 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if frameMismatch {
 						return transport.ErrStopStreaming
 					}
-					if stream && !buffered && ctx.Err() == nil {
+					if stream && !buffered && !limitReached && prep.limits.streamable() && ctx.Err() == nil {
 						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
+						}
+						// A tool-protocol refusal must be recognized before any byte of
+						// it reaches the client. Once text is emitted, payloadCommitted()
+						// locks the attempt and the tool_call_error retry can never run:
+						// the refusal would be delivered as the final answer, which is
+						// exactly the reported failure. IsToolProtocolRefusal only reads
+						// the opening of the reply, so the guard is complete once that
+						// window has arrived; until then nothing may be emitted.
+						if hasTools && sentText == "" {
+							if toolbridge.IsToolProtocolRefusal(text) {
+								return transport.NewUpstreamError(toolbridge.RefusalErrorText+" (hallucinated tool limit or refusal)", 502, "tool_call_error", nil, nil)
+							}
+							if len(text) <= toolbridge.RefusalWindowBytes {
+								return nil
+							}
 						}
 						if len(text) > len(sentText) || (s.Cfg.LiveThoughts && len(thoughts) > len(sentThought)) {
 							startStream(false)
 							if len(text) > len(sentText) {
-								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
-								sentText = text
+								// Emit only what is inside the client's budget.
+								visibleText, limitHit := prep.limits.visible(text)
+								if limitHit != "" {
+									limitFinish = limitHit
+									limitReached = true
+									limitedText = visibleText
+								}
+								if len(visibleText) > len(sentText) {
+									emit(sseDeltaContent{Content: visibleText[len(sentText):]}, nil, nil)
+									sentText = visibleText
+								}
 							}
 							if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) {
 								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 								sentThought = thoughts
 							}
 						}
-					} else if stream && buffered && ctx.Err() == nil && !done {
+					} else if stream && buffered && !limitReached && ctx.Err() == nil && !done {
 						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
@@ -526,13 +560,22 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 						canStreamText := identityVerified
 						if canStreamText {
-							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
+							// Only the part still inside the client's budget may go
+							// on the wire: a limit that fires later cannot retract
+							// bytes the client already has.
+							visibleText, limitHit := prep.limits.visible(text)
+							if limitHit != "" {
+								limitFinish = limitHit
+								limitReached = true
+								limitedText = visibleText
+							}
+							if !hasTools && strings.HasPrefix(visibleText, sentText) && len(visibleText) > 240 && len(visibleText) > len(sentText) && gemini.GeminiErrorReply(visibleText) == "" {
 								startStream(false)
-								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
-								sentText = text
+								emit(sseDeltaContent{Content: visibleText[len(sentText):]}, nil, nil)
+								sentText = visibleText
 								lastActiveKeepaliveAt = time.Now()
-						} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
+							} else if hasTools && !mediaToolUsed && prep.limits.streamable() && (toolStreamer == nil || !toolStreamer.SentAny()) && len(visibleText) > 240 {
+								if safePrefix := toolbridge.SafeStreamablePrefix(visibleText); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(visibleText[:240]) == "" && !toolbridge.IsToolProtocolRefusal(visibleText) {
 									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
 									sentText = safePrefix
@@ -557,6 +600,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
+		// Once a limit has fired, the committed answer is the snapshot the client
+		// already received. Comparing the final upstream frame against it would
+		// report a revision for text the client was never sent.
+		evalText, evalSent := text, sentText
+		if limitReached {
+			evalText, evalSent = limitedText, limitedText
+		}
 		interpreted, runCheck := s.evaluateAttemptCompletion(
 			ctx,
 			account,
@@ -566,8 +616,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			streamErr,
 			selected,
 			done,
-			text,
-			sentText,
+			evalText,
+			evalSent,
 			servedID,
 			servedLabel,
 			identityConflict,
@@ -614,9 +664,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			inStreamRetryable := (errCode == "tool_call_error" ||
 				errCode == "upstream_error_reply" ||
+				errCode == "upstream_transient" ||
 				errCode == "empty_upstream_response" ||
 				errCode == "incomplete_upstream_response" ||
 				(scope.AccountID == "" && (errCode == "model_substitution" ||
+					errCode == "model_label_mismatch" ||
 					errStatus == 429 ||
 					errCode == "rate_limit_error" ||
 					errCode == "session_busy" ||
@@ -750,7 +802,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					attachmentParts = fullAttachmentParts
 					continue
 				}
-				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
+				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" ||
+					errCode == "model_label_mismatch" {
 					lastRetryReason = errCode
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
@@ -920,6 +973,22 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"
+		// Apply the controls Gemini Web cannot express before anything is
+		// emitted, so the client never receives text past its own budget and
+		// finish_reason describes what actually happened.
+		if limitReached {
+			// The limit already fired during the stream; keep the answer the
+			// client was promised instead of a later upstream revision of it.
+			text = limitedText
+		} else {
+			text, limitFinish = prep.limits.apply(text)
+		}
+		if prep.limits.wantJSON {
+			text = jsonObjectText(text)
+		}
+		if limitFinish != "" {
+			finish = limitFinish
+		}
 		var content any = text
 		if textStr, ok := content.(string); ok {
 			content = toolbridge.StripToolGuard(textStr)
@@ -1286,14 +1355,24 @@ func hasCompatibleStreamPrefix(full, sent string) bool {
 }
 
 func appendToolErrorCorrection(fullPrompt, errMsg string) string {
-	var note string
-	if strings.Contains(errMsg, toolbridge.ToolProtocolRefusalError) {
-		// The model invented a tool-call budget. A generic schema note does not
-		// address that, so name the invention explicitly and restate availability.
-		note = "[System correction: Tools ARE available and there is NO tool-call or search budget in this session. The previous reply wrongly claimed a tool limit. Disregard any such claim and emit the next ```json {\"tool_calls\":[...]} ``` block now, using only the declared tools and their exact schema.]"
-	} else {
-		note = fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	// A protocol refusal is not a schema mistake, so telling the model to fix its
+	// JSON only makes it repeat the refusal. It has to be told that the premise
+	// it invented is false.
+	if toolbridge.IsRefusalMessage(errMsg) {
+		return appendNoteBeforeAssistant(fullPrompt, refusalCorrectionNote)
 	}
+	note := fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	return appendNoteBeforeAssistant(fullPrompt, note)
+}
+
+// refusalCorrectionNote contradicts the invented limit directly. The model
+// claims a per-turn tool budget that does not exist, so the correction states
+// the real contract instead of asking for better JSON.
+const refusalCorrectionNote = "[System correction: Your previous reply claimed a tool or function-call budget that does not exist. There is no per-turn tool limit, no numeric quota, and no counter to track; tools stay available for every turn of this conversation. Do not mention budgets, quotas, remaining counts, or tool availability. Take the next step now by emitting exactly one ```json {\"tool_calls\":[...]} ``` block that calls the tool the task requires, or, if the task is already complete, state the result in one short paragraph.]"
+
+// appendNoteBeforeAssistant inserts a note immediately before the trailing
+// "Assistant:" cue, so the model reads it as the last thing before answering.
+func appendNoteBeforeAssistant(fullPrompt, note string) string {
 	const suffix = "\n\nAssistant:"
 	if strings.HasSuffix(fullPrompt, suffix) {
 		return fullPrompt[:len(fullPrompt)-len(suffix)] + "\n\n" + note + suffix

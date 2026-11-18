@@ -168,6 +168,22 @@ func exhaustedBucket(quota []gemini.QuotaBucket, now time.Time) (label string, r
 	return "", time.Time{}, false
 }
 
+// looksLikeAccountBan reports whether a recorded failure was upstream restricting
+// the account itself. Such a verdict survives a healthy registry read: the account
+// can list models and still be refused for every generation.
+func looksLikeAccountBan(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if m == "" {
+		return false
+	}
+	for _, needle := range []string{"account_banned", "tos_violation", "permission_denied", "quarantin"} {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func looksLikeAuthFailure(msg string) bool {
 	m := strings.ToLower(strings.TrimSpace(msg))
 	if m == "" {

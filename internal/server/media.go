@@ -450,6 +450,7 @@ func (s *Server) runMediaGenerationOnAccount(
 		HasTools:        false,
 		ProtocolMode:    "web",
 		PersonalContext: "off",
+		NoFrameTimeout:  s.Cfg.NoFrameTimeout,
 	}
 	client := s.clientFor(account)
 	var (

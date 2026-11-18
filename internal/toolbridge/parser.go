@@ -39,6 +39,49 @@ var (
 	// scarcity noun next to a tool noun, an exhaustion word next to a tool noun,
 	// or a zero/remaining marker instead.
 	toolBudgetClaimRe = regexp.MustCompile(`(?i)(?:(?:cupo|cuota|l[íi]mite|limite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|tool\s+budget|tool\s+limit|quota|allowance)[^.\n]{0,60}(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|search\s+calls?|tools?)[^.\n]{0,40}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up|(?:en|a)\s+0\b|\b0\s+(?:restantes?|disponibles?|remaining))|(?:agot[óo]|alcanz[óo]|excedi[óo]|super[óo]|bloque[óo])\s+(?:el\s+|la\s+)?(?:cupo|cuota|l[íi]mite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+|de\s+)?)?(?:herramientas?|funciones?|b[úu]squedas?)|(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|tools?)\b[^.\n]{0,60}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up)|(?:bloquead[oa]s?|restringid[oa]s?)\s+(?:en\s+|por\s+)?[^.\n]{0,40}(?:llamadas?|herramientas?)|\(\s*\b(?:0|zero|cero)\s+remaining\s*\)|\b(?:0|cero|zero)\s+(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)|(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)\s+(?:restantes|disponibles|remaining)\s*[:=]?\s*\b(?:0|cero|zero)\b|(?:sin|no\s+(?:hay|quedan|tiene|tenemos))\s+(?:m[áa]s\s+)?(?:cupo|llamadas?\s+(?:de\s+|a\s+)?(?:herramientas?|funciones?)))`)
+	// toolProtocolRefusalPatterns detects an invented refusal of the
+	// tool-calling protocol. It is a list of named, separately testable phrases
+	// rather than one expression: the model produces this refusal in many
+	// shapes (a hallucinated budget, a "tools unavailable this turn" claim, an
+	// accusation of prompt injection), and a single alternation could not be
+	// extended without risking an accidental precedence bug.
+	toolProtocolRefusalPatterns = []struct {
+		name string
+		re   *regexp.Regexp
+	}{
+		// Budget/limit claims in English: "exhausted my tool-call budget".
+		{"budget-exhausted-en", regexp.MustCompile(`(?i)\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b`)},
+		{"budget-reached-en", regexp.MustCompile(`(?i)\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b`)},
+		{"zero-remaining-en", regexp.MustCompile(`(?i)\b(?:tool[- ]?calls?|function[- ]?calls?|tools?|budget)\b[^.!?]{0,60}\b0\s+remaining\b`)},
+		{"zero-left-en", regexp.MustCompile(`(?i)\b0\s+(?:tool|function)[- ]?(?:call|use)s?\s+(?:remaining|left)\b`)},
+		// Budget claims in Indonesian: "kuota pemanggilan tool sudah habis".
+		{"budget-exhausted-id", regexp.MustCompile(`(?i)\bkuota\s+(?:pemanggilan\s+|pemakaian\s+|penggunaan\s+)?(?:tool|fungsi)\b[^.!?]{0,80}?\b(?:sudah|telah)\s+habis\b`)},
+		{"zero-remaining-id", regexp.MustCompile(`(?i)\b(?:0|nol)\s+(?:tool|pemanggilan\s+tool|tool\s+calls?)\b[^.!?]{0,30}\b(?:tersisa|tersedia|left|remaining)\b`)},
+		{"zero-left-id", regexp.MustCompile(`(?i)\b(?:sisa|jumlah)\s+(?:tool|pemanggilan\s+tool|tool\s+calls?)\b[^.!?]{0,40}\b(?:0|nol)\b`)},
+		// The number can also follow the noun: "tool calls remaining: **0**",
+		// "tool budget left: 0". Markdown emphasis, backticks and a colon may sit
+		// between the noun and the digit, so they are absorbed by the separator
+		// class. \x60 is a backtick; a literal one cannot appear inside a raw
+		// string literal.
+		{"zero-after-noun-en", regexp.MustCompile("(?i)\\b(?:tool|function)[- ]?(?:calls?|budget|quota|limit|uses?|use)\\b(?:[\\s*_:\\x60]+(?:calls?|remaining|left|available|reached))*[\\s*_:\\x60]{1,4}(?:0|zero)\\b")},
+		// The model also drops the word "tool": "search calls remaining: **0**".
+		// Requiring an adjacent tool/function noun missed that shape, so the
+		// "calls remaining/left" pair is matched on its own; the digit must still
+		// be zero directly after it.
+		{"calls-remaining-zero-en", regexp.MustCompile("(?i)\\b(?:calls?|uses?)\\s+(?:remaining|left|available)\\b[\\s*_:\\x60]{0,6}(?:0|zero)\\b")},
+		{"zero-after-noun-id", regexp.MustCompile("(?i)\\b(?:pemanggilan\\s+tool|tool\\s+calls?|kuota\\s+tool|sisa\\s+tool)\\b[\\s*_:\\x60]{1,4}(?:0|nol)\\b")},
+		// Availability claims: the tool surface is switched off for this turn.
+		// This is the shape that reached the client as a final answer: "Eksekusi
+		// tool inspeksi file sedang tidak tersedia di turn ini (0 tool calls
+		// tersisa)".
+		{"unavailable-this-turn-id", regexp.MustCompile(`(?i)\b(?:tool|tool\s+calls?|pemanggilan\s+tool|eksekusi\s+tool|tidak)\b[^.!?]{0,80}\b(?:sedang\s+)?tidak\s+(?:tersedia|dapat\s+digunakan|bisa\s+digunakan|aktif|tersedia\s+di\s+turn)\b`)},
+		{"unavailable-this-turn-en", regexp.MustCompile(`(?i)\b(?:tools?|tool[- ]?calls?|tool\s+execution)\b[^.!?]{0,60}\b(?:is|are)\s+(?:currently\s+)?(?:not\s+available|unavailable|disabled)\b`)},
+		{"cannot-invoke-id", regexp.MustCompile(`(?i)\b(?:tidak|tak)\s+(?:bisa|dapat)\s+(?:menjalankan|memanggil|menggunakan|mengeksekusi)\s+(?:the\s+)?(?:tool|tools|tool\s+calls?)\b`)},
+		{"cannot-invoke-en", regexp.MustCompile(`(?i)\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey|invoke|call|run)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol|tools?)\b`)},
+		// Reframing the tool protocol itself as adversarial.
+		{"prompt-injection-claim", regexp.MustCompile(`(?i)\b(?:prompt\s+injection|jailbreak)\b[^.!?]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b`)},
+		{"protocol-called-injection", regexp.MustCompile(`(?i)\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b[^.!?]{0,80}\b(?:prompt\s+injection|jailbreak)\b`)},
+	}
 )
 
 // ToolProtocolRefusalError is the tool_call_error text produced when the model
@@ -110,30 +153,134 @@ func unwrapIdenticalMarkdownLinks(s string) string {
 	})
 }
 
-// IsToolProtocolRefusal reports whether a short plain-text reply is an invented
+// IsToolProtocolRefusal reports whether a plain-text reply is an invented
 // refusal of the tool-calling protocol itself (such as hallucinating an
 // exhausted "tool budget" or claiming the tool_calls JSON format is a prompt
 // injection).
+//
+// Only the opening of the reply is inspected, because a refusal is the model's
+// opening statement. The previous rule rejected any reply longer than 1200
+// bytes outright, and that failed in the shape the model actually produces when
+// it gives up on tools: a one-line refusal followed by step-by-step manual
+// instructions. Such a reply was shipped to the client as a final answer, which
+// is the reported "it says it cannot execute" behaviour. A bounded window
+// catches the opening refusal and still leaves a long answer that merely
+// mentions a tool budget mid-document alone.
+
+// RefusalWindowBytes is how much of the reply the refusal detector reads. The
+// streaming gate uses it too: with tools active, no text may be emitted before
+// this many bytes have arrived, because an emitted byte commits the attempt and
+// makes the tool_call_error retry illegal.
+const RefusalWindowBytes = 2000
+
+// IsToolProtocolRefusal reports whether a plain-text reply is an invented
+// refusal of the tool-calling protocol.
 func IsToolProtocolRefusal(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
 	}
-	// The upstream tool-call guard can arrive embedded inside an otherwise long
-	// answer, so these protocol markers are checked without a length bound.
+	// The upstream guard marker is unambiguous and can arrive embedded in an
+	// otherwise long answer, so it is checked without a length bound.
 	if toolCallGuardRe.MatchString(trimmed) {
 		return true
 	}
+	// Model replies wrap at prose width, so a refusal routinely breaks the
+	// phrase it uses across lines ("sedang tidak\n tersedia"). Collapse every
+	// whitespace run to one space first: the patterns are phrase-shaped, and a
+	// newline in the middle of a phrase must not hide the refusal.
+	trimmed = strings.Join(strings.Fields(trimmed), " ")
+	if len(trimmed) > RefusalWindowBytes {
+		trimmed = trimmed[:RefusalWindowBytes]
+	}
+	// These detectors are bounded by the same window as the pattern list: a
+	// late mention inside an otherwise legitimate long answer must stay an
+	// answer, and the streaming gate only holds RefusalWindowBytes anyway.
 	if toolProtocolRefusalEsRe.MatchString(trimmed) {
 		return true
 	}
 	if toolBudgetClaimRe.MatchString(trimmed) {
 		return true
 	}
-	if len(trimmed) > 1200 {
+	if toolProtocolRefusalRe.MatchString(trimmed) {
+		return true
+	}
+	return matchToolProtocolRefusal(trimmed)
+}
+
+// RefusalErrorText is the message carried by a tool_call_error that was caused
+// by an invented protocol refusal rather than by a schema violation. The server
+// uses it to choose a correction that contradicts the refusal instead of one
+// that asks for better JSON.
+const RefusalErrorText = "the model refused the tool-calling protocol"
+
+// IsRefusalMessage reports whether a tool_call_error message describes a
+// protocol refusal. Both the streaming gate and InterpretReply use this exact
+// text so the server has one string to test.
+func IsRefusalMessage(msg string) bool {
+	return strings.Contains(msg, RefusalErrorText)
+}
+
+// matchToolProtocolRefusal reports whether any known refusal phrase matches.
+// RefusalPatternNames is exported for tests so a new pattern cannot be added
+// without a case that proves it fires and a case that proves normal prose does
+// not.
+func matchToolProtocolRefusal(trimmed string) bool {
+	for _, p := range toolProtocolRefusalPatterns {
+		if p.re.MatchString(trimmed) {
+			return true
+		}
+	}
+	return zeroQuotaRefusal(trimmed)
+}
+
+// zeroQuotaRefusal reports the budget-refusal shape structurally instead of by
+// phrase. Enumerating wordings did not converge: the model produced "0 tool
+// calls tersisa", then "calls remaining: **0**", then "There are **0** built-in
+// tool and search calls remaining" for the same question, and every new wording
+// shipped a refusal as the final answer.
+//
+// The structural signal is a zero count stated next to both a tool word and an
+// availability word, inside one sentence. Prose that merely reports a zero
+// result ("returned 0 matches", "0 errors were found") has no availability word
+// and stays an answer.
+func zeroQuotaRefusal(trimmed string) bool {
+	if !strings.Contains(trimmed, "0") && !strings.Contains(strings.ToLower(trimmed), "zero") && !strings.Contains(strings.ToLower(trimmed), "nol") {
 		return false
 	}
-	return toolProtocolRefusalRe.MatchString(trimmed)
+	for _, sentence := range splitRefusalSentences(trimmed) {
+		lower := strings.ToLower(sentence)
+		if !refusalZeroRe.MatchString(lower) {
+			continue
+		}
+		if refusalToolWordRe.MatchString(lower) && refusalAvailabilityRe.MatchString(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitRefusalSentences cuts on sentence terminators so a zero in one sentence
+// cannot be paired with an availability word in another.
+func splitRefusalSentences(s string) []string {
+	return refusalSentenceSplitRe.Split(s, -1)
+}
+
+var (
+	refusalSentenceSplitRe = regexp.MustCompile(`[.!?\n]+`)
+	// A zero standing alone as a count: not "10", "0.5", or "100".
+	refusalZeroRe         = regexp.MustCompile(`(?:^|[\s(*_:=])(?:0|zero|nol)(?:$|[\s)*_.,:;])`)
+	refusalToolWordRe     = regexp.MustCompile(`\b(?:tool|tools|tool[- ]?calls?|function[- ]?calls?|pemanggilan\s+tool|fungsi|search\s+calls?)\b`)
+	refusalAvailabilityRe = regexp.MustCompile(`\b(?:remaining|left|available|tersisa|tersedia|limit|quota|budget|kuota|habis|maximum|reached)\b`)
+)
+
+// RefusalPatternNames returns the identifier of every refusal pattern.
+func RefusalPatternNames() []string {
+	names := make([]string, 0, len(toolProtocolRefusalPatterns))
+	for _, p := range toolProtocolRefusalPatterns {
+		names = append(names, p.name)
+	}
+	return names
 }
 
 type candidateSpan struct {

@@ -44,7 +44,19 @@ type StreamOptions struct {
 	ProtocolMode    string // "bridge" | "web"
 	PersonalContext string // "auto" | "off" | "on"
 	FreshSocket     bool
+	// NoFrameTimeout bounds how long the stream may run without delivering a
+	// single parsed frame. Gemini can accept the request, answer every
+	// transport-level read with length prefixes and empty envelopes, and never
+	// produce a candidate; nothing above the transport layer can tell that apart
+	// from a slow model, so the deadline lives here next to the frame counter.
+	NoFrameTimeout time.Duration
 }
+
+// defaultNoFrameTimeout bounds a StreamGenerate that never yields a candidate
+// frame. It is deliberately shorter than the transport stall timeout: a stream
+// answering with keepalive envelopes is not slow, it is dead, and holding the
+// caller until the transport gives up costs the whole request.
+const defaultNoFrameTimeout = 75 * time.Second
 
 // StreamResponse captures the final HTTP status, headers, and conversation state from StreamGenerateLive.
 type StreamResponse struct {
@@ -412,6 +424,17 @@ func (ac *AccountClient) streamGenerateLocked(
 		grounding       []GroundingSource
 	)
 
+	// firstFrameTimeout bounds a stream that stays connected and busy while never
+	// producing a frame. The transport stall timer cannot see this: Gemini answers
+	// with length prefixes and empty envelopes, which are real bytes on the wire
+	// and reset that timer, while the user sees nothing. The deadline is derived
+	// from parsed frames, so it only fires for a stream that produced nothing.
+	firstFrameTimeout := opts.NoFrameTimeout
+	if firstFrameTimeout <= 0 {
+		firstFrameTimeout = defaultNoFrameTimeout
+	}
+	noFrameCtx, frameWatch := newFrameWatchdog(ctx, firstFrameTimeout)
+	defer frameWatch.Release()
 	emitLine := func(line string) error {
 		parsed, err := ParseFrameLine(line)
 		if err != nil {
@@ -444,6 +467,9 @@ func (ac *AccountClient) streamGenerateLocked(
 		if parsed.StreamEnd {
 			sawStreamEnd = true
 		}
+		if len(parsed.Frames) > 0 && frameCount == 0 {
+			frameWatch.Disarm()
+		}
 		frameCount += len(parsed.Frames)
 		grounding = MergeGroundingSources(grounding, parsed.GroundingSources)
 		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
@@ -452,7 +478,7 @@ func (ac *AccountClient) streamGenerateLocked(
 		return nil
 	}
 
-	res, err := sc.Do(ctx, transport.RequestOptions{
+	res, err := sc.Do(noFrameCtx, transport.RequestOptions{
 		Method:      "POST",
 		URL:         Origin + "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?" + q.Encode(),
 		Kind:        transport.ReqKindCORS,
@@ -477,6 +503,13 @@ func (ac *AccountClient) streamGenerateLocked(
 		},
 	})
 	if err != nil {
+		// The watchdog cancels the request context, so the transport reports the
+		// failure as an ordinary cancellation. The expiry flag is what turns it
+		// into a retryable stall instead of a client_cancelled that no failover
+		// path will pick up.
+		if stallErr := noFrameStallError(frameWatch, firstFrameTimeout, nil); stallErr != nil {
+			return nil, stallErr
+		}
 		var ue *transport.UpstreamError
 		if errors.As(err, &ue) {
 			return nil, ue
@@ -506,6 +539,11 @@ func (ac *AccountClient) streamGenerateLocked(
 					return nil, err
 				}
 			}
+		}
+		// The watchdog verdict is taken after the tail flush, so a frame that
+		// arrived in the final chunk still counts as output.
+		if stallErr := noFrameStallError(frameWatch, firstFrameTimeout, res.Headers); stallErr != nil {
+			return nil, stallErr
 		}
 		if frameCount == 0 && asyncVideoCID != "" {
 			// If Temporary was enabled and inner[45] was 1, Google does not persist the conversation for hNvQHb polling.
@@ -905,4 +943,19 @@ func (ac *AccountClient) DownloadMedia(ctx context.Context, rawURL, fallbackURL 
 		}
 	}
 	return nil, "", fmt.Errorf("media download failed (HTTP %d)", lastStatus)
+}
+
+// noFrameStallError reports a stream abandoned because it never produced a
+// candidate frame. Returning nil keeps the caller's own verdict.
+func noFrameStallError(watch *frameWatchdog, timeout time.Duration, headers map[string]string) error {
+	if !watch.Expired() {
+		return nil
+	}
+	return transport.NewUpstreamError(
+		fmt.Sprintf("upstream sent no candidate frame for %ds (only keepalive envelopes)", int(timeout.Seconds())),
+		504,
+		"upstream_stalled",
+		headers,
+		nil,
+	)
 }

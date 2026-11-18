@@ -867,8 +867,33 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 		p = findBatchPayload(entries, "otAQ7b")
 	}
 
-	if isStatus1016(p) {
-		return nil, transport.NewUpstreamError("session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account", 401, "upstream_auth_error", res.Headers, nil)
+	if code := accountStatusCode(p); code != 0 && code != 1000 {
+		if code == 1014 {
+			// A temporary access restriction, not a verdict on the account. It is
+			// reported as a retryable degradation so the pool fails over now and
+			// comes back to this account once the restriction lifts.
+			return nil, transport.NewUpstreamError(
+				"upstream temporarily restricted this account (code 1014): "+accountStatusCodes[code]+" — retrying later usually succeeds",
+				503,
+				"upstream_degraded",
+				res.Headers,
+				nil,
+			)
+		}
+		if code == 1016 {
+			return nil, transport.NewUpstreamError("session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account", 401, "upstream_auth_error", res.Headers, nil)
+		}
+		reason, known := accountStatusCodes[code]
+		if !known {
+			reason = "account status is not one this bridge recognizes"
+		}
+		return nil, transport.NewUpstreamError(
+			fmt.Sprintf("upstream rejected this account (code %d): %s — retrying will not help; fix the account on gemini.google.com", code, reason),
+			403,
+			"account_banned",
+			res.Headers,
+			nil,
+		)
 	}
 
 	pArr, ok := p.([]any)
@@ -1215,15 +1240,38 @@ func findBatchPayload(entries []BatchEntry, rpcID string) any {
 	return nil
 }
 
-func isStatus1016(p any) bool {
+// accountStatusCodes maps the numeric status GetUserStatus returns to a human
+// explanation. Only a handful were recognized before, so an account restricted
+// for a terms-of-service or regional reason surfaced as a generic upstream
+// error and the operator went looking in the wrong place. Every code below is
+// an account-level verdict that retrying cannot fix.
+var accountStatusCodes = map[int]string{
+	1014: "access is temporarily restricted (possibly regional or a transient session problem)",
+	1016: "session is unauthenticated or the saved cookies have expired",
+	1021: "account access is rejected; check the account's Google settings",
+	1033: "account did not pass Google's safety or trust checks for some features",
+	1040: "the latest Terms of Service must be accepted on this account",
+	1042: "the account's accepted Terms of Service are out of date",
+	1054: "access is blocked by a parent or guardian",
+	1057: "access requires parent or guardian approval",
+	1060: "Gemini is not available in this account's country or region",
+}
+
+// accountStatusCode reads the numeric status field of a GetUserStatus payload.
+// A nil or 1000 status means the account is authorized.
+func accountStatusCode(p any) int {
 	arr, ok := p.([]any)
 	if !ok || len(arr) <= 14 {
-		return false
+		return 0
 	}
-	if f, ok := arr[14].(float64); ok && int(f) == 1016 {
-		return true
+	if f, ok := arr[14].(float64); ok {
+		return int(f)
 	}
-	return false
+	return 0
+}
+
+func isStatus1016(p any) bool {
+	return accountStatusCode(p) == 1016
 }
 
 func toIntSlice(v any) []int {

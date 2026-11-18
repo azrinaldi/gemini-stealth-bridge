@@ -17,6 +17,7 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
@@ -293,6 +294,50 @@ func TestPoolQuotaErrorSummarizesUnavailableAccounts(t *testing.T) {
 	srv.HandleChat(context.Background(), pinnedRec, body, AuthScope{OK: true, AccountID: "acct1"})
 	if pinnedRec.Code != 429 || !strings.Contains(pinnedRec.Body.String(), "on account acct1") {
 		t.Fatalf("expected pinned account error to remain account-specific, got %d: %s", pinnedRec.Code, pinnedRec.Body.String())
+	}
+}
+
+// TestStalledStreamFailsOverInsteadOfHoldingTheClient pins the watchdog path end
+// to end: an account whose upstream never yields a frame must be abandoned and
+// the request retried on a healthy account. Before the frame watchdog existed the
+// transport timers were satisfied by keepalive envelopes, so the caller waited
+// until its own timeout, no failover happened, and the healthy account was never
+// tried.
+func TestStalledStreamFailsOverInsteadOfHoldingTheClient(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.MaxConcurrentPerAccount = 0
+	cfg.MaxRPMPerAccount = 0
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	srv := New(cfg)
+
+	stalled := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			// Stands in for the frame watchdog firing on the first account.
+			return nil, transport.NewUpstreamError("upstream sent no candidate frame", 504, "upstream_stalled", nil, nil)
+		},
+	}
+	healthy := clientFromFrames([]gemini.Frame{
+		makeFrame("OK", "", true, testModel.ModelID),
+	})
+
+	a1 := &AccountState{ID: "acct1", Email: "a1@example.com", Models: []gemini.ModelInfo{testModel}, Capacity: 2, ModelsAt: time.Now(), Client: stalled}
+	a2 := &AccountState{ID: "acct2", Email: "a2@example.com", Models: []gemini.ModelInfo{testModel}, Capacity: 2, ModelsAt: time.Now(), Client: healthy}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	body := map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "synthetic"}},
+	}
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, body, AuthScope{OK: true})
+	if rec.Code != 200 {
+		t.Fatalf("expected failover to the healthy account, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "OK") {
+		t.Fatalf("expected the healthy account's answer, got %s", rec.Body.String())
 	}
 }
 
@@ -2534,6 +2579,143 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 	}
 	if !strings.Contains(rec.Body.String(), `/tmp/data.db`) || !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
 		t.Fatalf("expected tool_calls completion, got:\n%s", rec.Body.String())
+	}
+}
+
+// A protocol refusal is not a schema error: telling the model to fix its JSON
+// produced the same refusal again and burned every retry. The correction must
+// contradict the invented budget instead, and must land right before the
+// Assistant cue so the model reads it last.
+func TestAppendToolErrorCorrectionRefusal(t *testing.T) {
+	base := "User: do the task\n\nAssistant:"
+	got := appendToolErrorCorrection(base, toolbridge.RefusalErrorText+" (hallucinated tool limit or refusal)")
+
+	if !strings.HasSuffix(got, "\n\nAssistant:") {
+		t.Fatalf("note must stay before the Assistant cue, got suffix %q", got[len(got)-20:])
+	}
+	if !strings.Contains(got, "budget that does not exist") {
+		t.Fatalf("refusal correction must contradict the invented budget, got %q", got)
+	}
+	if strings.Contains(got, "failed tool validation") {
+		t.Fatal("refusal must not receive the schema correction")
+	}
+}
+
+// A genuine schema failure still gets the schema correction, which asks for the
+// required properties.
+func TestAppendToolErrorCorrectionSchema(t *testing.T) {
+	base := "User: do the task\n\nAssistant:"
+	got := appendToolErrorCorrection(base, `missing required property "path"`)
+
+	if !strings.Contains(got, "failed tool validation") {
+		t.Fatalf("schema error must keep the schema correction, got %q", got)
+	}
+	if strings.Contains(got, "budget that does not exist") {
+		t.Fatal("schema error must not receive the refusal correction")
+	}
+	if !strings.HasSuffix(got, "\n\nAssistant:") {
+		t.Fatal("note must stay before the Assistant cue")
+	}
+}
+
+// A successful background model refresh proves the account is reachable and
+// authenticated, so the transient failure label must clear on its own. Only a
+// served request used to reset the counters, and the scheduler never serves one,
+// so "degraded" outlived its cause until an operator pressed Refresh manually.
+func TestRefreshAccountClearsTransientFailure(t *testing.T) {
+	a := &AccountState{ID: "acc1"}
+	a.Fails = 3
+	a.LastFail = time.Now()
+	a.LastError = "upstream_stalled: no candidate frame"
+
+	if !shouldClearTransientFailure(a.LastError) {
+		t.Fatal("a transient stall must be cleared by a healthy registry read")
+	}
+
+	// The session/auth verdicts must survive: they are not disproved by listing
+	// models, and hiding them would send the operator to the wrong remedy.
+	for _, severe := range []string{
+		"session is unauthenticated or the saved cookies have expired (code 1016)",
+		"upstream auth error 401: auth_redirect",
+		"account_banned: TOS_VIOLATION",
+		"account restricted upstream (PERMISSION_DENIED)",
+	} {
+		if shouldClearTransientFailure(severe) {
+			t.Errorf("severe failure %q must not be cleared by a registry read", severe)
+		}
+	}
+}
+
+// An account carrying a failure must be re-checked on a short cadence. The
+// recheck is what proves the failure is over and clears the degraded label, so a
+// full 30-minute model-refresh interval would leave the account looking broken
+// long after it recovered - the reason the operator was pressing Refresh by hand.
+func TestFailedAccountRechecksSooner(t *testing.T) {
+	now := time.Now()
+	s := &Server{Cfg: config.Config{ModelRefreshEvery: 30 * time.Minute}}
+
+	healthy := &AccountState{ID: "healthy"}
+	now2, healthyNext := s.nextRefreshAt(now, healthy)
+	failed := &AccountState{ID: "failed"}
+	failed.Fails = 2
+	failed.LastFail = now.Add(-time.Minute)
+	now3, failedNext := s.nextRefreshAt(now, failed)
+
+	if !now2.Equal(now) || !now3.Equal(now) {
+		t.Fatal("nextRefreshAt must not advance the clock")
+	}
+	if !healthyNext.After(now.Add(10 * time.Minute)) {
+		t.Errorf("a healthy account should keep the slow cadence, got %v", healthyNext.Sub(now))
+	}
+	if failedNext.Sub(now) > 3*failureRecheckInterval {
+		t.Errorf("a failed account must be re-checked within a few minutes, got %v", failedNext.Sub(now))
+	}
+	if !failedNext.Before(healthyNext) {
+		t.Errorf("failed recheck %v must come before healthy %v", failedNext.Sub(now), healthyNext.Sub(now))
+	}
+}
+
+// Recording a failure must pull the next model refresh forward. The recheck is
+// what proves the failure is over, and an account keeps whatever deadline it was
+// given while healthy - which is the slow cadence. Without this, an account that
+// breaks just after its scheduled refresh waits the full interval, which is the
+// state the operator kept escaping by pressing Refresh by hand.
+func TestMarkAccountFailureSchedulesFastRecheck(t *testing.T) {
+	now := time.Now()
+	a := &AccountState{ID: "acc1"}
+	// Healthy cadence: a refresh 25 minutes out.
+	a.NextModelRefAt = now.Add(25 * time.Minute)
+
+	s := &Server{clock: func() time.Time { return now }}
+	s.markAccountFailure(a, "upstream_stalled: no candidate frame")
+
+	a.mu.RLock()
+	due := a.NextModelRefAt
+	fails := a.Fails
+	a.mu.RUnlock()
+
+	if fails != 1 {
+		t.Fatalf("failure not recorded, Fails=%d", fails)
+	}
+	if d := due.Sub(now); d > 3*failureRecheckInterval {
+		t.Errorf("next refresh still %v out; a failed account must be re-checked within minutes", d)
+	}
+}
+
+// A failure must never push the recheck later than it already was.
+func TestMarkAccountFailureNeverDelaysRecheck(t *testing.T) {
+	now := time.Now()
+	a := &AccountState{ID: "acc1"}
+	a.NextModelRefAt = now.Add(30 * time.Second)
+
+	s := &Server{clock: func() time.Time { return now }}
+	s.markAccountFailure(a, "upstream_stalled")
+
+	a.mu.RLock()
+	due := a.NextModelRefAt
+	a.mu.RUnlock()
+	if due.After(now.Add(30 * time.Second)) {
+		t.Errorf("a failure moved the recheck later (%v); it must only pull it forward", due.Sub(now))
 	}
 }
 

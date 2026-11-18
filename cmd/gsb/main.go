@@ -315,6 +315,13 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	if lockPath := cookies.DetectActiveProfileLock(dbPath); lockPath != "" {
 		fmt.Printf("Note: Browser profile lock detected (%s); concurrent browser and bridge rotation on the same session can cause __Secure-1PSIDTS conflicts.\n", filepath.Base(lockPath))
 	}
+	// Chrome 127+ can bind the session to a hardware key (Device Bound Session
+	// Credentials). Cookies captured from such a profile expire within hours and
+	// `--rotate` cannot renew them, so say it here rather than letting the
+	// operator discover it as a 401 later.
+	if isChromiumFamilyDB(dbPath) {
+		fmt.Println("Note: Chromium-family profiles may use Device Bound Session Credentials (DBSC), which keeps imported cookies valid for only a few hours and blocks renewal. gsb --login uses a disposable profile and avoids this; a Firefox profile is the other safe source.")
+	}
 	hdr, err := cookies.ReadChromeCookies(dbPath)
 	if err != nil {
 		return err
@@ -784,4 +791,20 @@ func runCaptureReference(cfg config.Config, explicitProfile string) error {
 	fmt.Printf("Wrote Chrome reference fingerprint (%s) -> %s\n", explicitProfile, outPath)
 	fmt.Printf("Compare against a live dump with:\n  BRIDGE_DUMP_REQUEST=/tmp/gsb-dumps ./gsb --probe\n  ./scripts/diff-fingerprint.sh /tmp/gsb-dumps/req-*.json %s\n", outPath)
 	return nil
+}
+
+// isChromiumFamilyDB reports whether the Cookies database belongs to a browser
+// that can enable Device Bound Session Credentials. Firefox has no equivalent,
+// so the warning would only be noise there.
+func isChromiumFamilyDB(dbPath string) bool {
+	p := strings.ToLower(dbPath)
+	if strings.Contains(p, "firefox") || strings.HasSuffix(p, ".sqlite") {
+		return false
+	}
+	for _, name := range []string{"chrome", "chromium", "brave", "edge", "vivaldi", "arc", "opera"} {
+		if strings.Contains(p, name) {
+			return true
+		}
+	}
+	return false
 }

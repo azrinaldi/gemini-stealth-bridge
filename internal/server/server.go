@@ -98,6 +98,26 @@ func canStreamVerified(eagerStream, rejectDowngrade, identityConflict bool, mode
 	return eagerStream || !rejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(model, servedID, servedLabel))
 }
 
+// shouldAbortForModelRejection reports whether the served identity must end the
+// stream immediately, before any of that answer reaches the client.
+//
+// RejectDowngrade covers a different backend id. RejectLabelMismatch covers the
+// narrower case where the id named the requested slot but the label names
+// another tier, which is how Google renames a tier in place. Both must stop on
+// the first frame that carries the verdict: waiting for the generation to finish
+// spends the whole upstream latency (100-200s on the carbon tier) only to reject
+// the answer at the end, and on the eager path the answer would already be on
+// the wire.
+func shouldAbortForModelRejection(cfg config.Config, mediaToolUsed bool, model gemini.ModelInfo, servedID, servedLabel string) bool {
+	if mediaToolUsed || servedID == "" && servedLabel == "" {
+		return false
+	}
+	if cfg.RejectDowngrade && !gemini.IsMatchingServedModel(model, servedID, servedLabel) {
+		return true
+	}
+	return cfg.RejectLabelMismatch && gemini.ServedLabelMismatch(model, servedID, servedLabel)
+}
+
 type cachedUpload struct {
 	File gemini.UploadedFile
 	At   time.Time
@@ -938,6 +958,33 @@ func (s *Server) decollideRotationTimers() {
 	}
 }
 
+// nextRefreshAt computes the next model-refresh deadline for one account. An
+// account holding failure evidence is re-checked soon, because that check is
+// what clears the evidence; a healthy account keeps the slow cadence. now is
+// returned unchanged so callers can thread one clock value through.
+func (s *Server) nextRefreshAt(now time.Time, a *AccountState) (time.Time, time.Time) {
+	refEvery := s.Cfg.ModelRefreshEvery
+	if refEvery <= 0 {
+		refEvery = 30 * time.Minute
+	}
+	interval := refEvery + randDuration(refEvery/5)
+	if a != nil {
+		a.mu.RLock()
+		failing := a.Fails > 0 || !a.LastFail.IsZero()
+		a.mu.RUnlock()
+		if failing {
+			interval = failureRecheckInterval + randDuration(failureRecheckInterval/5)
+		}
+	}
+	return now, now.Add(interval)
+}
+
+// failureRecheckInterval is how often an account that recorded a failure is
+// re-checked. The recheck doubles as the probe that clears a transient failure
+// label, so it must be short enough that the operator never presses Refresh
+// manually just to see the account come back.
+const failureRecheckInterval = 2 * time.Minute
+
 // RunSchedulerStep evaluates one tick of the per-account background scheduler at now.
 func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 	if inQuietHours(now, s.Cfg.QuietHours) {
@@ -1015,8 +1062,9 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 			rCtx, rCancel := context.WithTimeout(ctx, 45*time.Second)
 			s.RefreshAccount(rCtx, a, true)
 			rCancel()
+			_, next := s.nextRefreshAt(now, a)
 			a.mu.Lock()
-			a.NextModelRefAt = now.Add(refEvery + randDuration(refEvery/5))
+			a.NextModelRefAt = next
 			a.mu.Unlock()
 		}
 	}

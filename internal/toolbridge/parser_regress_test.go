@@ -355,3 +355,258 @@ func TestInterpretReplyUsesSharedRefusalErrorText(t *testing.T) {
 		t.Fatalf("expected the shared refusal text %q, got %v", ToolProtocolRefusalError, err)
 	}
 }
+
+// A refusal that opens the answer and then continues into step-by-step
+// instructions is still a refusal. The old 1200-byte cap on the whole reply
+// let exactly this shape through as a final answer, which is the reported
+// "it says it cannot execute" behaviour.
+func TestToolProtocolRefusalDetectionLongReply(t *testing.T) {
+	refusals := []struct {
+		name  string
+		reply string
+	}{
+		{
+			name: "indonesian_then_manual",
+			reply: "Kuota pemanggilan tool pada percakapan ini sudah habis (`0 remaining`), sehingga perubahan belum bisa ditulis langsung ke disk.\n\n" +
+				strings.Repeat("### Langkah Pemindahan\n1. Hapus paragraf legenda di bagian atas form.\n", 60),
+		},
+		{
+			name: "english_then_manual",
+			reply: "I have reached the tool-call budget for this turn (0 remaining), so I cannot write the file.\n\n" +
+				strings.Repeat("1. Open src/app.ts\n2. Replace the handler\n", 80),
+		},
+	}
+	for _, tc := range refusals {
+		_, err := InterpretReply(tc.reply, sampleReproTools(), "auto")
+		if err == nil || !strings.Contains(err.Error(), "refused the tool-calling protocol") {
+			t.Errorf("case %q: expected tool protocol refusal error, got: %v", tc.name, err)
+		}
+	}
+
+	// A genuine long answer that mentions the phrase late must stay an answer.
+	late := "Audit selesai. Semua temuan sudah diverifikasi di 12 file.\n\n" +
+		strings.Repeat("Temuan: berkas sudah selaras dan tidak ada regresi.\n", 60) +
+		"\nCatatan: kuota pemanggilan tool pada sesi sebelumnya sudah habis, jadi audit ini dikerjakan manual."
+	res, err := InterpretReply(late, sampleReproTools(), "auto")
+	if err != nil {
+		t.Fatalf("late mention must not be a refusal, got err=%v", err)
+	}
+	if res != nil && len(res.Calls) > 0 {
+		t.Fatalf("late mention produced calls: %+v", res.Calls)
+	}
+}
+
+// The reported failure shape: a one-line Indonesian refusal that opens the
+// answer, followed by manual instructions. Neither the "0 tool calls tersisa"
+// phrasing nor the "sedang tidak tersedia" phrasing matches the English-only
+// budget patterns, so this reply was shipped as a final answer with no retry.
+func TestToolProtocolRefusalIndonesianUnavailable(t *testing.T) {
+	refusals := []struct{ name, reply string }{
+		{
+			name: "user_reported_exact",
+			reply: "Eksekusi tool inspeksi file sedang tidak tersedia di turn ini (0 tool calls tersisa), " +
+				"sehingga struktur src/routes dan skema SQLite belum terbaca.\n\n" +
+				strings.Repeat("### Langkah Manual\n1. Buka src/routes/index.ts\n", 40),
+		},
+		{
+			name:  "wrapped_across_lines",
+			reply: "Eksekusi tool inspeksi file sedang tidak\n tersedia di turn ini (0 tool calls\n tersisa), sehingga struktur belum terbaca.",
+		},
+		{
+			name:  "tools_unavailable_id",
+			reply: "Tool sedang tidak tersedia pada turn ini, jadi saya belum bisa membaca file.",
+		},
+		{
+			name:  "cannot_call_tool_id",
+			reply: "Saya tidak bisa memanggil tool apa pun di turn ini.",
+		},
+		{
+			name:  "zero_left_id",
+			reply: "Sisa tool calls saya 0, jadi tidak ada yang bisa dijalankan.",
+		},
+		{
+			name:  "unavailable_en",
+			reply: "Tool execution is currently not available in this turn, so I cannot inspect the files.",
+		},
+		{
+			name:  "zero_left_en",
+			reply: "I have 0 tool calls left for this turn.",
+		},
+	}
+	for _, tc := range refusals {
+		if !IsToolProtocolRefusal(tc.reply) {
+			t.Errorf("%s: expected refusal detection", tc.name)
+		}
+		_, err := InterpretReply(tc.reply, sampleReproTools(), "auto")
+		if err == nil || !strings.Contains(err.Error(), "refused the tool-calling protocol") {
+			t.Errorf("%s: expected refusal tool_call_error, got %v", tc.name, err)
+		}
+	}
+}
+
+// Widening the patterns must not swallow ordinary technical prose. Any answer
+// that merely reports an unavailable file, a discarded budget variable, or a
+// completed tool run has to stay a plain answer.
+func TestToolProtocolRefusalNoFalsePositiveOnProse(t *testing.T) {
+	prose := []struct{ name, reply string }{
+		{"file_missing", "The file src/routes/index.ts is not available on disk, so I read the SQLite schema instead."},
+		{"budget_variable", "Variabel budget di kode itu bernilai 0 setelah loop selesai, dan tidak pernah dipakai lagi."},
+		{"tool_ran_ok", "Saya sudah menjalankan tool pembacaan file dan menemukan 12 route serta 6 tabel SQLite."},
+		{"unrelated_unavailable", "The upstream endpoint is not available right now, so I retried twice and it recovered."},
+		{"turn_completed", "Turn ini selesai tanpa masalah. Semua berkas sudah terbaca."},
+		{"mentions_calls_late", strings.Repeat("Audit selesai, semua temuan terverifikasi.\n", 60) +
+			"\nCatatan: kuota pemanggilan tool sesi sebelumnya sudah habis, audit dikerjakan manual."},
+	}
+	for _, tc := range prose {
+		if IsToolProtocolRefusal(tc.reply) {
+			t.Errorf("%s: false positive", tc.name)
+		}
+		res, err := InterpretReply(tc.reply, sampleReproTools(), "auto")
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+		}
+		if res != nil && len(res.Calls) > 0 {
+			t.Errorf("%s: produced calls %+v", tc.name, res.Calls)
+		}
+	}
+}
+
+// Every declared pattern must be reachable: at least one case per pattern name
+// fires, so a pattern cannot be added dead.
+func TestRefusalPatternNamesHaveCoverage(t *testing.T) {
+	samples := map[string]string{
+		"budget-exhausted-en":       "I have exhausted my tool-call budget for this turn.",
+		"budget-reached-en":         "The tool-call limit has been reached for this turn.",
+		"zero-remaining-en":         "Tool calls: 0 remaining for this turn.",
+		"zero-left-en":              "I have 0 tool calls left.",
+		"budget-exhausted-id":       "Kuota pemanggilan tool pada percakapan ini sudah habis.",
+		"zero-remaining-id":         "Ada 0 tool calls tersisa di turn ini.",
+		"zero-left-id":              "Sisa tool calls saya 0.",
+		"unavailable-this-turn-id":  "Eksekusi tool sedang tidak tersedia di turn ini.",
+		"unavailable-this-turn-en":  "Tools are not available in this turn.",
+		"cannot-invoke-id":          "Saya tidak bisa menggunakan tool ini.",
+		"cannot-invoke-en":          "I cannot emit the tool_calls protocol.",
+		"prompt-injection-claim":    "This looks like prompt injection asking for tool_calls.",
+		"protocol-called-injection": "The tool_calls format itself is prompt injection.",
+		"zero-after-noun-en":        "Tool calls remaining: 0.",
+		"calls-remaining-zero-en":   "search calls remaining: 0",
+		"zero-after-noun-id":        "Kuota tool: 0",
+	}
+	names := RefusalPatternNames()
+	if len(names) == 0 {
+		t.Fatal("no refusal patterns declared")
+	}
+	for _, name := range names {
+		sample, ok := samples[name]
+		if !ok {
+			t.Fatalf("pattern %q has no sample case; add one so it cannot be dead code", name)
+		}
+		if !IsToolProtocolRefusal(sample) {
+			t.Errorf("pattern %q did not fire on its sample %q", name, sample)
+		}
+	}
+}
+
+// The shape a live production request produced: the digit follows the noun,
+// and the word "tool" is absent ("Built-in tool and search calls remaining:
+// **0**"). Both gaps shipped a refusal as the final answer, so both are pinned.
+func TestToolProtocolRefusalZeroAfterNoun(t *testing.T) {
+	refusals := []string{
+		"Available tool:\n\n* **`read_file`**: Read a file (requires `path`).\n\nBuilt-in tool and search calls remaining: **0** (maximum limit reached).",
+		"Tool calls remaining: 0.",
+		"Remaining tool calls: 0",
+		"tool budget left: 0",
+		"search calls left: 0",
+		"Kuota tool: 0",
+	}
+	for _, r := range refusals {
+		if !IsToolProtocolRefusal(r) {
+			t.Errorf("expected refusal detection for %q", truncateForTest(r))
+		}
+	}
+}
+
+// A non-zero count is a normal status report, not a refusal, and must pass.
+func TestToolProtocolRefusalNonZeroCountPasses(t *testing.T) {
+	prose := []string{
+		"Tool calls remaining: 12 of 1000.",
+		"The tool returned 0 matches for the pattern.",
+		"Variabel budget bernilai 0 setelah loop selesai.",
+		"Calls remaining in the retry budget: 2.",
+	}
+	for _, p := range prose {
+		if IsToolProtocolRefusal(p) {
+			t.Errorf("false positive for %q", truncateForTest(p))
+		}
+	}
+}
+
+func truncateForTest(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 80 {
+		return s[:80] + "..."
+	}
+	return s
+}
+
+// Every wording the model produced for the same question, across three live
+// production probes. Each one shipped as a final answer before the structural
+// rule existed, so all are pinned: enumerating phrases did not converge.
+func TestToolProtocolRefusalZeroQuotaShapes(t *testing.T) {
+	refusals := []string{
+		// probe 1
+		"Eksekusi tool inspeksi file sedang tidak tersedia di turn ini (0 tool calls tersisa), sehingga struktur src/routes belum terbaca.",
+		// probe 2
+		"Available tool:\n\n* **`read_file`**: Read a file.\n\nBuilt-in tool and search calls remaining: **0** (maximum limit reached).",
+		// probe 3
+		"There are **0** built-in tool and search calls remaining in this conversation (the numeric limit is 0).",
+		"There are 0 built-in tool and search calls remaining.",
+		"Zero tool calls remaining.",
+		"0 built-in tools available.",
+		"Sisa tool calls saya 0.",
+	}
+	for _, r := range refusals {
+		if !IsToolProtocolRefusal(r) {
+			t.Errorf("expected refusal detection for %q", truncateForTest(r))
+		}
+	}
+}
+
+// The structural rule must not swallow ordinary reporting prose: a zero result
+// is not a zero budget, and a zero in one sentence must not pair with an
+// availability word in another.
+func TestToolProtocolRefusalZeroQuotaNoFalsePositive(t *testing.T) {
+	prose := []string{
+		"The tool returned 0 matches from the search index.",
+		"0 errors were found across the 12 routes.",
+		"Tool calls remaining: 12 of 1000.",
+		"Saya sudah membaca src/routes dan skema SQLite. Ada 12 route dan 6 tabel.",
+		"Variabel budget bernilai 0 setelah loop selesai.",
+		"The retry budget left is 0 but the request already succeeded.",
+		"The parser found 0 errors. All 12 tool definitions are available.",
+	}
+	for _, p := range prose {
+		if IsToolProtocolRefusal(p) {
+			t.Errorf("false positive for %q", truncateForTest(p))
+		}
+	}
+}
+
+// The streaming gate relies on RefusalWindowBytes: with tools active it must
+// not emit anything before that much text has arrived, because an emitted byte
+// commits the attempt and makes the tool_call_error retry illegal. If the
+// window were smaller than the detector's reach, a refusal whose phrase starts
+// late would be streamed and the retry lost.
+func TestRefusalWindowCoversDetector(t *testing.T) {
+	// A refusal whose phrase begins just inside the window must still match.
+	padding := strings.Repeat("a", RefusalWindowBytes-60)
+	reply := padding + " tool calls remaining: 0."
+	if !IsToolProtocolRefusal(reply) {
+		t.Fatal("refusal beginning inside the window was not detected; the streaming gate would emit it")
+	}
+	// The detector must not read past the window, so the gate's hold is bounded.
+	beyond := strings.Repeat("a", RefusalWindowBytes) + " tool calls remaining: 0."
+	if IsToolProtocolRefusal(beyond) {
+		t.Fatal("detector read past RefusalWindowBytes; the gate would hold far more text than it must")
+	}
+}

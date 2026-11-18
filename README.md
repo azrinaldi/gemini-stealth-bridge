@@ -66,7 +66,7 @@ The daemon runs without headless Chrome or CDP. Browserless transport is an impl
 
 Compatibility covers the endpoints and fields documented here, not the entire OpenAI API:
 
-- Sampling and output controls such as `temperature`, `top_p`, `max_tokens`, and `max_output_tokens` are **not forwarded** as generation controls. They may appear in model metadata for client compatibility, but they do not enforce output limits or change sampling.
+- Sampling controls such as `temperature`, `top_p`, and `seed` are **not forwarded** and do not change output. Output-shaping controls **are** enforced locally: `max_tokens` / `max_completion_tokens` truncate the answer and report `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format` with `type: "json_object"` or `"json_schema"` strips Gemini's code fence so the client receives a bare JSON object. `max_tokens` and `stop` are honoured while streaming: only the prefix inside the limit is emitted, so the client never receives text the final answer would not contain. `response_format` is the exception — a JSON object cannot be unwrapped before it is complete, so that request is emitted once at the end.
 - Responses clients must resend conversation history in `input`; `previous_response_id` is not a continuation mechanism. Response retrieval, deletion, and background jobs are not implemented.
 - Function calling is prompt-based, not native Gemini Developer API function calling. Malformed or schema-invalid calls can fail with `tool_call_error`.
 - Token usage is estimated locally, not reported by Google's billing/tokenizer API. The model registry advertises a 1,048,576-token context window and 65,536-token output limit as metadata, not a guarantee for every account or request.
@@ -352,6 +352,8 @@ This matters for Docker: bridge NAT makes every request look remote, so the cont
   - *Copy Key*
   - *Remove Account* (two-step confirmation)
 - **Refresh All** queries upstream with `/v1/accounts?live=1`.
+
+An account that records a failure is re-checked automatically within about two minutes instead of waiting the full `BRIDGE_MODEL_REFRESH_MS` interval. The re-check is a real model-registry read, so a successful one proves the account is reachable and authenticated and clears the transient failure label on its own. A rejected session (`code 1016`) or a restricted account is not disproved by listing models, so those keep their own status and their own remedy. Nothing here requires a manual Refresh.
 
 Status badges map the API statuses to UI labels: `ok` → Ready, `disabled` → Paused, `exhausted` → Exhausted, `cooling` → Cooling, `degraded` → Degraded, `quarantined` → Quarantined, `expired` → Expired, `unknown` → Unprobed.
 
@@ -709,7 +711,9 @@ Non-streaming errors use HTTP status codes with the envelope above. Streaming re
 | `model_discovery_error` | 502 | Upstream model registry was malformed or unavailable |
 | `upstream_connect_timeout` | 504 | First-byte timeout |
 | `upstream_timeout` | 504 | Overall upstream timeout |
-| `upstream_stalled` | 504 | No generation frame within `BRIDGE_STALL_TIMEOUT_MS` |
+| `upstream_stalled` | 504 | No generation frame within `BRIDGE_STALL_TIMEOUT_MS`, or no candidate frame at all within `BRIDGE_NO_FRAME_TIMEOUT_MS` |
+| `upstream_degraded` | 502 | Gemini Web failed the turn or temporarily restricted the account (code 1185 / 1014); retrying on another account usually succeeds |
+| `upstream_transient` | 503 | Gemini reported a temporary model error (code 1013); retried automatically |
 | `upstream_upload_error` | 502 | Attachment upload failed |
 | `search_timeout` | 504 | MCP search deadline exceeded |
 | `media_generation_failed` | 502 | No media returned by upstream |
@@ -720,6 +724,8 @@ Non-streaming errors use HTTP status codes with the envelope above. Streaming re
 | `admin_auth_required` | 401 | Admin key required |
 | `admin_auth_rate_limited` | 429 | Too many failed admin auth attempts |
 | `cross_site_forbidden` | 403 | Cross-site admin request |
+
+`upstream_stalled` is usually a real silence, not a queue. A captured `gemini-4-carbon` turn with `reasoning_effort: high` and a ~108 KB prompt produced exactly one frame, `[{"37":[0]}]`, and no candidate for the full 75 s deadline; there was no queue-status block to distinguish it from a dead stream. Raise `BRIDGE_NO_FRAME_TIMEOUT_MS` only if that model class is expected to spend minutes before its first frame, and expect the larger prompts in that class to be the ones that trip it.
 
 For a pool-key request, a `429` may say that no pool account can serve the requested model and summarize unavailable accounts by reason (`exhausted`, `substitution_cooldown`, `cooling`, `rate_limited`, `busy`, `model_unavailable`, `quarantined`). The message reports counts rather than emails or credentials; use `/v1/accounts?live=1` for per-account detail. Account-key requests keep the precise account-specific error.
 
@@ -838,7 +844,7 @@ Accepted fields:
 | `thinkingConfig`, `generationConfig.thinkingConfig` | `thinkingLevel` or `thinkingBudget` |
 | `output_config` | `effort` |
 
-Sampling parameters such as `temperature`, `top_p`, `max_tokens`, and `stop` are accepted but ignored.
+Sampling parameters `temperature`, `top_p`, and `seed` are accepted but ignored: Gemini Web exposes no equivalent. Output controls are enforced by the bridge instead of upstream — `max_tokens` / `max_completion_tokens` cut the answer and set `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format: {"type": "json_object"}` returns an unwrapped JSON object. Because those limits apply to the whole answer, a request that sets one is buffered and emitted once rather than streamed token by token.
 
 Message content can be a string or an array of parts. Supported image shapes:
 
@@ -914,7 +920,7 @@ Streaming behavior:
 ```
 
 If the served model differs from the requested one, the payload also includes `requested_model` and `model_served`.
-The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`. Router tiers are exempt: `gemini-auto` (the free tier's `Auto — adapts to your needs` entry, id `cf41b0e0dd7d53e5` on the 2026-11-13 registry) picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is its documented behaviour rather than a relabel.
+The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`, in which case the relabel ends the stream on the first frame that carries it and a pool request fails over to another account instead of waiting out the generation. Router tiers are exempt: `gemini-auto` (the free tier's `Auto — adapts to your needs` entry, id `cf41b0e0dd7d53e5` on the 2026-11-13 registry) picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is its documented behaviour rather than a relabel.
 
 #### Function calling behavior
 
@@ -923,6 +929,8 @@ Function calling is prompt-based, not native Gemini function calling. `gsb` rend
 Validation covers `type` (including unions), `enum`, `const`, local `$ref`, string length/pattern, numeric bounds and `multipleOf`, array bounds and `uniqueItems`, object `required`/`additionalProperties`, and `allOf`/`anyOf`/`oneOf`/`not`/`nullable`.
 
 Before validation, `gsb` coerces common model mistakes into the declared types (`"42"` → `42`, `"true"` → `true`, JSON-encoded objects/arrays in strings, scalar → single-element array). It also strips stray closing braces/brackets, removes trailing commas, quotes bare identifier keys, repairs string escapes, and retries truncated envelopes or invented refusals.
+
+An invented refusal is detected from the **opening** of the reply (first 2000 bytes), not the whole reply. The shape this catches is the one the model actually produces when it gives up on tools: a one-line claim that the tool budget is spent, followed by step-by-step manual instructions. That reply is a `tool_call_error` and is retried with a correction note, so it never reaches the client as a final answer. A long genuine answer that only mentions a tool budget further down stays an answer. Refusals are also dropped from assistant history, so a fabricated budget claim cannot poison the next turn.
 
 A schema-invalid call returns `tool_call_error`. To force a function, use `tool_choice: {"type":"function","function":{"name":"get_status"}}` for Chat or `{"type":"function","name":"get_status"}` for Responses. The bridge returns calls; it never executes your functions. Append the assistant call and matching tool result to the next request's history.
 
@@ -1308,6 +1316,7 @@ Models with documented limits always use the documented value; `capabilities.lim
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Initial upstream response timeout |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Abandon a stream that produced no candidate frame at all. Keepalive envelopes count as no data, so this is the only bound on an upstream that stays chatty but never answers |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval, clamped to 60 s–3600 s. Idle accounts rotate at half frequency |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh interval |
@@ -1523,7 +1532,7 @@ Statuses are computed in this precedence order:
 | `expired` | Expired | Saved session is no longer valid; run `gsb --login <name>` |
 | `exhausted` | Exhausted | A real quota window is spent until `resetAt`, or a model stayed exhausted across retries |
 | `cooling` | Cooling | Failed within the last 60 seconds; temporarily skipped |
-| `degraded` | Degraded | Cooldown elapsed, but the failure counter has not been cleared by a success |
+| `degraded` | Degraded | Cooldown elapsed, but the failure counter has not been cleared by a success or by the automatic re-check |
 | `unknown` | Unprobed | No quota check has run in this process |
 | `ok` | Ready | Loaded, authenticated, no known limit |
 
