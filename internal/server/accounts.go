@@ -1766,7 +1766,7 @@ func (s *Server) prepareGeneration(
 		ThinkingLevel:   thinkLvl,
 		Temporary:       tempReq || s.Cfg.Temporary,
 		Language:        s.Cfg.Locale,
-		DisableTools:    hasTools,
+		DisableTools:    false,
 		HasTools:        hasTools,
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,

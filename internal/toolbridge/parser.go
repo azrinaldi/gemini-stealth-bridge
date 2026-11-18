@@ -21,8 +21,83 @@ var (
 	htmlTagRe                       = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9:_-]*\s[^>\n]*?)>`)
 	missingQuoteAfterEscapedQuoteRe = regexp.MustCompile(`^\s*(?:,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*\}\s*(?:,\s*\{|\]\s*\}))`)
 	markdownAutolinkRe              = regexp.MustCompile(`\[(https?://[^\]\s]+)\]\((https?://[^)\s]+)\)`)
-	toolProtocolRefusalRe           = regexp.MustCompile(`(?is)(?:\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b|\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b|\b(?:prompt\s+injection|jailbreak)[\s\S]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b|\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)[\s\S]{0,80}\b(?:prompt\s+injection|jailbreak)\b|\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol)\b)`)
+	toolProtocolRefusalRe           = regexp.MustCompile(`(?is)(?:\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b|\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b|\b(?:prompt\s+injection|jailbreak)[\s\S]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b|\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)[\s\S]{0,80}\b(?:prompt\s+injection|jailbreak)\b|\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol)\b|\b(?:maximum|max)\s+(?:allowed\s+|permitted\s+|per[- ]turn\s+)?number\s+of\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\b|\b(?:0|zero)\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\b|\b(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\s*[:=]?\s*(?:0|zero)\b|</?prohibit_tool_calling>)`)
+	toolCallGuardRe                 = regexp.MustCompile(`(?i)(?:</?prohibit_tool_calling>|maximum\s+number\s+of\s+tool\s+and\s+search\s+calls)`)
+	toolGuardBlockRe                = regexp.MustCompile(`(?is)<prohibit_tool_calling>.*?</prohibit_tool_calling>`)
+	toolGuardSentenceRe             = regexp.MustCompile(`(?i)you\s+have\s+(?:exceeded|reached)\s+the\s+maximum\s+number\s+of\s+tool\s+and\s+search\s+calls[^.\n]*\.?`)
+	toolGuardTailRe                 = regexp.MustCompile(`(?i)(?:^|\n)\s*(?:0|zero)\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\.?`)
+
+	// The guard is confabulated in the language of the conversation, so an
+	// English-only detector misses the same invention in Spanish.
+	toolGuardSentenceEsRe   = regexp.MustCompile(`(?i)(?:^|\n)\s*se\s+(?:ha\s+)?(?:alcanz[óo]|excedi[óo]|agot[óo]|super[óo])\s+(?:el\s+|la\s+)?(?:l[íi]mite|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|presupuesto)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+)?)?(?:herramientas?|funciones?)?[^.\n]{0,160}[.:]?`)
+	toolGuardTailEsRe       = regexp.MustCompile(`(?i)(?:^|\n)\s*(?:(?:0|cero)\s+llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)|(?:no|sin)\s+(?:quedan|hay|existen)\s+(?:m[áa]s\s+)?llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?))[^\n]*`)
+	toolProtocolRefusalEsRe = regexp.MustCompile(`(?is)(?:se\s+(?:ha\s+)?(?:alcanz[óo]|alcanzad[oa]|excedi[óo]|excedid[oa]|agot[óo]|agotad[oa]|super[óo]|superad[oa])\s+(?:el\s+|la\s+)?(?:l[íi]mite|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|presupuesto)\s+(?:de\s+|permitid[oa]\s+de\s+)?(?:llamadas?\s+(?:a\s+)?)?(?:herramientas?|funciones?|b[úu]squedas?)|(?:l[íi]mite|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|presupuesto)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+)?)?(?:herramientas?|funciones?)\s+(?:se\s+)?(?:ha\s+)?(?:sido\s+)?(?:alcanzad[oa]|excedid[oa]|agotad[oa]|superad[oa])|(?:no|sin)\s+(?:quedan|hay|existen)\s+(?:m[áa]s\s+)?llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)|(?:0|cero)\s+llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)|(?:llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)\s*[:=]?\s*(?:0|cero))|(?:no\s+(?:puedo|podemos|es\s+posible)\s+(?:usar|utilizar|ejecutar|invocar|llamar)\s+(?:m[áa]s\s+)?(?:las\s+|la\s+)?herramientas?))`)
+
+	// toolBudgetClaimRe covers the shapes models actually emit when they invent a
+	// tool budget. Enumerating verbs per phrase missed real variants ("cupo",
+	// "llamadas de herramientas", a declarative "... en 0"), so this anchors on a
+	// scarcity noun next to a tool noun, an exhaustion word next to a tool noun,
+	// or a zero/remaining marker instead.
+	toolBudgetClaimRe = regexp.MustCompile(`(?i)(?:(?:cupo|cuota|l[íi]mite|limite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|tool\s+budget|tool\s+limit|quota|allowance)[^.\n]{0,60}(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|search\s+calls?|tools?)\b|(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|tools?)\b[^.\n]{0,60}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up)|(?:bloquead[oa]s?|restringid[oa]s?)\s+(?:en\s+|por\s+)?[^.\n]{0,40}(?:llamadas?|herramientas?)|\(\s*(?:0|zero|cero)\s+remaining\s*\)|\(?\s*(?:0|cero|zero)\s+(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)|(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)\s+(?:restantes|disponibles|remaining)|(?:sin|no\s+(?:hay|quedan|tiene|tenemos))\s+(?:m[áa]s\s+)?(?:cupo|llamadas?\s+(?:de\s+|a\s+)?(?:herramientas?|funciones?)))`)
 )
+
+// ToolProtocolRefusalError is the tool_call_error text produced when the model
+// invents a tool-call budget or otherwise refuses the tool-calling protocol.
+// Callers use it to choose a targeted correction instead of the generic
+// schema-validation note.
+const ToolProtocolRefusalError = "the model refused the tool-calling protocol (hallucinated tool limit or refusal)"
+
+// StripToolGuard removes an upstream tool-call guard from free text so the
+// invented "tool budget" notice never reaches the client as answer content or
+// reasoning, where it would poison later turns of the conversation.
+func StripToolGuard(text string) string {
+	if text == "" {
+		return text
+	}
+	out := toolGuardBlockRe.ReplaceAllString(text, "")
+	out = toolGuardSentenceRe.ReplaceAllString(out, "")
+	out = toolGuardSentenceEsRe.ReplaceAllString(out, "")
+	out = toolGuardTailRe.ReplaceAllString(out, "\n")
+	out = toolGuardTailEsRe.ReplaceAllString(out, "\n")
+	out = stripBudgetClaimLines(out)
+	out = strings.TrimSpace(out)
+	return out
+}
+
+// budgetClaimStart reports the byte offset where a hallucinated tool-budget
+// claim begins inside one line, or -1 when the line carries none. Text before
+// that offset is retained so a legitimate summary prefix survives stripping.
+func budgetClaimStart(line string) int {
+	start := -1
+	for _, re := range []*regexp.Regexp{
+		toolBudgetClaimRe,
+		toolProtocolRefusalEsRe,
+		toolCallGuardRe,
+		toolGuardTailRe,
+		toolGuardTailEsRe,
+		toolProtocolRefusalRe,
+	} {
+		if loc := re.FindStringIndex(line); loc != nil && (start < 0 || loc[0] < start) {
+			start = loc[0]
+		}
+	}
+	return start
+}
+
+func stripBudgetClaimLines(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if start := budgetClaimStart(line); start >= 0 {
+			if prefix := strings.TrimSpace(line[:start]); prefix != "" {
+				kept = append(kept, prefix)
+			}
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
 
 func unwrapIdenticalMarkdownLinks(s string) string {
 	return markdownAutolinkRe.ReplaceAllStringFunc(s, func(m string) string {
@@ -40,7 +115,21 @@ func unwrapIdenticalMarkdownLinks(s string) string {
 // injection).
 func IsToolProtocolRefusal(text string) bool {
 	trimmed := strings.TrimSpace(text)
-	if trimmed == "" || len(trimmed) > 1200 {
+	if trimmed == "" {
+		return false
+	}
+	// The upstream tool-call guard can arrive embedded inside an otherwise long
+	// answer, so these protocol markers are checked without a length bound.
+	if toolCallGuardRe.MatchString(trimmed) {
+		return true
+	}
+	if toolProtocolRefusalEsRe.MatchString(trimmed) {
+		return true
+	}
+	if toolBudgetClaimRe.MatchString(trimmed) {
+		return true
+	}
+	if len(trimmed) > 1200 {
 		return false
 	}
 	return toolProtocolRefusalRe.MatchString(trimmed)
@@ -1032,7 +1121,7 @@ func InterpretReply(reply string, tools any, toolChoice any) (*InterpretResult, 
 		return nil, toolCallError(fmt.Sprintf("the model did not return the required tool call (%s)", parsed.Reason))
 	}
 	if IsToolProtocolRefusal(reply) {
-		return nil, toolCallError("the model refused the tool-calling protocol (hallucinated tool limit or refusal)")
+		return nil, toolCallError(ToolProtocolRefusalError)
 	}
 	return nil, nil
 }
@@ -1064,10 +1153,13 @@ func SafeStreamablePrefix(text string) string {
 	if trimmed == "" || trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '<' || strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "💭") || strings.HasPrefix(trimmed, "🧠") {
 		return ""
 	}
-	if hasPotentialToolMarker(text) {
+	if hasPotentialToolMarker(text) || IsToolProtocolRefusal(text) {
 		return ""
 	}
 	safeEnd := len(text) - 140
+	if idx := strings.Index(text, "[["); idx >= 0 && idx < safeEnd {
+		safeEnd = idx
+	}
 	trimmedRight := strings.TrimRight(text, " \t\r\n")
 	if len(trimmedRight) > 0 {
 		lastCh := trimmedRight[len(trimmedRight)-1]

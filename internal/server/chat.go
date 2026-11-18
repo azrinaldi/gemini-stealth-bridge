@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
@@ -468,7 +469,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							text = frame.Text
 						}
 					}
-					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
+					thoughts = toolbridge.StripToolGuard(mergeStreamedThoughts(thoughts, frame.Thoughts))
 					done = frame.Done
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
@@ -531,7 +532,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								sentText = text
 								lastActiveKeepaliveAt = time.Now()
 						} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
+							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
 									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
 									sentText = safePrefix
@@ -595,7 +596,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}
@@ -920,6 +921,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"
 		var content any = text
+		if textStr, ok := content.(string); ok {
+			content = toolbridge.StripToolGuard(textStr)
+		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
 			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
@@ -1034,7 +1038,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"content": content,
 			}
 			if s.Cfg.LiveThoughts && thoughts != "" {
-				msgObj["reasoning_content"] = thoughts
+				msgObj["reasoning_content"] = toolbridge.StripToolGuard(thoughts)
 			}
 			if len(oaCalls) > 0 {
 				msgObj["tool_calls"] = oaCalls
@@ -1237,6 +1241,42 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	if fullTrimBoth != "" && fullTrimBoth == sentTrimBoth {
 		return "", true
 	}
+	// Gemini Web's grounding pass can retroactively rewrite inline citations
+	// (e.g. `[[domain/path]]` -> `[domain/path](https://...)`) inside an answer
+	// that has already started streaming. When the answer still shares a genuine
+	// opening prefix (>= 32 bytes), recover the continuation tail instead of
+	// aborting the stream with a false upstream_revision.
+	common := 0
+	maxCommon := len(fullTrimLeft)
+	if len(sentTrimLeft) < maxCommon {
+		maxCommon = len(sentTrimLeft)
+	}
+	for common < maxCommon && fullTrimLeft[common] == sentTrimLeft[common] {
+		common++
+	}
+	for common > 0 && !utf8.RuneStart(fullTrimLeft[common]) {
+		common--
+	}
+	if common >= 32 {
+		// Look for the trailing anchor of sentTrimLeft inside fullTrimLeft after common.
+		for anchorLen := 24; anchorLen >= 8; anchorLen -= 4 {
+			if len(sentTrimLeft) >= common+anchorLen {
+				anchor := sentTrimLeft[len(sentTrimLeft)-anchorLen:]
+				if idx := strings.Index(fullTrimLeft[common:], anchor); idx >= 0 {
+					endPos := common + idx + len(anchor)
+					return fullTrimLeft[endPos:], true
+				}
+			}
+		}
+		if len(fullTrimLeft) >= len(sentTrimLeft) {
+			off := len(sentTrimLeft)
+			for off < len(fullTrimLeft) && !utf8.RuneStart(fullTrimLeft[off]) {
+				off++
+			}
+			return fullTrimLeft[off:], true
+		}
+		return "", true
+	}
 	return "", false
 }
 
@@ -1246,7 +1286,14 @@ func hasCompatibleStreamPrefix(full, sent string) bool {
 }
 
 func appendToolErrorCorrection(fullPrompt, errMsg string) string {
-	note := fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	var note string
+	if strings.Contains(errMsg, toolbridge.ToolProtocolRefusalError) {
+		// The model invented a tool-call budget. A generic schema note does not
+		// address that, so name the invention explicitly and restate availability.
+		note = "[System correction: Tools ARE available and there is NO tool-call or search budget in this session. The previous reply wrongly claimed a tool limit. Disregard any such claim and emit the next ```json {\"tool_calls\":[...]} ``` block now, using only the declared tools and their exact schema.]"
+	} else {
+		note = fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	}
 	const suffix = "\n\nAssistant:"
 	if strings.HasSuffix(fullPrompt, suffix) {
 		return fullPrompt[:len(fullPrompt)-len(suffix)] + "\n\n" + note + suffix
