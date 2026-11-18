@@ -981,14 +981,33 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 				a.mu.Lock()
 				if res != nil && res.Rotated {
 					a.RotatedAt = now
+					// A rotation that produced fresh cookies proves the session is
+					// still renewable, so an expiry verdict recorded earlier is stale.
+					if looksLikeAuthFailure(a.LastError) {
+						a.LastError = ""
+						a.LastFail = time.Time{}
+						a.Fails = 0
+					}
 				}
 				a.NextRotateAt = nextTime
 				a.mu.Unlock()
+				// /RotateCookies rejecting the cookie chain means the session cannot
+				// be renewed at all: it is expired, or bound to a browser key gsb
+				// does not hold. Record it now so the account reports `expired`
+				// instead of dying silently hours later on the next request.
+				if res != nil && (res.Status == 401 || res.Status == 403) {
+					a.mu.Lock()
+					a.LastError = "session expired; run `gsb --login " + a.ID + "` to sign in again"
+					a.LastFail = now
+					a.mu.Unlock()
+				}
 				s.decollideRotationTimers()
 				if err != nil {
 					log.Printf("[cookies] %s rotate error: %v", a.ID, err)
 				} else if res != nil && res.Rotated {
 					log.Printf("[cookies] %s rotated session cookies (HTTP %d)", a.ID, res.Status)
+				} else if res != nil && (res.Status == 401 || res.Status == 403) {
+					log.Printf("[cookies] %s rotation rejected (HTTP %d): session cannot be renewed, re-login required", a.ID, res.Status)
 				}
 			}
 		}

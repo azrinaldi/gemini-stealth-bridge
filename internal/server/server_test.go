@@ -37,6 +37,7 @@ type mockUpstream struct {
 	quotaFn  func(ctx context.Context) []gemini.QuotaBucket
 	uploadFn func(ctx context.Context, data []byte, filename, contentType string) (gemini.UploadedFile, error)
 	bootFn   func(ctx context.Context) error
+	rotateFn func(ctx context.Context) (*cookies.RotateResult, error)
 }
 
 func (m *mockUpstream) Bootstrap(ctx context.Context) error {
@@ -76,6 +77,9 @@ func (m *mockUpstream) StreamGenerateLive(ctx context.Context, promptText string
 }
 
 func (m *mockUpstream) RotateCookies(ctx context.Context) (*cookies.RotateResult, error) {
+	if m.rotateFn != nil {
+		return m.rotateFn(ctx)
+	}
 	return &cookies.RotateResult{Status: 200, Rotated: false}, nil
 }
 
@@ -2530,5 +2534,49 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 	}
 	if !strings.Contains(rec.Body.String(), `/tmp/data.db`) || !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
 		t.Fatalf("expected tool_calls completion, got:\n%s", rec.Body.String())
+	}
+}
+
+// A rotation rejected by Google is the only signal that a saved session can no
+// longer be renewed (expired, or bound to a browser key gsb does not hold).
+// Recording it as an auth failure makes the account report `expired` at once
+// instead of dying silently hours later when a request lands on it.
+func TestSchedulerMarksExpiredWhenRotationRejected(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	now := time.Now()
+	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	acct.mu.Lock()
+	acct.NextRotateAt = now.Add(-time.Second)
+	acct.NextModelRefAt = now.Add(time.Hour)
+	acct.LastUsed = now
+	acct.Client = &mockUpstream{rotateFn: func(context.Context) (*cookies.RotateResult, error) {
+		return &cookies.RotateResult{Status: 401}, nil
+	}}
+	acct.mu.Unlock()
+
+	srv.RunSchedulerStep(context.Background(), now)
+	if st, _ := AccountStatus(acct, now); st != StatusExpired {
+		t.Fatalf("expected expired after a rejected rotation, got %q", st)
+	}
+
+	// A later rotation that produces fresh cookies proves the session is alive
+	// again, so the verdict must clear.
+	acct.mu.Lock()
+	acct.NextRotateAt = now.Add(-time.Second)
+	acct.Client = &mockUpstream{rotateFn: func(context.Context) (*cookies.RotateResult, error) {
+		return &cookies.RotateResult{Status: 200, Rotated: true}, nil
+	}}
+	acct.mu.Unlock()
+
+	srv.RunSchedulerStep(context.Background(), now.Add(time.Second))
+	acct.mu.RLock()
+	lastErr := acct.LastError
+	rotated := acct.RotatedAt
+	acct.mu.RUnlock()
+	if lastErr != "" {
+		t.Fatalf("expected expiry verdict cleared after a successful rotation, got %q", lastErr)
+	}
+	if rotated.IsZero() {
+		t.Fatal("expected RotatedAt to record the successful rotation")
 	}
 }

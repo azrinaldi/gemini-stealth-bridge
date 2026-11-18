@@ -170,7 +170,7 @@ Sign in through `gsb` so the session is captured in an isolated disposable brows
 ./gsb --probe
 ```
 
-`--login` opens a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, waits for Google sign-in, captures the cookies through CDP, verifies the session against Gemini Web, and deletes the temporary profile. No background browser process is left competing with `gsb` for `__Secure-1PSIDTS` rotation.
+`--login` opens a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, waits for Google sign-in, captures the cookies through CDP, verifies the session against Gemini Web, and deletes the temporary profile. No background browser process is left competing with `gsb` for `__Secure-1PSIDTS` rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so the captured session is not bound to a device key that `gsb` cannot present and stays renewable by the daemon.
 
 `--probe` prints the account's models and 5-hour/weekly quota. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
 

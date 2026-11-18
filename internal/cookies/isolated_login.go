@@ -125,6 +125,27 @@ func FindBrowserBinary(browser string) string {
 	return ""
 }
 
+// isolatedLoginArgs builds the disposable-profile browser command line.
+//
+// Device Bound Session Credentials are disabled on purpose. When Chrome
+// registers a DBSC binding, Google only refreshes the short-lived session
+// cookies for a client that can prove possession of the browser's key. gsb
+// holds cookies, not that key, so /RotateCookies is rejected and the imported
+// session dies within hours. A browser that never registers DBSC leaves the
+// session renewable, which is what makes the captured cookies durable.
+func isolatedLoginArgs(profileDir string, port int) []string {
+	return []string{
+		fmt.Sprintf("--user-data-dir=%s", profileDir),
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--remote-allow-origins=*",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-features=DeviceBoundSessionCredentials",
+		"--new-window",
+		"https://gemini.google.com/app",
+	}
+}
+
 // RunIsolatedBrowserLogin launches a clean, temporary Chromium/Chrome instance
 // with its own disposable --user-data-dir and CDP debugging port, waits for the
 // user to complete Google sign-in at https://gemini.google.com/app, extracts
@@ -155,17 +176,7 @@ func RunIsolatedBrowserLogin(ctx context.Context, browserBin string) (*IsolatedL
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	args := []string{
-		fmt.Sprintf("--user-data-dir=%s", tmpProfile),
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--remote-allow-origins=*",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--new-window",
-		"https://gemini.google.com/app",
-	}
-
-	cmd := exec.CommandContext(ctx, browserBin, args...)
+	cmd := exec.CommandContext(ctx, browserBin, isolatedLoginArgs(tmpProfile, port)...)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("launch browser %s: %w", browserBin, err)
 	}

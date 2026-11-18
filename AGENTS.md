@@ -135,7 +135,7 @@ gsb --probe
 
 `--login` launches a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, opens `https://gemini.google.com/app`, waits for Google sign-in (including 2FA), captures cookies via CDP, verifies the session against Gemini Web, and deletes the temporary profile.
 
-Why this is the recommended path: the disposable profile is destroyed after capture, so no background browser process competes with `gsb` for `__Secure-1PSIDTS` cookie rotation.
+Why this is the recommended path: the disposable profile is destroyed after capture, so no background browser process competes with `gsb` for `__Secure-1PSIDTS` cookie rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so Google never binds the session to a browser-held key that `gsb` cannot present; the captured cookies stay renewable by the daemon.
 
 If no local browser or display is available, `--login` falls back to a terminal prompt: open Gemini in an Incognito window, paste the `Cookie` header or Cookie-Editor JSON, then close the window.
 
@@ -309,6 +309,8 @@ curl -sS http://127.0.0.1:20133/v1/sessions \
 ```
 
 Account keys see only their account; group keys see only their group; the pool/admin key sees everything.
+
+A rejected rotation (`/RotateCookies` answers 401 or 403) is recorded as an auth failure, so the account reports `expired` on the next rotation tick instead of dying silently on a later request. A later rotation that produces fresh cookies clears the verdict.
 
 ### 7.4 Rate and concurrency controls
 
