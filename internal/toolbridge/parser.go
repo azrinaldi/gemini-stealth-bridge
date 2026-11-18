@@ -21,7 +21,7 @@ var (
 	htmlTagRe                       = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9:_-]*\s[^>\n]*?)>`)
 	missingQuoteAfterEscapedQuoteRe = regexp.MustCompile(`^\s*(?:,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*\}\s*(?:,\s*\{|\]\s*\}))`)
 	markdownAutolinkRe              = regexp.MustCompile(`\[(https?://[^\]\s]+)\]\((https?://[^)\s]+)\)`)
-	toolProtocolRefusalRe           = regexp.MustCompile(`(?is)(?:\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b|\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b|\b(?:prompt\s+injection|jailbreak)[\s\S]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b|\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)[\s\S]{0,80}\b(?:prompt\s+injection|jailbreak)\b|\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol)\b|\b(?:maximum|max)\s+(?:allowed\s+|permitted\s+|per[- ]turn\s+)?number\s+of\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\b|\b(?:0|zero)\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\b|\b(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\s*[:=]?\s*(?:0|zero)\b|</?prohibit_tool_calling>)`)
+	toolProtocolRefusalRe           = regexp.MustCompile(`(?is)(?:\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b|\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b|\b(?:prompt\s+injection|jailbreak)[\s\S]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b|\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)[\s\S]{0,80}\b(?:prompt\s+injection|jailbreak)\b|\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol)\b|\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:maximum|max)\s+(?:allowed\s+|permitted\s+|per[- ]turn\s+)?number\s+of\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\b|\b(?:maximum|max)\s+(?:allowed\s+|permitted\s+|per[- ]turn\s+)?number\s+of\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+(?:has\s+been\s+|was\s+|is\s+)?(?:exceeded|reached|exhausted|depleted)\b|\b(?:0|zero)\s+(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\b|\b(?:tool|search|function)[\s-]*(?:and\s+search\s+)?calls?\s+remaining\s*[:=]?\s*(?:0|zero)\b|</?prohibit_tool_calling>)`)
 	toolCallGuardRe                 = regexp.MustCompile(`(?i)(?:</?prohibit_tool_calling>|maximum\s+number\s+of\s+tool\s+and\s+search\s+calls)`)
 	toolGuardBlockRe                = regexp.MustCompile(`(?is)<prohibit_tool_calling>.*?</prohibit_tool_calling>`)
 	toolGuardSentenceRe             = regexp.MustCompile(`(?i)you\s+have\s+(?:exceeded|reached)\s+the\s+maximum\s+number\s+of\s+tool\s+and\s+search\s+calls[^.\n]*\.?`)
@@ -38,7 +38,7 @@ var (
 	// "llamadas de herramientas", a declarative "... en 0"), so this anchors on a
 	// scarcity noun next to a tool noun, an exhaustion word next to a tool noun,
 	// or a zero/remaining marker instead.
-	toolBudgetClaimRe = regexp.MustCompile(`(?i)(?:(?:cupo|cuota|l[íi]mite|limite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|tool\s+budget|tool\s+limit|quota|allowance)[^.\n]{0,60}(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|search\s+calls?|tools?)\b|(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|tools?)\b[^.\n]{0,60}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up)|(?:bloquead[oa]s?|restringid[oa]s?)\s+(?:en\s+|por\s+)?[^.\n]{0,40}(?:llamadas?|herramientas?)|\(\s*(?:0|zero|cero)\s+remaining\s*\)|\(?\s*(?:0|cero|zero)\s+(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)|(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)\s+(?:restantes|disponibles|remaining)|(?:sin|no\s+(?:hay|quedan|tiene|tenemos))\s+(?:m[áa]s\s+)?(?:cupo|llamadas?\s+(?:de\s+|a\s+)?(?:herramientas?|funciones?)))`)
+	toolBudgetClaimRe = regexp.MustCompile(`(?i)(?:(?:cupo|cuota|l[íi]mite|limite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|tool\s+budget|tool\s+limit|quota|allowance)[^.\n]{0,60}(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|search\s+calls?|tools?)[^.\n]{0,40}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up|(?:en|a)\s+0\b|\b0\s+(?:restantes?|disponibles?|remaining))|(?:agot[óo]|alcanz[óo]|excedi[óo]|super[óo]|bloque[óo])\s+(?:el\s+|la\s+)?(?:cupo|cuota|l[íi]mite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+|de\s+)?)?(?:herramientas?|funciones?|b[úu]squedas?)|(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|tools?)\b[^.\n]{0,60}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up)|(?:bloquead[oa]s?|restringid[oa]s?)\s+(?:en\s+|por\s+)?[^.\n]{0,40}(?:llamadas?|herramientas?)|\(\s*\b(?:0|zero|cero)\s+remaining\s*\)|\b(?:0|cero|zero)\s+(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)|(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)\s+(?:restantes|disponibles|remaining)\s*[:=]?\s*\b(?:0|cero|zero)\b|(?:sin|no\s+(?:hay|quedan|tiene|tenemos))\s+(?:m[áa]s\s+)?(?:cupo|llamadas?\s+(?:de\s+|a\s+)?(?:herramientas?|funciones?)))`)
 )
 
 // ToolProtocolRefusalError is the tool_call_error text produced when the model
@@ -69,13 +69,14 @@ func StripToolGuard(text string) string {
 // that offset is retained so a legitimate summary prefix survives stripping.
 func budgetClaimStart(line string) int {
 	start := -1
+	// Only guard-shaped patterns may truncate text. The broader refusal
+	// detectors also match ordinary statements such as "the maximum number of
+	// tool calls is 10"; stripping on those would delete legitimate answers.
 	for _, re := range []*regexp.Regexp{
 		toolBudgetClaimRe,
-		toolProtocolRefusalEsRe,
 		toolCallGuardRe,
 		toolGuardTailRe,
 		toolGuardTailEsRe,
-		toolProtocolRefusalRe,
 	} {
 		if loc := re.FindStringIndex(line); loc != nil && (start < 0 || loc[0] < start) {
 			start = loc[0]

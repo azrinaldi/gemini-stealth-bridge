@@ -88,3 +88,23 @@ func TestSafeStreamablePrefixHoldsBackLongToolProtocolRefusal(t *testing.T) {
 	}
 }
 
+// A statement that merely names a limit is not a refusal. The detector must
+// only fire when the text says the limit was reached, exhausted, or is zero;
+// otherwise a normal answer gets retried as a tool error and stripped of its
+// content.
+func TestToolGuardDoesNotMatchOrdinaryLimitStatements(t *testing.T) {
+	benign := []string{
+		"El límite de herramientas está configurado en 10.",
+		"The maximum number of tool calls is 10.",
+		"Configuré el límite de llamadas a herramientas en 10.",
+		"The tool limit is configured to 10 calls per turn.",
+	}
+	for _, text := range benign {
+		if IsToolProtocolRefusal(text) {
+			t.Errorf("ordinary limit statement treated as a refusal: %q", text)
+		}
+		if got := StripToolGuard(text); got != text {
+			t.Errorf("ordinary limit statement was altered: %q -> %q", text, got)
+		}
+	}
+}
