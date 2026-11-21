@@ -17,6 +17,7 @@ import (
 // in canonical wire order. Note: AEC is optional and may be absent in modern browser profiles.
 var EssentialNames = []string{
 	"SID", "HSID", "SSID", "APISID", "SAPISID",
+	"OSID", "__Secure-OSID",
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 	"__Secure-1PSIDTS", "__Secure-3PSIDTS",
 	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "NID", "AEC",
