@@ -1410,35 +1410,6 @@
   cursor: help;
 }
 
-    .priority-list {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      padding: 8px;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      background: var(--surface-recessed);
-    }
-
-    .priority-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      min-height: 36px;
-      padding: 5px 7px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--surface);
-      cursor: grab;
-    }
-
-    .priority-item:active { cursor: grabbing; }
-    .priority-item.is-dragged { opacity: 0.45; }
-    .priority-grip { color: var(--text-muted); letter-spacing: -2px; user-select: none; }
-    .priority-rank { min-width: 18px; font-size: 0.75rem; color: var(--text-muted); text-align: right; user-select: none; }
-    .priority-id { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-    .priority-controls { display: flex; gap: 3px; }
-
     .input,
     .select,
     .textarea {
@@ -2226,7 +2197,7 @@
         <div class="settings-group">
           <div class="settings-group-info">
             <h2>Pool Routing &amp; Failover <span class="source-tag">safe runtime</span></h2>
-            <p>Keep <code class="mono">rotate</code> for normal chat. Use <code class="mono">lru</code> for many independent requests; use <code class="mono">fill-first</code> only when priority order matters.</p>
+            <p>Keep <code class="mono">rotate</code> for normal chat. Use <code class="mono">lru</code> for many independent requests; use <code class="mono">fill-first</code> only when priority order matters (reorder accounts on the <strong>Accounts</strong> tab).</p>
           </div>
           <div class="form-stack">
             <div class="form-grid-2">
@@ -2253,15 +2224,6 @@
                   <option value="off">off (Disable preflight check)</option>
                 </select>
               </div>
-            </div>
-
-            <div class="field">
-              <div class="field-label-row">
-                <label for="cfg-priority-list">Account Priority Order (for fill-first)</label>
-                <span id="src-accountPriority" class="source-tag">default</span>
-              </div>
-              <div id="cfg-priority-list" class="priority-list" role="listbox" aria-label="Account priority order"></div>
-              <span class="helper">Drag accounts to reorder. Use ↑/↓ buttons with keyboard. Only <code class="mono">fill-first</code> uses this order.</span>
             </div>
           </div>
         </div>
@@ -3351,156 +3313,6 @@
           wrap.appendChild(chip);
         });
       }
-      function mergePriorityIDs(priorityIds, accounts) {
-        const seen = new Set();
-        const merged = [];
-        (Array.isArray(priorityIds) ? priorityIds : []).forEach(function (raw) {
-          const id = String(raw || '').trim();
-          if (id && !seen.has(id)) {
-            seen.add(id);
-            merged.push(id);
-          }
-        });
-        (Array.isArray(accounts) ? accounts : []).forEach(function (acct) {
-          const id = String((acct && acct.id) || '').trim();
-          if (id && !seen.has(id)) {
-            seen.add(id);
-            merged.push(id);
-          }
-        });
-        return merged;
-      }
-
-      function getPriorityList() {
-        return Array.from(document.querySelectorAll('#cfg-priority-list [data-account-id]')).map(function (el) {
-          return el.getAttribute('data-account-id');
-        });
-      }
-
-      function syncPriorityListUI(list) {
-        if (!list) return;
-        const rows = Array.from(list.querySelectorAll(':scope > [data-account-id]'));
-        rows.forEach(function (row, idx) {
-          const id = row.getAttribute('data-account-id') || '';
-          row.setAttribute('aria-label', id + ', priority ' + (idx + 1));
-          const rank = row.querySelector('.priority-rank');
-          if (rank) rank.textContent = String(idx + 1);
-          const up = row.querySelector('[data-dir="-1"]');
-          const down = row.querySelector('[data-dir="1"]');
-          if (up) up.disabled = idx === 0;
-          if (down) down.disabled = idx === rows.length - 1;
-        });
-      }
-
-      function renderPriorityList(ids) {
-        const list = document.getElementById('cfg-priority-list');
-        if (!list) return;
-        list.textContent = '';
-        if (!list._priorityDragBound) {
-          list._priorityDragBound = true;
-          list.addEventListener('dragover', function (ev) {
-            if (!list._dragged) return;
-            ev.preventDefault();
-            if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
-            const targetRow = ev.target && ev.target.closest ? ev.target.closest('.priority-item') : null;
-            if (!targetRow) {
-              const rows = Array.from(list.querySelectorAll(':scope > .priority-item'));
-              const last = rows[rows.length - 1];
-              if (last && last !== list._dragged && ev.clientY > last.getBoundingClientRect().bottom) {
-                list.appendChild(list._dragged);
-                syncPriorityListUI(list);
-              }
-            }
-          });
-          list.addEventListener('drop', function (ev) {
-            if (!list._dragged) return;
-            ev.preventDefault();
-            syncPriorityListUI(list);
-            updateConfigDirtyState();
-          });
-        }
-        const items = Array.isArray(ids) ? ids : [];
-        if (!items.length) {
-          const empty = document.createElement('span');
-          empty.className = 'helper';
-          empty.textContent = 'No accounts loaded yet.';
-          list.appendChild(empty);
-          return;
-        }
-        items.forEach(function (id) {
-          const row = document.createElement('div');
-          row.className = 'priority-item';
-          row.draggable = true;
-          row.setAttribute('role', 'option');
-          row.setAttribute('data-account-id', id);
-          row.addEventListener('dragstart', function (ev) {
-            list._dragged = row;
-            row.classList.add('is-dragged');
-            if (ev.dataTransfer) {
-              ev.dataTransfer.effectAllowed = 'move';
-              ev.dataTransfer.setData('text/plain', id);
-            }
-          });
-          row.addEventListener('dragend', function () {
-            row.classList.remove('is-dragged');
-            list._dragged = null;
-            syncPriorityListUI(list);
-            updateConfigDirtyState();
-          });
-          row.addEventListener('dragover', function (ev) {
-            const dragged = list._dragged;
-            if (!dragged) return;
-            ev.preventDefault();
-            if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
-            if (dragged === row) return;
-            const rect = row.getBoundingClientRect();
-            const placeAfter = ev.clientY > rect.top + rect.height / 2;
-            const refNode = placeAfter ? row.nextSibling : row;
-            if (dragged !== refNode && dragged.nextSibling !== refNode) {
-              list.insertBefore(dragged, refNode);
-              syncPriorityListUI(list);
-            }
-          });
-          const grip = document.createElement('span');
-          grip.className = 'priority-grip';
-          grip.textContent = '⋮⋮';
-          grip.setAttribute('aria-hidden', 'true');
-          row.appendChild(grip);
-          const rank = document.createElement('span');
-          rank.className = 'priority-rank mono';
-          row.appendChild(rank);
-          const label = document.createElement('span');
-          label.className = 'priority-id mono';
-          label.textContent = id;
-          row.appendChild(label);
-          const controls = document.createElement('span');
-          controls.className = 'priority-controls';
-          [['↑', -1, 'Move up'], ['↓', 1, 'Move down']].forEach(function (entry) {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'btn-row-icon';
-            button.textContent = entry[0];
-            button.title = entry[2] + ' ' + id;
-            button.setAttribute('aria-label', entry[2] + ' ' + id);
-            button.setAttribute('data-dir', String(entry[1]));
-            button.addEventListener('click', function () {
-              const rows = Array.from(list.querySelectorAll(':scope > [data-account-id]'));
-              const cur = rows.indexOf(row);
-              const target = rows[cur + entry[1]];
-              if (!target) return;
-              list.insertBefore(row, entry[1] < 0 ? target : target.nextSibling);
-              syncPriorityListUI(list);
-              updateConfigDirtyState();
-              if (!button.disabled) button.focus();
-            });
-            controls.appendChild(button);
-          });
-          row.appendChild(controls);
-          list.appendChild(row);
-        });
-        syncPriorityListUI(list);
-      }
-
 
       /* ---------- Config Population & Dirty Tracking ---------- */
       function serializeConfigForm() {
@@ -3508,7 +3320,6 @@
           defaultThinking: document.getElementById('cfg-thinking').value,
           accountStrategy: document.getElementById('cfg-strategy').value,
           quotaPreflight: document.getElementById('cfg-preflight').value,
-          accountPriority: getPriorityList(),
           maxRpmPerAccount: Number(document.getElementById('cfg-max-rpm').value),
           maxConcurrentPerAccount: Number(document.getElementById('cfg-max-conc').value),
           rejectDowngrade: document.getElementById('cfg-reject-downgrade').checked,
@@ -3558,7 +3369,6 @@
         document.getElementById('cfg-thinking').value = cfg.defaultThinking || 'low';
         document.getElementById('cfg-strategy').value = cfg.accountStrategy || 'rotate';
         document.getElementById('cfg-preflight').value = cfg.quotaPreflight || 'strict';
-        renderPriorityList(mergePriorityIDs(cfg.accountPriority, allAccountsCache));
         document.getElementById('cfg-max-rpm').value = cfg.maxRpmPerAccount != null ? cfg.maxRpmPerAccount : 24;
         document.getElementById('cfg-max-conc').value = cfg.maxConcurrentPerAccount != null ? cfg.maxConcurrentPerAccount : 2;
 
@@ -3570,7 +3380,7 @@
         document.getElementById('cfg-history-offload').checked = Boolean(cfg.historyOffload);
 
         const sources = adm.sources || {};
-        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount', 'rejectDowngrade', 'rejectLabelMismatch', 'liveThoughts', 'liveToolCalls', 'keepToolPreamble', 'historyOffload'].forEach(function (k) {
+        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'maxRpmPerAccount', 'maxConcurrentPerAccount', 'rejectDowngrade', 'rejectLabelMismatch', 'liveThoughts', 'liveToolCalls', 'keepToolPreamble', 'historyOffload'].forEach(function (k) {
           const el = document.getElementById('src-' + k);
           if (el) {
             const sourceInfo = humanizeConfigSource(sources[k]);
@@ -3972,7 +3782,6 @@
           defaultThinking: document.getElementById('cfg-thinking').value,
           accountStrategy: document.getElementById('cfg-strategy').value,
           quotaPreflight: document.getElementById('cfg-preflight').value,
-          accountPriority: getPriorityList(),
           maxRpmPerAccount: Number(document.getElementById('cfg-max-rpm').value),
           maxConcurrentPerAccount: Number(document.getElementById('cfg-max-conc').value),
           rejectDowngrade: document.getElementById('cfg-reject-downgrade').checked,
