@@ -125,11 +125,13 @@ jobs:
           ref="${{ github.event.inputs.tag || github.ref_name }}"
           if gh release view "$ref" >/dev/null 2>&1; then
             gh release upload "$ref" dist/* --clobber
+            gh release edit "$ref" --title "$ref" --draft=false --prerelease=false --latest --verify-tag
           else
             gh release create "$ref" dist/* \
               --title "$ref" \
               --generate-notes \
-              --verify-tag
+              --verify-tag \
+              --latest
           fi
 
   docker:
