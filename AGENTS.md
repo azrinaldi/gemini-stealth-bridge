@@ -706,7 +706,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 
 - Accounts tab: pool/per-account keys, quota bars, filters, priority `↑`/`↓`, `⋯` menu (Refresh, Pause/Resume, Unquarantine/Reset failures, Copy Key, Remove), Refresh All.
 - Add Account: Incognito cookie paste plus an isolated-browser launcher (with local helper fallback). Account name, proxy, and group are collapsed under **Optional settings**.
-- Runtime configuration: strategy, quota preflight, priority, default thinking, RPM, concurrency, downgrade rejection, live thoughts, live tool calls, tool preamble, history offload. Apply in memory or persist to `config.env`.
+- Runtime configuration: strategy, quota preflight, priority, default thinking, RPM, concurrency, downgrade rejection, label-mismatch rejection, live thoughts, live tool calls, tool preamble, history offload. Apply in memory or persist to `config.env`.
 
 ### 14.4 Admin API
 
@@ -725,7 +725,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 
 Runtime fields editable through `PATCH`:
 
-`defaultThinking`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
+`defaultThinking`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `rejectLabelMismatch`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
 
 Everything else is environment-only.
 
@@ -832,7 +832,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Deadline for upstream HTTP response headers |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames (keepalive envelopes do not count as a frame) |
-| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Whole request |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Rotation interval (60s–3600s) |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh |
@@ -846,7 +846,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|
 | `--login <name>` | Isolated browser sign-in |
 | `--login-helper` | Local desktop helper on `127.0.0.1:20134` |
-| `--desktop-ui` | Desktop control plane on `127.0.0.1:20135` using the private SSH socket from README §6.4 |
+| `--desktop-ui` | Desktop control plane on `127.0.0.1:20133` using the private SSH socket from README §6.4 |
 | `--import-chrome <name>` | Import from browser profile |
 | `--import-cookie <name>` | Import raw cookie payload |
 | `--chrome-profile <v>` | Profile name/dir/DB |
@@ -923,7 +923,7 @@ gsb --web
 gsb --login-helper   # on the laptop, optional
 ```
 
-For desktop browser sign-in without a manual helper token, follow README §6.4 and open `http://127.0.0.1:20135/ui`.
+For desktop browser sign-in without a manual helper token, follow README §6.4 and open `http://127.0.0.1:20133/ui`.
 
 ### 18.3 Docker
 

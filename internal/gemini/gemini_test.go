@@ -1132,6 +1132,7 @@ func TestUploadFileDoesNotClobberConcurrentRotation(t *testing.T) {
 	}
 
 	// Rotate cookies AGAIN while upload HTTP call is in flight (before Set-Cookie absorption).
+	ac.Rotator.Forget("acct_up")
 	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
 		t.Fatalf("RotateCookies #2 failed: res=%+v err=%v", rotRes, err)
 	}
@@ -1211,6 +1212,7 @@ func TestUploadFileFallbackPreservesConcurrentRotation(t *testing.T) {
 	close(releaseInit)
 
 	<-putEntered
+	ac.Rotator.Forget("acct_up_fb")
 	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
 		t.Fatalf("RotateCookies #2 failed: res=%+v err=%v", rotRes, err)
 	}
@@ -1466,17 +1468,19 @@ func TestRotateOnClientConcurrentWithStreamAbsorption(t *testing.T) {
 	}()
 	<-rotStarted
 
-	// Stream response Set-Cookie absorbed while rotateOnClient is in flight.
-	if !ac.absorbAndPersistCookiesWithGen([]string{"__Secure-1PSIDTS=stream_newer_ts; Path=/; Secure"}, ac.cookieGen.Load(), true) {
+	// Incidental stream Set-Cookie absorbed while rotateOnClient is in flight must NOT
+	// cause rotateOnClient to discard its freshly rotated __Secure-1PSIDTS delta.
+	if !ac.absorbAndPersistCookiesWithGen([]string{"SIDCC=stream_sidcc; Path=/; Secure"}, ac.cookieGen.Load(), true) {
 		t.Fatal("expected stream Set-Cookie absorption to succeed")
 	}
 	close(releaseRot)
 	res := <-rotCh
-	if res == nil || res.Rotated {
-		t.Fatalf("expected concurrent rotateOnClient not to clobber stream absorption (Rotated=false), got %+v", res)
+	if res == nil || !res.Rotated {
+		t.Fatalf("expected concurrent rotateOnClient to merge delta and succeed (Rotated=true), got %+v", res)
 	}
-	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=stream_newer_ts") {
-		t.Fatalf("expected stream_newer_ts preserved, got %q", ac.CookieHeader())
+	gotCookie := ac.CookieHeader()
+	if !strings.Contains(gotCookie, "__Secure-1PSIDTS=rot_ts") || !strings.Contains(gotCookie, "SIDCC=stream_sidcc") {
+		t.Fatalf("expected both rot_ts and stream_sidcc preserved, got %q", gotCookie)
 	}
 }
 
@@ -2465,6 +2469,240 @@ func TestBootstrapDoubleRaceWithCookieOnlyDiskReload(t *testing.T) {
 		mu.Unlock()
 		if dispatched {
 			t.Fatal("StreamGenerate must not be dispatched with empty/stale AT after double-race")
+		}
+	})
+}
+
+func TestNewAccountClient_ProtectsExplicitCookiesFromStaleDiskReload(t *testing.T) {
+	acctPath := filepath.Join(t.TempDir(), "acct.json")
+	if _, err := cookies.SaveCredentialFile(acctPath, cookies.CredentialFile{
+		Name:    "acct",
+		Email:   "acct@example.com",
+		Cookies: "SAPISID=old_disk_sap; __Secure-1PSIDTS=old_disk_ts",
+		AT:      "old_at",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{MaxSessions: 2})
+	defer pool.Reset()
+	ac := NewAccountClient("acct", "SAPISID=fresh_mem_sap; __Secure-1PSIDTS=fresh_mem_ts", acctPath, pool, cookies.NewRotator())
+
+	if ac.ReloadFromDiskIfNewer() {
+		t.Fatal("ReloadFromDiskIfNewer must not overwrite unsaved explicit cookies")
+	}
+	sess, err := ac.acquireSession(context.Background())
+	if err != nil {
+		t.Fatalf("acquireSession: %v", err)
+	}
+	if !strings.Contains(ac.CookieHeader(), "fresh_mem_ts") || !strings.Contains(sess.CookieHeader(), "fresh_mem_ts") {
+		t.Fatalf("expected fresh_mem_ts preserved across acquireSession, got client=%q sess=%q", ac.CookieHeader(), sess.CookieHeader())
+	}
+
+	// Once persisted, future external disk updates ARE reloaded.
+	ac.persistState()
+	time.Sleep(15 * time.Millisecond)
+	if _, err := cookies.SaveCredentialFile(acctPath, cookies.CredentialFile{
+		Name:    "acct",
+		Cookies: "SAPISID=fresh_mem_sap; __Secure-1PSIDTS=newer_disk_ts",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !ac.ReloadFromDiskIfNewer() || !strings.Contains(ac.CookieHeader(), "newer_disk_ts") {
+		t.Fatalf("expected ReloadFromDiskIfNewer to pick up newer_disk_ts after persist, got %q", ac.CookieHeader())
+	}
+}
+
+func TestStreamGenerate_SkipsLineBufTailFlushOnErrStopStreaming(t *testing.T) {
+	donePayload := `[null,["c_1","r_1"],null,null,[["rc_1",["clean answer"],null,null,null,null,null,null,[2]]],{"26":"ctx1"}]`
+	esc, _ := marshalJSONString(donePayload)
+	// Same chunk ends with a truncated/invalid wrb.fr tail without newline.
+	chunk := ")]}'\n\n" + `[["wrb.fr",null,` + esc + `]]` + "\n" + `[["er",null,"truncated_tail`
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{},
+				Body:       io.NopCloser(strings.NewReader(chunk)),
+			}, nil
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}})
+	defer pool.Reset()
+	ac := NewAccountClient("acct_stop", "SAPISID=sap1", "", pool, nil)
+	ac.SetTokens("at1", "bl1", "fs1")
+
+	var gotText string
+	res, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{}, func(u *LineParseResult) error {
+		for _, f := range u.Frames {
+			if f.Text != "" {
+				gotText = f.Text
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil error when ErrStopStreaming stops before truncated tail, got %v", err)
+	}
+	if res == nil || gotText != "clean answer" {
+		t.Fatalf("unexpected result: res=%+v gotText=%q", res, gotText)
+	}
+}
+
+func TestStreamGenerate_MidStreamWatchdogProgressAndHang(t *testing.T) {
+	const timeout = 10 * time.Second
+	line := func(payload string) string {
+		esc, _ := marshalJSONString(payload)
+		return `[["wrb.fr",null,` + esc + `]]` + "\n"
+	}
+	p1 := line(`[null,["c_1","r_1"],null,null,[["rc_1",["hello"],null,null,null,null,null,null,[1]]]]`)
+	p1Dup := line(`[null,["c_1","r_1"],null,null,[["rc_1",["hello"],null,null,null,null,null,null,[1]]]]`)
+	p2Thoughts := line(`[null,["c_1","r_1"],null,null,[["rc_1",["hello"],null,null,null,null,null,null,[1],null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,["thinking..."]]]]`)
+	p3Text := line(`[null,["c_1","r_1"],null,null,[["rc_1",["hello world"],null,null,null,null,null,null,[1]]]]`)
+	done := line(`[null,["c_1","r_1"],null,null,[["rc_1",["hello world!"],null,null,null,null,null,null,[2]]],{"26":"ctx1"}]`)
+	keepalive := `[["wrb.fr",null,null,null,null,[3]]]` + "\n"
+
+	t.Run("midstream_silent_hang_after_candidate_returns_502_incomplete", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			doer := &stubGeminiDoer{fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				return &fhttp.Response{
+					StatusCode: 200,
+					Body: &ctxScriptedReadCloser{
+						ctx: req.Context(),
+						chunks: []scriptedChunk{
+							{data: p1},
+							{delay: 5 * time.Second, data: p1Dup},
+							{delay: 3 * time.Second, data: keepalive},
+							{waitCtx: true, err: context.Canceled},
+						},
+					},
+				}, nil
+			}}
+			pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}})
+			ac := NewAccountClient("fw_mid", "SAPISID=f", "", pool, nil)
+			ac.SetTokens("at", "bl", "fs")
+			start := time.Now()
+			_, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: timeout}, nil)
+			var ue *transport.UpstreamError
+			if !errors.As(err, &ue) || ue.StatusCode != 502 || ue.Code != "incomplete_upstream_response" || time.Since(start) != timeout {
+				t.Fatalf("expected 502 incomplete_upstream_response at %s, got %+v (%v) after %s", timeout, ue, err, time.Since(start))
+			}
+		})
+	})
+
+	t.Run("candidate_growth_resets_watchdog_past_timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			doer := &stubGeminiDoer{fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				return &fhttp.Response{
+					StatusCode: 200,
+					Body: &ctxScriptedReadCloser{
+						ctx: req.Context(),
+						chunks: []scriptedChunk{
+							{delay: 6 * time.Second, data: p1},
+							{delay: 6 * time.Second, data: p2Thoughts},
+							{delay: 6 * time.Second, data: p3Text},
+							{delay: 6 * time.Second, data: done},
+						},
+					},
+				}, nil
+			}}
+			pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}})
+			ac := NewAccountClient("fw_grow", "SAPISID=f", "", pool, nil)
+			ac.SetTokens("at", "bl", "fs")
+			var final string
+			_, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: timeout}, func(u *LineParseResult) error {
+				for _, f := range u.Frames {
+					if f.Done {
+						final = f.Text
+					}
+				}
+				return nil
+			})
+			if err != nil || final != "hello world!" {
+				t.Fatalf("expected growing multi-phase stream to succeed past NoFrameTimeout, got final=%q err=%v", final, err)
+			}
+		})
+	})
+}
+
+func TestClassifyRPCErrorCode_1016And1014(t *testing.T) {
+	for _, tc := range []struct {
+		code       int
+		wantStatus int
+		wantCode   string
+	}{
+		{1016, 401, "upstream_auth_error"},
+		{1014, 503, "upstream_degraded"},
+	} {
+		frame := fmt.Sprintf(`[["wrb.fr",null,null,null,null,[8,null,[["type.googleapis.com/assistant.lamda.BardFrontendService",[[%d]]]]]]]`, tc.code)
+		_, err := ParseFrameLine(frame)
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != tc.wantStatus || ue.Code != tc.wantCode {
+			t.Fatalf("RPC %d: got %+v (%v), want %d %s", tc.code, ue, err, tc.wantStatus, tc.wantCode)
+		}
+	}
+}
+
+func TestPersistState_DoesNotBumpRotatedAtOnStatusChanges(t *testing.T) {
+	acctPath := filepath.Join(t.TempDir(), "acct.json")
+	origRot := "2025-01-01T00:00:00Z"
+	if _, err := cookies.SaveCredentialFile(acctPath, cookies.CredentialFile{
+		Name:      "acct",
+		Cookies:   "SAPISID=sap1",
+		RotatedAt: origRot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ac, err := LoadAccountFromFile(acctPath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac.SetQuarantined(true, "TOS_VIOLATION")
+	ac.SetDisabled(true)
+	ac.SetSurfaceStatus("geminiWeb", "blocked")
+
+	rec, _, err := cookies.LoadAccountFile(acctPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.RotatedAt != origRot {
+		t.Fatalf("status persistence bumped RotatedAt from %q to %q", origRot, rec.RotatedAt)
+	}
+}
+
+func TestSetRuntimeOptions_AllowsClearingGroupAndProxy(t *testing.T) {
+	ac := NewAccountClient("acct", "SAPISID=sap1", "", nil, nil)
+	ac.SetRuntimeOptions("en", "bl1", "bridge", "team-a", "http://127.0.0.1:8888")
+	ac.SetRuntimeOptions("", "", "", "", "")
+	ac.mu.RLock()
+	grp, proxy := ac.accountGroup, ac.proxyURL
+	ac.mu.RUnlock()
+	if grp != "" || proxy != "" {
+		t.Fatalf("expected SetRuntimeOptions to clear group and proxy, got group=%q proxy=%q", grp, proxy)
+	}
+}
+
+func TestPollAsyncVideoGeneration_TimeoutReturns504UpstreamTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				return &fhttp.Response{
+					StatusCode: 500,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader("still pending")),
+				}, nil
+			},
+		}
+		sc, err := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ac := NewAccountClient("vid_to", "SAPISID=sap1", "", nil, nil)
+		_, err = ac.pollAsyncVideoGenerationLocked(context.Background(), sc, "SAPISID=sap1", "at", "bl", "fs", "en", "c_vid_to")
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != 504 || ue.Code != "upstream_timeout" {
+			t.Fatalf("expected 504 upstream_timeout, got %+v (%v)", ue, err)
 		}
 	})
 }

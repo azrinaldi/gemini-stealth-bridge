@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -229,6 +230,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		"authMode":     authMode,
 		"poolKey":      s.displayPoolKey(cfg.APIKey),
 		"rotateCursor": rotCursor,
+		"aliasesEnabled": (cfg.APIKey == "" || cfg.APIKey == "public") && len(cfg.AccountTokens) == 0,
 		// The live model ids, so the Web UI can show the connection copy chips
 		// from the same registry the API serves. A hardcoded list there went
 		// stale the moment upstream renamed a model.
@@ -317,6 +319,19 @@ func (s *Server) HandleAdmin(ctx context.Context, w http.ResponseWriter, r *http
 		if !ok {
 			return
 		}
+		if rawID, _ := body["id"].(string); strings.TrimSpace(rawID) != "" && !reSafeID.MatchString(strings.TrimSpace(rawID)) {
+			sendJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]any{"message": fmt.Sprintf("invalid account id %q", strings.TrimSpace(rawID)), "type": "invalid_request_error"},
+			}, nil)
+			return
+		}
+		if !s.browserLoginInFlight.CompareAndSwap(false, true) {
+			sendJSON(w, http.StatusConflict, map[string]any{
+				"error": map[string]any{"message": "another browser login is already in progress", "type": "invalid_request_error"},
+			}, nil)
+			return
+		}
+		defer s.browserLoginInFlight.Store(false)
 		loginCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		defer cancel()
 		res, err := cookies.RunIsolatedBrowserLogin(loginCtx, "")
@@ -521,7 +536,7 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 	for k := range envUpdates {
 		if persist {
 			cfg.FieldSources[k] = "file"
-		} else if cfg.FieldSources[k] == "" {
+		} else {
 			cfg.FieldSources[k] = "runtime"
 		}
 	}
@@ -664,14 +679,32 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 		return
 	}
 	ac := gemini.NewAccountClient(initialRec.Name, hdr, stagePath, s.Pool, s.Rotator)
+	defer func() {
+		if s.Pool != nil {
+			s.Pool.Remove(initialRec.Name)
+		}
+		if s.Rotator != nil {
+			s.Rotator.Forget(initialRec.Name)
+		}
+	}()
 	ac.SetProvenance("web-ui", "cookie-export")
 	ac.SetAuthUser(initialRec.AuthUser)
 	ac.SetRuntimeOptions(locale, blOverride, protoMode, acctGroup, proxyURL)
 	candidate := &AccountState{ID: acctID, FilePath: stagePath, Client: ac, AccountGroup: acctGroup, ProxyURL: proxyURL, CapturedAt: now}
 	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	err = s.probeSingleAccount(probeCtx, candidate)
+	if err != nil && probeCtx.Err() == nil {
+		// Freshly captured browser cookies can hit a brief propagation delay on
+		// the first /app bootstrap or model listing; retry once before failing.
+		select {
+		case <-time.After(1200 * time.Millisecond):
+			err = s.probeSingleAccount(probeCtx, candidate)
+		case <-probeCtx.Done():
+		}
+	}
 	cancel()
 	if err != nil {
+		log.Printf("[admin] account import probe failed (id=%q): %v", acctID, err)
 		sendChatError(w, false, fmt.Errorf("probe with imported cookies failed: %w", err))
 		return
 	}
@@ -857,7 +890,7 @@ func (s *Server) handleAdminRotateAccount(ctx context.Context, w http.ResponseWr
 		return
 	}
 	now := s.now()
-	if res != nil && res.Rotated {
+	if res != nil && res.Status == 200 && res.Rotated {
 		acct.mu.Lock()
 		acct.RotatedAt = now
 		if looksLikeAuthFailure(acct.LastError) {
@@ -865,9 +898,14 @@ func (s *Server) handleAdminRotateAccount(ctx context.Context, w http.ResponseWr
 			acct.LastFail = time.Time{}
 			acct.Fails = 0
 		}
-		if acct.ModelsError != nil && looksLikeAuthFailure(acct.ModelsError.Error()) {
+		if acct.ModelsError != nil && isModelsAuthError(acct.ModelsError) {
 			acct.ModelsError = nil
 		}
+		acct.mu.Unlock()
+	} else if res != nil && (res.Status == 401 || res.Status == 403) {
+		acct.mu.Lock()
+		acct.LastError = fmt.Sprintf("cookie rotation rejected (HTTP %d); session expired; run `gsb --login %s` to sign in again", res.Status, acct.ID)
+		acct.LastFail = now
 		acct.mu.Unlock()
 	}
 	out := map[string]any{
@@ -994,6 +1032,13 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, acctID string) 
 		}
 	}
 	s.mu.Unlock()
+	if s.Pool != nil {
+		s.Pool.Remove(acctID)
+	}
+	if s.Rotator != nil {
+		s.Rotator.Forget(acctID)
+	}
+	s.evictUploadCacheForAccount(acctID)
 
 	sendJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",

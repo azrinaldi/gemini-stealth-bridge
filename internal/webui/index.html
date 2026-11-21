@@ -2050,11 +2050,6 @@
       <button type="button" id="feedback-close" class="btn btn-ghost btn-sm">Dismiss</button>
     </div>
 
-    <div id="desktop-connect" class="status-banner warn" hidden>
-      <span id="desktop-connect-status" role="status" aria-live="polite">Approve this browser once to manage your bridge.</span>
-      <button type="button" id="btn-desktop-connect" class="btn btn-secondary btn-sm">Connect desktop</button>
-    </div>
-
     <!-- VIEW 1: ACCOUNTS POOL -->
     <section id="view-accounts" class="view-section" role="tabpanel" aria-labelledby="tab-btn-accounts">
       <div class="view-stack">
@@ -2122,7 +2117,7 @@
                 <span class="helper">loading…</span>
               </div>
             </div>
-            <span class="pinning-note">Pin 1 account (no failover): copy <code class="mono">gsb-&lt;id&gt;</code> on any row</span>
+            <span id="pinning-note" class="pinning-note">Pin 1 account (no failover): copy <code class="mono">gsb-&lt;id&gt;</code> on any row</span>
           </div>
         </section>
 
@@ -2440,21 +2435,13 @@
     (function () {
       const THEME_KEY = 'gsb_ui_theme';
       const TOKEN_KEY = 'gsb_admin_token';
-      const DESKTOP_KEY = 'gsb_desktop_key';
-
       const rootEl = document.documentElement;
       const metaColorScheme = document.querySelector('meta[name="color-scheme"]');
-      const desktopUI = rootEl.dataset.desktopUi === 'true';
-      const clientOrigin = desktopUI ? 'http://127.0.0.1:20133' : window.location.origin;
+      const clientOrigin = window.location.origin;
 
       const desktopLoginError = document.getElementById('desktop-login-error');
       const importInlineError = document.getElementById('import-inline-error');
-      const desktopConnect = document.getElementById('desktop-connect');
-      const desktopConnectStatus = document.getElementById('desktop-connect-status');
-      const btnDesktopConnect = document.getElementById('btn-desktop-connect');
-      if (desktopUI) {
-        document.getElementById('isolated-login-help').textContent = 'Opens a browser on this computer. Sign in to Google; the desktop app sends the session through the SSH tunnel.';
-      }
+      const pinningNoteEl = document.getElementById('pinning-note');
 
       const btnTheme = document.getElementById('btn-theme-toggle');
       const btnRefreshLive = document.getElementById('btn-refresh-live');
@@ -2500,6 +2487,7 @@
       let allAccountsCache = [];
       let currentFilter = 'all';
       let lastConfigSnapshot = '';
+      let aliasesEnabled = true;
 
       /* ---------- Theme (2-state system-aware toggle) ---------- */
       function getSystemScheme() {
@@ -2783,33 +2771,9 @@
         loadAll(false);
       });
 
-      /* ---------- Desktop Pairing ---------- */
-      btnDesktopConnect.addEventListener('click', async function () {
-        const code = Array.from(crypto.getRandomValues(new Uint8Array(8)), function (x) { return x % 10; }).join('');
-        btnDesktopConnect.disabled = true;
-        desktopConnectStatus.textContent = 'Approve only if the desktop dialog shows this code: ' + code;
-        try {
-          const res = await fetch('/desktop/pair', { method: 'POST', body: code, redirect: 'error', cache: 'no-store' });
-          const data = await res.json();
-          if (!res.ok || !data.key) throw new Error((data.error && data.error.message) || 'Desktop approval failed.');
-          sessionStorage.setItem(DESKTOP_KEY, data.key);
-          desktopConnect.hidden = true;
-          bannerEl.hidden = true;
-          await loadAll(false);
-        } catch (err) {
-          desktopConnectStatus.textContent = err.message;
-        } finally {
-          btnDesktopConnect.disabled = false;
-        }
-      });
-
       /* ---------- API Client ---------- */
       async function apiRequest(path, options) {
         const opts = Object.assign({ method: 'GET', headers: {} }, options || {});
-        if (desktopUI) {
-          const desktopKey = sessionStorage.getItem(DESKTOP_KEY);
-          if (desktopKey) opts.headers['X-GSB-Desktop-Key'] = desktopKey;
-        }
         const tok = getToken();
         if (tok) {
           opts.headers['Authorization'] = 'Bearer ' + tok;
@@ -2826,12 +2790,6 @@
         } catch (_) {}
         if (res.status === 401) {
           const msg = (data.error && data.error.message) || 'Authentication required for this daemon.';
-          if (desktopUI && res.headers.get('X-GSB-Desktop-Connect') === 'required') {
-            sessionStorage.removeItem(DESKTOP_KEY);
-            desktopConnectStatus.textContent = 'Approve this browser once to manage your bridge.';
-            desktopConnect.hidden = false;
-            throw new Error(msg);
-          }
           openAuthModal(msg);
           throw new Error(msg);
         }
@@ -3137,6 +3095,8 @@
         tableWrap.hidden = false;
 
         filtered.forEach(function (acct, idx) {
+          const fullIdx = allAccountsCache.indexOf(acct);
+          const rankIdx = fullIdx >= 0 ? fullIdx : idx;
           const isTurn = Boolean(currentRotateCursor && currentRotateCursor === acct.id);
           const tr = document.createElement('tr');
           if (isTurn) tr.className = 'is-active-turn';
@@ -3151,9 +3111,8 @@
 
           const rank = document.createElement('span');
           rank.className = 'acct-rank';
-          rank.textContent = String(idx + 1).padStart(2, '0');
+          rank.textContent = String(rankIdx + 1).padStart(2, '0');
           primaryLine.appendChild(rank);
-
           const idSpan = document.createElement('span');
           idSpan.className = 'acct-id';
           idSpan.textContent = acct.id;
@@ -3181,16 +3140,17 @@
           emailSpan.textContent = acct.email || 'unverified email';
           subLine.appendChild(emailSpan);
 
-          const keyBtn = document.createElement('button');
-          keyBtn.type = 'button';
-          keyBtn.className = 'acct-key-btn';
-          keyBtn.title = 'Copy dedicated key gsb-' + acct.id + ' (pins traffic to this account, no failover)';
-          keyBtn.innerHTML = '<span>gsb-' + escapeHTML(acct.id) + '</span><span class="readout-copy-icon" aria-hidden="true">' + SVG_COPY + '</span>';
-          keyBtn.addEventListener('click', function () {
-            copyToClipboard('gsb-' + acct.id, keyBtn, 'Copied dedicated key gsb-' + acct.id);
-          });
-          subLine.appendChild(keyBtn);
-
+          if (aliasesEnabled) {
+            const keyBtn = document.createElement('button');
+            keyBtn.type = 'button';
+            keyBtn.className = 'acct-key-btn';
+            keyBtn.title = 'Copy dedicated key gsb-' + acct.id + ' (pins traffic to this account, no failover)';
+            keyBtn.innerHTML = '<span>gsb-' + escapeHTML(acct.id) + '</span><span class="readout-copy-icon" aria-hidden="true">' + SVG_COPY + '</span>';
+            keyBtn.addEventListener('click', function () {
+              copyToClipboard('gsb-' + acct.id, keyBtn, 'Copied dedicated key gsb-' + acct.id);
+            });
+            subLine.appendChild(keyBtn);
+          }
           thId.appendChild(subLine);
           tr.appendChild(thId);
 
@@ -3233,13 +3193,14 @@
           const orderGrp = document.createElement('div');
           orderGrp.className = 'order-group';
 
+          const filterLocksOrder = currentFilter !== 'all';
           const btnUp = document.createElement('button');
           btnUp.type = 'button';
           btnUp.className = 'btn-row-icon';
           btnUp.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>';
-          btnUp.title = 'Move account up in priority order';
+          btnUp.title = filterLocksOrder ? 'Switch filter to All to reorder priority' : 'Move account up in priority order';
           btnUp.setAttribute('aria-label', 'Move ' + acct.id + ' up');
-          btnUp.disabled = idx === 0;
+          btnUp.disabled = filterLocksOrder || rankIdx === 0;
           btnUp.addEventListener('click', function () {
             moveAccount(acct.id, 'up', btnUp);
           });
@@ -3249,14 +3210,13 @@
           btnDown.type = 'button';
           btnDown.className = 'btn-row-icon';
           btnDown.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
-          btnDown.title = 'Move account down in priority order';
+          btnDown.title = filterLocksOrder ? 'Switch filter to All to reorder priority' : 'Move account down in priority order';
           btnDown.setAttribute('aria-label', 'Move ' + acct.id + ' down');
-          btnDown.disabled = idx === filtered.length - 1;
+          btnDown.disabled = filterLocksOrder || rankIdx >= allAccountsCache.length - 1;
           btnDown.addEventListener('click', function () {
             moveAccount(acct.id, 'down', btnDown);
           });
           orderGrp.appendChild(btnDown);
-
           actRow.appendChild(orderGrp);
 
           const btnMore = document.createElement('button');
@@ -3350,6 +3310,10 @@
 
       function populateConfigForm(adm) {
         currentRotateCursor = adm.rotateCursor || '';
+        aliasesEnabled = adm.aliasesEnabled !== false;
+        if (pinningNoteEl) {
+          pinningNoteEl.hidden = !aliasesEnabled;
+        }
         hdrMeta.textContent = 'v' + (adm.version || '0.4.4') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
         document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
         document.getElementById('conn-base-url').textContent = clientOrigin + '/v1';
@@ -3731,6 +3695,7 @@
             desktopLoginError.hidden = false;
             desktopLoginError.textContent = err.message;
           }
+          showBanner('err', 'Add Account failed: ' + err.message);
         } finally {
           btn.disabled = false;
           btn.textContent = 'Launch';

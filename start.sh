@@ -14,7 +14,7 @@ export BRIDGE_WEB_UI="${BRIDGE_WEB_UI:-1}"
 needs_build=0
 if [ ! -x "./gsb" ]; then
   needs_build=1
-elif [ -n "$(find cmd internal -name '*.go' -newer ./gsb -print -quit 2>/dev/null)" ]; then
+elif [ -n "$(find cmd internal \( -name '*.go' -o -name '*.html' \) -newer ./gsb -print -quit 2>/dev/null)" ]; then
   needs_build=1
 fi
 

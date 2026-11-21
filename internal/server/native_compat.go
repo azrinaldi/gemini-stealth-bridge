@@ -13,10 +13,9 @@ import (
 // sends max_tokens or stop trusts the bridge to honour it: ignoring them
 // silently returns a longer answer than the caller budgeted for.
 //
-// The controls are applied to the finished text rather than to the stream
-// because Gemini emits whole enuni, not tokens, so there is no byte position
-// that corresponds to "token 5". Truncating the assembled answer is the only
-// point where the count is knowable.
+// Token and stop limits are enforced incrementally during streaming via
+// visible()/visibleAfter() and on the finished answer via apply(). response_format
+// json_object is unwrapped once the full object has arrived.
 
 // answerLimits holds the sampling-free controls from an OpenAI request that
 // gsb enforces itself.
@@ -85,10 +84,16 @@ func (l answerLimits) streamable() bool {
 // has been reached. When a limit is reached the caller must stop emitting and
 // finish with the returned verdict.
 func (l answerLimits) visible(text string) (string, string) {
+	return l.visibleAfter(text, 0)
+}
+
+// visibleAfter returns the prefix of text that is safe to emit without stepping
+// back below minCut (already-streamed byte length).
+func (l answerLimits) visibleAfter(text string, minCut int) (string, string) {
 	if !l.enabled() {
 		return text, ""
 	}
-	visible, finish := l.apply(text)
+	visible, finish := l.applyWithFloor(text, minCut)
 	if finish != "" {
 		return visible, finish
 	}
@@ -103,19 +108,27 @@ func (l answerLimits) visible(text string) (string, string) {
 			}
 		}
 	}
-	return visible[:len(visible)-hold], ""
+	cut := len(visible) - hold
+	if cut < minCut && minCut <= len(visible) {
+		cut = minCut
+	}
+	return visible[:cut], ""
 }
 
 // apply cuts the answer at the first stop sequence and at the token budget.
 // It reports which limit fired so the caller can set finish_reason accordingly.
 func (l answerLimits) apply(text string) (string, string) {
+	return l.applyWithFloor(text, 0)
+}
+
+func (l answerLimits) applyWithFloor(text string, minCut int) (string, string) {
 	finish := ""
 	if idx := l.stopIndex(text); idx >= 0 {
 		text = text[:idx]
 		finish = "stop"
 	}
 	if l.maxTokens > 0 {
-		if cut, truncated := truncateToTokens(text, l.maxTokens); truncated {
+		if cut, truncated := truncateToTokensWithFloor(text, l.maxTokens, minCut); truncated {
 			text = cut
 			finish = "length"
 		}
@@ -138,6 +151,10 @@ func (l answerLimits) stopIndex(text string) int {
 // using the same estimator as the usage report so the two cannot disagree.
 // It prefers a word boundary when one exists near the cut.
 func truncateToTokens(text string, budget int) (string, bool) {
+	return truncateToTokensWithFloor(text, budget, 0)
+}
+
+func truncateToTokensWithFloor(text string, budget int, minCut int) (string, bool) {
 	if text == "" || budget <= 0 {
 		return text, false
 	}
@@ -161,14 +178,22 @@ func truncateToTokens(text string, budget int) (string, bool) {
 	}
 	if cut > 0 && cut < len(text) {
 		// Do not end mid-word: step back to the last space in the final 20% of
-		// the kept prefix, but never past the budget.
+		// the kept prefix, but never past the budget or below already-emitted bytes.
 		back := cut - cut/5
 		if back < 0 {
 			back = 0
 		}
-		if i := strings.LastIndexByte(text[back:cut], ' '); i >= 0 {
-			cut = back + i
+		if back < minCut {
+			back = minCut
 		}
+		if back < cut {
+			if i := strings.LastIndexByte(text[back:cut], ' '); i >= 0 {
+				cut = back + i
+			}
+		}
+	}
+	if cut < minCut && minCut <= len(text) {
+		cut = minCut
 	}
 	return text[:cut], true
 }

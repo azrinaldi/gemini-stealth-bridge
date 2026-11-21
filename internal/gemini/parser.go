@@ -1265,6 +1265,22 @@ func classifyRPCErrorCode(code int, raw any) error {
 		snippet = snippet[:200]
 	}
 	switch code {
+	case 1014:
+		return transport.NewUpstreamError(
+			"upstream error code 1014: access is temporarily restricted; retrying later usually succeeds",
+			503,
+			"upstream_degraded",
+			nil,
+			nil,
+		)
+	case 1016:
+		return transport.NewUpstreamError(
+			"upstream error code 1016: session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again",
+			401,
+			"upstream_auth_error",
+			nil,
+			nil,
+		)
 	case 1037:
 		return transport.NewUpstreamError(
 			"upstream error code 1037",

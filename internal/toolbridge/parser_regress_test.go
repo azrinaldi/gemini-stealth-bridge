@@ -610,3 +610,51 @@ func TestRefusalWindowCoversDetector(t *testing.T) {
 		t.Fatal("detector read past RefusalWindowBytes; the gate would hold far more text than it must")
 	}
 }
+
+func TestMultiLineFencedToolEnvelopeWithTrailingCloseFenceChatter(t *testing.T) {
+	tools := sampleReproTools()
+
+	// Exact shapes leaked by gemini-4-neon in ATRBPN Warehouse OMP session:
+	// 1. Multi-line fenced tool_calls block with "```Groq\nReviewer: ..." glued onto the closing fence.
+	leak58 := "```json\n{\"tool_calls\":[{\"arguments\":{\"path\":\"/tmp/a\"},\"name\":\"read_file\"},{\"arguments\":{\"command\":\"echo ok\",\"i\":\"Run check\"},\"name\":\"bash\"}]}\n```Groq\nReviewer: wait, let's see the tool output!"
+	res1, err := InterpretReply(leak58, tools, "auto")
+	if err != nil {
+		t.Fatalf("leak58 unexpected error: %v", err)
+	}
+	if res1 == nil || len(res1.Calls) != 2 || res1.Calls[0].Name != "read_file" || res1.Calls[1].Name != "bash" {
+		t.Fatalf("leak58 expected 2 parsed tool calls, got %+v", res1)
+	}
+
+	// 2. Model self-corrects after trailing text on closing fence and emits a second identical block glued after a period.
+	leak68 := "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/b\"}},{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\",\"i\":\"List dir\"}}]}\n``` Wed May 2026 - wait no trailing text!\n\nWAIT — I almost wrote trailing text outside the json block! Let's NOT do that. Output ONLY the ```json ... ``` block.```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/b\"}},{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\",\"i\":\"List dir\"}}]}\n```"
+	res2, err := InterpretReply(leak68, tools, "auto")
+	if err != nil {
+		t.Fatalf("leak68 unexpected error: %v", err)
+	}
+	if res2 == nil || len(res2.Calls) != 2 || res2.Calls[0].Name != "read_file" || res2.Calls[1].Name != "bash" {
+		t.Fatalf("leak68 expected 2 parsed tool calls (not 4), got %+v", res2)
+	}
+
+	// 3. Two adjacent fenced blocks with identical tool calls separated only by whitespace/fences are deduplicated.
+	dupBlocks := "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/c\"}}]}\n```\n```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/c\"}}]}\n```"
+	res3, err := InterpretReply(dupBlocks, tools, "auto")
+	if err != nil {
+		t.Fatalf("dupBlocks unexpected error: %v", err)
+	}
+	if res3 == nil || len(res3.Calls) != 1 {
+		t.Fatalf("dupBlocks expected 1 deduplicated tool call, got %+v", res3)
+	}
+
+	// Verify LiveToolCallStreamer also streams and finalizes leak58 cleanly without revision error.
+	var deltas []map[string]any
+	streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+		deltas = append(deltas, d)
+	})
+	if err := streamer.PushError(leak58); err != nil {
+		t.Fatalf("streamer.PushError(leak58) failed: %v", err)
+	}
+	oa, err := streamer.FinalizeError(res1.Calls, leak58)
+	if err != nil || len(oa) != 2 {
+		t.Fatalf("streamer.FinalizeError(leak58) = %+v, err=%v", oa, err)
+	}
+}

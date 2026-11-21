@@ -733,7 +733,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 	if stream && cfg.EarlySSE && (eagerStream || !cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && cfg.EarlySSEGrace > 0 {
+	} else if stream && cfg.EarlySSEGrace > 0 {
 		graceDur := cfg.EarlySSEGrace
 		graceWG.Add(1)
 		go func() {
@@ -847,6 +847,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	}
 
 	triedAccounts := map[string]bool{account.ID: true}
+	var stallTracker requestStallTracker
+	errorReplyRetried := false
 	freshSocketNext := false
 	rebootstrapNext := false
 	serverMediaRounds := 0
@@ -935,7 +937,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					markPhase(&identityMs)
 				}
 				earlyMismatch := shouldAbortForModelRejection(cfg, mediaToolUsed, *model, servedID, servedLabel)
-				identityVerifiedNow := canStreamVerified(eagerStream, cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+				identityVerifiedNow := canStreamVerifiedWithConfig(cfg, eagerStream, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
@@ -999,8 +1001,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 					}
 					thoughts = toolbridge.StripToolGuard(mergeStreamedThoughts(thoughts, frame.Thoughts))
-					done = frame.Done
-					frameMismatch := cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+					done = done || frame.Done
+					frameMismatch := shouldAbortForModelRejection(cfg, mediaToolUsed, *model, servedID, servedLabel)
 					attemptStateMu.Unlock()
 					if frameMismatch {
 						return transport.ErrStopStreaming
@@ -1011,31 +1013,42 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 
 					if stream && !buffered && prep.limits.streamable() && limitFinish == "" && ctx.Err() == nil {
-						if !strings.HasPrefix(text, sentText) || (cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
+						clean := toolbridge.StripToolGuard(text)
+						if !hasCompatibleStreamPrefix(clean, sentText) || (cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						if hasTools && sentText == "" {
-							if toolbridge.IsToolProtocolRefusal(text) {
+							if toolbridge.IsToolProtocolRefusal(clean) {
 								return transport.NewUpstreamError(toolbridge.RefusalErrorText, 502, "tool_call_error", nil, nil)
 							}
-							if len(text) <= toolbridge.RefusalWindowBytes {
+							if len(clean) <= toolbridge.RefusalWindowBytes {
 								continue
 							}
 						}
-						visible, hit := prep.limits.visible(toolbridge.StripToolGuard(text))
-						if hit != "" {
-							limitFinish, limitedText = hit, visible
+						if done && sentText == "" && gemini.GeminiErrorReply(clean) != "" {
+							continue
 						}
-						if strings.HasPrefix(visible, sentText) && len(visible) > len(sentText) {
-							emitTextDelta(visible[len(sentText):])
-							sentText = visible
+						if len(clean) > len(sentText) && gemini.GeminiErrorReply(clean) == "" {
+							visible := clean
+							if !hasTools {
+								var hit string
+								visible, hit = prep.limits.visibleAfter(clean, len(sentText))
+								if hit != "" {
+									limitFinish, limitedText = hit, visible
+								}
+							}
+							if tail, ok := remainingStreamTail(visible, sentText); ok && tail != "" {
+								emitTextDelta(tail)
+								sentText = visible
+							}
 						}
 					} else if stream && buffered && limitFinish == "" && ctx.Err() == nil && !done {
-						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
+						clean := toolbridge.StripToolGuard(text)
+						if sentText != "" && !hasCompatibleStreamPrefix(clean, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						// Answer text still waits for model verification in strict mode.
-						identityVerified := canStreamVerified(eagerStream, cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+						identityVerified := canStreamVerifiedWithConfig(cfg, eagerStream, identityConflict, *model, servedID, servedLabel)
 						if identityVerified && cfg.LiveThoughts {
 							if hasTools && !cfg.KeepToolPreamble && sentText == "" {
 								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
@@ -1050,18 +1063,26 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							}
 						}
 						if identityVerified && prep.limits.streamable() {
-							clean := toolbridge.StripToolGuard(text)
-							visible, hit := prep.limits.visible(clean)
-							if hit != "" {
-								limitFinish, limitedText = hit, visible
+							if hasTools && sentText == "" && toolbridge.IsToolProtocolRefusal(clean) {
+								return transport.NewUpstreamError(toolbridge.RefusalErrorText, 502, "tool_call_error", nil, nil)
 							}
-							if !hasTools && strings.HasPrefix(visible, sentText) && len(visible) > 240 && len(visible) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								emitTextDelta(visible[len(sentText):])
-								sentText = visible
-							} else if hasTools && !mediaToolUsed && len(visible) > 240 && !toolbridge.IsToolProtocolRefusal(text) {
-								if safePrefix := toolbridge.SafeStreamablePrefix(visible); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text) == "" {
-									emitTextDelta(safePrefix[len(sentText):])
-									sentText = safePrefix
+							if !hasTools {
+								visible, hit := prep.limits.visibleAfter(clean, len(sentText))
+								if hit != "" {
+									limitFinish, limitedText = hit, visible
+								}
+								if len(visible) > 240 && gemini.GeminiErrorReply(clean) == "" {
+									if tail, ok := remainingStreamTail(visible, sentText); ok && tail != "" {
+										emitTextDelta(tail)
+										sentText = visible
+									}
+								}
+							} else if !mediaToolUsed && len(clean) > 240 && !toolbridge.IsToolProtocolRefusal(clean) && gemini.GeminiErrorReply(clean) == "" {
+								if safePrefix := toolbridge.SafeStreamablePrefix(clean); len(safePrefix) > len(sentText) {
+									if tail, ok := remainingStreamTail(safePrefix, sentText); ok && tail != "" {
+										emitTextDelta(tail)
+										sentText = safePrefix
+									}
 								}
 							}
 						}
@@ -1078,9 +1099,16 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
+		rawText := text
 		evalText, evalSent := text, sentText
-		if limitFinish != "" {
-			evalText, evalSent = limitedText, limitedText
+		if limitFinish != "" && !hasTools {
+			evalText = limitedText
+			if sentText != "" {
+				evalSent = limitedText
+			}
+			if evalText == "" && rawText != "" {
+				evalText = " "
+			}
 		}
 		interpreted, runCheck := s.evaluateAttemptCompletion(
 			ctx,
@@ -1118,13 +1146,17 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				// A local reservation rejection is not an upstream account failure.
 			} else if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
+			} else if stallTracker.recordError(s, account, errCode, runCheck.Error()) {
+				if !stallTracker.poisoned {
+					s.refreshQuotaAsync(account, c)
+				}
 			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && shouldEvictSessionCacheOnError(errCode, errStatus) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}
@@ -1141,19 +1173,26 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			inStreamRetryable := (errCode == "tool_call_error" ||
 				errCode == "upstream_error_reply" ||
 				errCode == "upstream_transient" ||
+				errCode == "upstream_degraded" ||
+				(sentThought == "" && (errCode == "upstream_transport_error" ||
+					errCode == "upstream_error" ||
+					errCode == "upstream_http_error" ||
+					errCode == "upstream_upload_error" ||
+					errCode == "upstream_parse_error")) ||
 				errCode == "empty_upstream_response" ||
 				errCode == "incomplete_upstream_response" ||
-				(scope.AccountID == "" && (errCode == "model_substitution" ||
+				errCode == "session_busy" ||
+				errCode == "upstream_auth_error" ||
+				errCode == "auth_redirect" ||
+				(len(opts.Metadata) > 0 && (errCode == "upstream_stalled" || errCode == "upstream_timeout")) ||
+				(scope.AccountID == "" && (errCode == "account_disabled" ||
+					errCode == "model_substitution" ||
 					errCode == "model_label_mismatch" ||
 					errStatus == 429 ||
 					errCode == "rate_limit_error" ||
-					errCode == "session_busy" ||
-					errCode == "upstream_auth_error" ||
-					errCode == "auth_redirect" ||
 					errCode == "upstream_connect_timeout" ||
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" ||
-					errCode == "upstream_degraded" ||
 					errCode == "model_identity_unknown" ||
 					errCode == "model_identity_conflict"))) && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
@@ -1229,10 +1268,21 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" {
 					lastRetryReason = errCode
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct, nextModel)
+					if !stallTracker.poisoned {
+						if scope.AccountID == "" {
+							if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+								triedAccounts[nextAcct.ID] = true
+								assignAccount(nextAcct, nextModel)
+								opts.Metadata = nil
+								opts.Files = nil
+								curPrompt = fullPrompt
+								attachmentParts = fullAttachmentParts
+								continue
+							}
+						}
+						if len(opts.Metadata) > 0 {
+							// The continuation itself stalled; retry once as a fresh
+							// conversation even on a single or pinned account.
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1278,11 +1328,39 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 					}
 				}
+				if errCode == "account_disabled" {
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct, nextModel)
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+				}
 				if errCode == "upstream_transport_error" ||
 					errCode == "upstream_error" ||
+					errCode == "upstream_http_error" ||
+					errCode == "upstream_upload_error" ||
+					errCode == "upstream_parse_error" ||
 					errCode == "incomplete_upstream_response" ||
 					errCode == "tool_call_error" {
 					lastRetryReason = errCode
+					if errCode != "tool_call_error" && scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct, nextModel)
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
 					if errCode != "tool_call_error" {
 						freshSocketNext = true
 						rebootstrapNext = true
@@ -1297,8 +1375,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					continue
 				}
 				if errCode == "upstream_error_reply" {
-					if attempt == 0 {
-						lastRetryReason = errCode
+					if !errorReplyRetried {
+						errorReplyRetried = true
 						freshSocketNext = true
 						rebootstrapNext = true
 						opts.Metadata = nil
@@ -1415,6 +1493,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
+				opts.Files = nil
+				attachmentParts = fullAttachmentParts
 				serverMediaRounds++
 				attempt--
 				if upstreamCalls > 0 {
@@ -1428,6 +1508,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
+				opts.Files = nil
+				attachmentParts = fullAttachmentParts
 				serverMediaRounds++
 				attempt--
 				if upstreamCalls > 0 {
@@ -1566,6 +1648,15 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					"output_index":  reasoningIndex,
 					"summary_index": 0,
 					"text":          reasoningText,
+				})
+				emitSSE("response.reasoning_summary_part.done", map[string]any{
+					"item_id":       rsID,
+					"output_index":  reasoningIndex,
+					"summary_index": 0,
+					"part": map[string]any{
+						"type": "summary_text",
+						"text": reasoningText,
+					},
 				})
 				emitSSE("response.output_item.done", map[string]any{
 					"output_index": reasoningIndex,

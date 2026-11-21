@@ -1045,3 +1045,146 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestStealthClientDo_NoGoroutineLeakWhenDoerReturnsErrorOnCancel(t *testing.T) {
+	sc, err := NewStealthClient(ClientConfig{
+		FirstByteTimeout: 5 * time.Second,
+		CustomDoer: &stubDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm up one call before measuring baseline.
+	warmCtx, warmCancel := context.WithCancel(context.Background())
+	warmCancel()
+	_, _ = sc.Do(warmCtx, RequestOptions{Method: "GET", URL: "https://gemini.google.com/app"})
+	runtime.Gosched()
+	time.Sleep(15 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	for range 40 {
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
+		_, _ = sc.Do(cctx, RequestOptions{
+			Method:           "GET",
+			URL:              "https://gemini.google.com/app",
+			FirstByteTimeout: 5 * time.Second,
+		})
+		cancel()
+	}
+
+	runtime.Gosched()
+	time.Sleep(25 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	if after > baseline+4 {
+		t.Fatalf("goroutine leak detected when doer.Do returns error on cancel: baseline=%d after=%d", baseline, after)
+	}
+}
+
+func TestStealthClientDo_StallTimerRaceFreeWithErrStopStreaming(t *testing.T) {
+	for range 25 {
+		doer := &stubDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				pr, pw := io.Pipe()
+				go func() {
+					defer pw.Close()
+					for range 5 {
+						if _, err := pw.Write([]byte("chunk_data\n")); err != nil {
+							return
+						}
+						time.Sleep(2 * time.Millisecond)
+					}
+				}()
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       pr,
+				}, nil
+			},
+		}
+		sc, err := NewStealthClient(ClientConfig{
+			CustomDoer:       doer,
+			FirstByteTimeout: time.Second,
+			StallTimeout:     6 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chunks int
+		res, err := sc.Do(context.Background(), RequestOptions{
+			Method: "POST",
+			URL:    "https://gemini.google.com/StreamGenerate",
+			OnChunk: func(string) error {
+				chunks++
+				if chunks >= 2 {
+					return ErrStopStreaming
+				}
+				return nil
+			},
+		})
+		if err != nil || res == nil || res.Status != 200 {
+			t.Fatalf("expected clean ErrStopStreaming return without stall race, got res=%+v err=%v", res, err)
+		}
+	}
+}
+
+func TestPoolRemoveAndSessionQueuedAccuracy(t *testing.T) {
+	pool := NewPool(PoolOptions{
+		ClientConfig: ClientConfig{CustomDoer: &stubDoer{}},
+		MaxSessions:  4,
+		MaxQueue:     4,
+		WaitTimeout:  2 * time.Second,
+	})
+	defer pool.Reset()
+
+	sA, err := pool.Acquire(context.Background(), "acct-a", "SAPISID=a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sB, err := pool.Acquire(context.Background(), "acct-b", "SAPISID=b")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrent RunStream calls must NOT be reported as queued.
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = sB.RunStream(context.Background(), func(string) error {
+				started <- struct{}{}
+				<-release
+				return nil
+			})
+		}()
+	}
+	<-started
+	<-started
+	if sB.Active() != 2 || sB.Queued() != 0 {
+		t.Fatalf("expected RunStream active=2 queued=0, got active=%d queued=%d", sB.Active(), sB.Queued())
+	}
+	for _, st := range pool.Status() {
+		if st.Key == "acct-b" && (st.Active != 2 || st.Queued != 0) {
+			t.Fatalf("expected Pool.Status acct-b active=2 queued=0, got %+v", st)
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	// Pool.Remove evicts only acct-a and retires its session.
+	pool.Remove("acct-a")
+	if pool.Existing("acct-a") != nil {
+		t.Fatal("expected acct-a removed from pool")
+	}
+	if sA.Client == nil || pool.Existing("acct-b") == nil {
+		t.Fatal("expected acct-b to remain in pool")
+	}
+}

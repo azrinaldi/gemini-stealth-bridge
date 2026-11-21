@@ -403,7 +403,7 @@ All admin routes require the admin key when one is configured, and are only moun
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/v1/admin/config` | Effective runtime config, field sources, pool key, rotation cursor, uptime, metrics |
-| `PATCH` | `/v1/admin/config` | Update the 11 runtime fields above; `persist: true` writes `config.env` |
+| `PATCH` | `/v1/admin/config` | Update the 12 runtime fields above; `persist: true` writes `config.env` |
 | `POST` | `/v1/admin/accounts/import` | Import an account from a cookie payload; body: `id`, `cookie`, `accountGroup`, `proxyUrl` |
 | `POST` | `/v1/admin/accounts/browser-login` | Run an isolated browser login (4-minute timeout) and import the result |
 | `DELETE` | `/v1/admin/accounts/<id>` | Remove the account file and unload it |
@@ -515,7 +515,7 @@ Then open `http://127.0.0.1:20133/ui` locally and use **+ Add Account**:
 
 `gsb --login-helper` listens on `127.0.0.1:20134` on the laptop. Do not tunnel that port. Paste the token shown in the helper terminal into **Desktop helper token**. The token changes when the helper restarts.
 
-**Desktop browser login on VPS:** keep GSB daemon UI as only UI. Use one local port, `20133`, for API, daemon Web UI, and local browser login. Install `zenity`, keep private SSH socket tunnel, then start `gsb --desktop-ui` on laptop.
+**Desktop browser login on VPS:** keep GSB daemon UI as only UI. Use one local port, `20133`, for API, daemon Web UI, and local browser login. Keep the private SSH socket tunnel open, then start `gsb --desktop-ui` on laptop.
 
 ```sh
 install -d -m 700 "$XDG_RUNTIME_DIR/gsb-desktop"
@@ -862,7 +862,7 @@ Accepted fields:
 | `thinkingConfig`, `generationConfig.thinkingConfig` | `thinkingLevel` or `thinkingBudget` |
 | `output_config` | `effort` |
 
-Sampling parameters `temperature`, `top_p`, and `seed` are accepted but ignored: Gemini Web exposes no equivalent. Output controls are enforced by the bridge instead of upstream — `max_tokens` / `max_completion_tokens` cut the answer and set `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format: {"type": "json_object"}` returns an unwrapped JSON object. Because those limits apply to the whole answer, a request that sets one is buffered and emitted once rather than streamed token by token.
+Sampling parameters `temperature`, `top_p`, and `seed` are accepted but ignored: Gemini Web exposes no equivalent. Output controls are enforced by the bridge instead of upstream — `max_tokens` / `max_completion_tokens` cut the answer and set `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format` (`{"type": "json_object"}` or `{"type": "json_schema"}`) returns an unwrapped JSON object. `max_tokens` and `stop` keep incremental streaming (only the prefix inside the limit is emitted, holding back any trailing partial `stop` prefix until resolved), whereas `response_format` is buffered and emitted once at the end because a JSON object cannot be unwrapped before it is complete.
 
 Message content can be a string or an array of parts. Supported image shapes:
 
@@ -1348,7 +1348,7 @@ Models with documented limits always use the documented value; `capabilities.lim
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Upstream HTTP response-header deadline; stops when headers arrive |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
-| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Deadline after HTTP 200 headers for the first candidate with content or final status. Changed activity can extend it; unchanged activity, empty candidates, and keepalives cannot |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Deadline after HTTP 200 headers for the first candidate with content or final status. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models (`medium`/`high` and explicit values use the full deadline). Changed activity can extend it; unchanged activity, empty candidates, and keepalives cannot |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval, clamped to 60 s–3600 s. Idle accounts rotate at half frequency |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh interval |
@@ -1657,7 +1657,7 @@ go build -tags nowebui -o gsb ./cmd/gsb
 |---|---|
 | `--login <name>` | Interactive isolated-browser sign-in; saves `accounts/<name>.json` |
 | `--login-helper` | Run the local desktop login helper on `127.0.0.1:20134` for remote VPS use |
-| `--desktop-ui` | Run the desktop control plane on `127.0.0.1:20135` using the private SSH socket from §6.4 |
+| `--desktop-ui` | Run the desktop control plane on `127.0.0.1:20133` using the private SSH socket from §6.4 |
 | `--import-chrome <name>` | Import cookies from a local browser profile or cookie database |
 | `--import-cookie <name>` | Import a raw `Cookie` header or Cookie-Editor JSON |
 | `--chrome-profile <name\|dir\|db>` | Browser profile name, directory, or Cookies SQLite path |

@@ -1110,10 +1110,12 @@ func TestT1_2_6_SlowSingleFrameWithinTimeoutSucceeds(t *testing.T) {
 
 func TestT1_2_6_MultiFrameStreamExceedingNoFrameTimeoutSucceeds(t *testing.T) {
 	f1 := e2eBuildStreamLine("c1", "r1", "rc1", "part1", "", false, "")
-	f2 := e2eBuildStreamLine("c1", "r1", "rc1", "part1 part2", "", true, "ctx1")
+	f2 := e2eBuildStreamLine("c1", "r1", "rc1", "part1 part2", "", false, "")
+	f3 := e2eBuildStreamLine("c1", "r1", "rc1", "part1 part2 part3", "", true, "ctx1")
 	ac, _ := newBootstrappedAccountWithStreamChunks(t, []e2eChunk{
-		{data: []byte(")]}'\n\n" + f1 + "\n"), delay: 10 * time.Millisecond},
-		{data: []byte(f2 + "\n"), delay: 80 * time.Millisecond},
+		{data: []byte(")]}'\n\n" + f1 + "\n"), delay: 25 * time.Millisecond},
+		{data: []byte(f2 + "\n"), delay: 25 * time.Millisecond},
+		{data: []byte(f3 + "\n"), delay: 25 * time.Millisecond},
 	})
 	var last string
 	res, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: 45 * time.Millisecond}, func(u *LineParseResult) error {
@@ -1122,7 +1124,7 @@ func TestT1_2_6_MultiFrameStreamExceedingNoFrameTimeoutSucceeds(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil || res.Empty || last != "part1 part2" {
+	if err != nil || res.Empty || last != "part1 part2 part3" {
 		t.Fatalf("expected multi-frame stream past NoFrameTimeout to succeed, got res=%+v last=%q err=%v", res, last, err)
 	}
 }
@@ -1156,20 +1158,38 @@ func TestT1_2_6_ZeroNoFrameTimeoutUsesDefault(t *testing.T) {
 }
 
 func TestT2_2_6_ValidFrameAlreadyReceivedThenStreamLongerThanTimeout(t *testing.T) {
-	f1 := e2eBuildStreamLine("c1", "r1", "rc1", "first valid frame", "", false, "")
-	f2 := e2eBuildStreamLine("c1", "r1", "rc1", "first valid frame complete", "", true, "ctx1")
-	ac, _ := newBootstrappedAccountWithStreamChunks(t, []e2eChunk{
-		{data: []byte(")]}'\n\n" + f1 + "\n"), delay: 5 * time.Millisecond},
-		{data: []byte("[[\"wrb.fr\",null,null,null,null,[3]]]\n"), delay: 60 * time.Millisecond},
-		{data: []byte(f2 + "\n"), delay: 10 * time.Millisecond},
+	t.Run("progressing_stream_longer_than_timeout_succeeds", func(t *testing.T) {
+		f1 := e2eBuildStreamLine("c1", "r1", "rc1", "part 1", "", false, "")
+		f2 := e2eBuildStreamLine("c1", "r1", "rc1", "part 1 part 2", "", false, "")
+		f3 := e2eBuildStreamLine("c1", "r1", "rc1", "part 1 part 2 complete", "", true, "ctx1")
+		ac, _ := newBootstrappedAccountWithStreamChunks(t, []e2eChunk{
+			{data: []byte(")]}'\n\n" + f1 + "\n"), delay: 20 * time.Millisecond},
+			{data: []byte(f2 + "\n"), delay: 20 * time.Millisecond},
+			{data: []byte(f3 + "\n"), delay: 20 * time.Millisecond},
+		})
+		res, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: 35 * time.Millisecond}, nil)
+		if err != nil {
+			t.Fatalf("progressing stream longer than NoFrameTimeout must succeed, got: %v", err)
+		}
+		if res.Empty {
+			t.Fatal("expected non-empty StreamResponse")
+		}
 	})
-	res, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: 35 * time.Millisecond}, nil)
-	if err != nil {
-		t.Fatalf("stream already received valid frame, MUST NOT return stall error: %v", err)
-	}
-	if res.Empty {
-		t.Fatal("expected non-empty StreamResponse")
-	}
+
+	t.Run("midstream_keepalive_only_hang_returns_incomplete", func(t *testing.T) {
+		f1 := e2eBuildStreamLine("c1", "r1", "rc1", "first valid frame", "", false, "")
+		f2 := e2eBuildStreamLine("c1", "r1", "rc1", "first valid frame complete", "", true, "ctx1")
+		ac, _ := newBootstrappedAccountWithStreamChunks(t, []e2eChunk{
+			{data: []byte(")]}'\n\n" + f1 + "\n"), delay: 5 * time.Millisecond},
+			{data: []byte("[[\"wrb.fr\",null,null,null,null,[3]]]\n"), delay: 60 * time.Millisecond},
+			{data: []byte(f2 + "\n"), delay: 10 * time.Millisecond},
+		})
+		_, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{NoFrameTimeout: 35 * time.Millisecond}, nil)
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != 502 || ue.Code != "incomplete_upstream_response" {
+			t.Fatalf("expected 502 incomplete_upstream_response on mid-stream keepalive hang, got %+v (%v)", ue, err)
+		}
+	})
 }
 
 func TestT2_2_6_KeepaliveOnlyExceedingNoFrameTimeoutReturns504(t *testing.T) {
@@ -2098,8 +2118,16 @@ func TestT1_3_3_Fallback658WhenPrimaryInCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call 2: %v", err)
 	}
-	if !seen658.Load() || !strings.Contains(res2.CookieHeader, "SIDCC=sidcc_658") {
-		t.Fatalf("expected cooldown fallback 658 to rotate SIDCC, got seen658=%v res2=%+v", seen658.Load(), res2)
+	if seen658.Load() || res2.Rotated || res2.Status != 0 {
+		t.Fatalf("expected cooldown early return without 658 fallback, got seen658=%v res2=%+v", seen658.Load(), res2)
+	}
+	rot.Forget("a1")
+	res3, err := rot.RotateAccount(context.Background(), "a1", "", sc)
+	if err != nil {
+		t.Fatalf("call 3 fallback: %v", err)
+	}
+	if !seen658.Load() || !strings.Contains(res3.CookieHeader, "SIDCC=sidcc_658") {
+		t.Fatalf("expected 658 fallback after Forget with empty primary subset, got seen658=%v res3=%+v", seen658.Load(), res3)
 	}
 }
 

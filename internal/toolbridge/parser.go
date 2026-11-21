@@ -12,7 +12,7 @@ var (
 	fencedBlockRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*([\\s\\S]*?)```|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*([\\s\\S]*?)</(?:tool_call|tool_calls|function_call|function_calls)>)")
 	standaloneAfterRe               = regexp.MustCompile("(?is)^[}\\]\\s]*(?:(?:</(?:tool_call|tool_calls|function_call|function_calls)>|```)[}\\]\\s]*)?$")
 	standaloneBeforeRe              = regexp.MustCompile("(?is)(?:^|\\n)\\s*(?:<(?:tool_call|tool_calls|function_call|function_calls)>|```(?:json|tool_call|tool_calls|function_call|function_calls)?)\\s*$")
-	exampleIntroRe                  = regexp.MustCompile(`(?is)(?:\bdo\s+not\s+execute\b|\bdon't\s+execute\b|\bfor\s+example\b|\be\.g\.\b|\bexample\s*(?:json|call|payload|envelope|output|response|format)?\s*:\s*|\bformat\s+is\s*:\s*)\s*$`)
+	exampleIntroRe                  = regexp.MustCompile(`(?is)(?:\b(?:do\s+not|don't)\s+execute\b\s*:?|\bfor\s+example\b(?:[^.:\n]{0,80}:)?|\be\.g\.\s*(?:,|[^.:\n]{0,60}:)?|\b(?:example|sample)\s*(?:json|call|payload|envelope|output|response|format|tool\s*call)?\s*:|\bformat\s+is\s*:)\s*$`)
 	truncatedEnvRe                  = regexp.MustCompile("(?is)(?:(?:^|[\\r\\n]\\s*|```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*)\\{\\s*\"\\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\\s*\"\\s*:|(?:```(?:json|tool_call|tool_calls|function_call|function_calls)|<(?:tool_call|tool_calls|function_call|function_calls)>)\\s*\\{\\s*\"\\s*(?:name|tool|tool_name)\\s*\"\\s*:)")
 	gapFenceRe                      = regexp.MustCompile("(?is)^(?:\\s|```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)*$")
 	trailingTagRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)\\s*$")
@@ -575,17 +575,29 @@ func repairSanitizedHTMLInJSON(s string) string {
 }
 
 func isStandaloneSpan(text string, start, end int) bool {
+	if start < 0 || end > len(text) || start > end {
+		return false
+	}
+	spanText := text[start:end]
+	isMultiLineSpan := strings.IndexByte(spanText, '\n') >= 0
 	before := text[:start]
 	after := text[end:]
 
 	if exampleIntroRe.MatchString(before) {
 		return false
 	}
+	if stripped := trailingTagRe.ReplaceAllString(before, ""); stripped != before && exampleIntroRe.MatchString(stripped) {
+		return false
+	}
 
 	lineStart := strings.LastIndexByte(before, '\n') + 1
 	beforeOnLine := strings.TrimSpace(before[lineStart:])
 	if beforeOnLine != "" && !standaloneBeforeRe.MatchString(before) {
-		return false
+		// Allow a multi-line fenced block glued immediately to the end of an earlier
+		// sentence or closing fence (e.g. "... ONLY the ```json ... ``` block.```json\n{...}\n```").
+		if !(isMultiLineSpan && strings.HasPrefix(spanText, "```") && strings.HasSuffix(beforeOnLine, ".")) {
+			return false
+		}
 	}
 
 	afterOnLine := after
@@ -594,11 +606,16 @@ func isStandaloneSpan(text string, start, end int) bool {
 	}
 	afterOnLine = strings.TrimSpace(afterOnLine)
 	if afterOnLine != "" && !standaloneAfterRe.MatchString(afterOnLine) {
-		return false
+		// When the model emits a dedicated multi-line tool_calls block and then
+		// glues trailing chatter onto the closing fence line (e.g. "```Groq\nReviewer: ..."),
+		// the multi-line block is still a real tool call rather than an inline prose mention.
+		if !isMultiLineSpan {
+			return false
+		}
 	}
 
 	afterTrimmed := strings.TrimSpace(after)
-	if afterTrimmed == "" || standaloneAfterRe.MatchString(afterTrimmed) {
+	if afterTrimmed == "" || standaloneAfterRe.MatchString(afterTrimmed) || isMultiLineSpan {
 		return true
 	}
 	return strings.HasPrefix(after, "\n") || strings.HasPrefix(after, "\r\n")
@@ -672,8 +689,10 @@ func callCandidates(text string) []candidateSpan {
 	}
 
 	out = append(out, candidateSpan{raw: trimmed, start: 0, end: len(trimmed), whole: true, fenced: false})
+	var ignoredFencedSpans [][2]int
 	for _, loc := range fencedBlockRe.FindAllStringSubmatchIndex(trimmed, -1) {
 		if exampleIntroRe.MatchString(trimmed[:loc[0]]) {
+			ignoredFencedSpans = append(ignoredFencedSpans, [2]int{loc[0], loc[1]})
 			continue
 		}
 		// A fenced envelope is a tool call only when the fence sits on its own
@@ -681,6 +700,7 @@ func callCandidates(text string) []candidateSpan {
 		// bullet/paragraph (e.g. "… blok ```json {"tool_calls":[…]} ``` di dalam
 		// penjelasan") is a prose mention, not a call.
 		if !isStandaloneSpan(trimmed, loc[0], loc[1]) {
+			ignoredFencedSpans = append(ignoredFencedSpans, [2]int{loc[0], loc[1]})
 			continue
 		}
 		subStart, subEnd := -1, -1
@@ -697,6 +717,16 @@ func callCandidates(text string) []candidateSpan {
 		}
 	}
 	for _, sp := range findBalancedObjects(trimmed) {
+		insideIgnored := false
+		for _, ig := range ignoredFencedSpans {
+			if sp[0] >= ig[0] && sp[1] <= ig[1] {
+				insideIgnored = true
+				break
+			}
+		}
+		if insideIgnored {
+			continue
+		}
 		out = append(out, candidateSpan{
 			raw:    trimmed[sp[0]:sp[1]],
 			start:  sp[0],
@@ -1095,6 +1125,18 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 }
 
 // ParseToolReply extracts and validates tool calls from a model reply.
+func callSlicesEqual(a, b []Call) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || !callArgsEqual(a[i].Arguments, b[i].Arguments) {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseToolReply(reply string, tools any) (*ParseResult, error) {
 	trimmed := strings.TrimSpace(reply)
 	var allow map[string]map[string]any
@@ -1220,7 +1262,9 @@ func ParseToolReply(reply string, tools any) (*ParseResult, error) {
 				return nil, extraErr
 			}
 			if len(extra) > 0 {
-				calls = append(calls, extra...)
+				if !callSlicesEqual(calls, extra) {
+					calls = append(calls, extra...)
+				}
 				prevEnd = next.span.end
 			}
 		}

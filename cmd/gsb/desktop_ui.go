@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,8 +44,7 @@ func runDesktopUI() error {
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "unix", socket)
 		},
-		ResponseHeaderTimeout: 75 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
+		IdleConnTimeout: 30 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
 	ln, err := net.Listen("tcp4", desktopUIAddr)
@@ -56,7 +56,6 @@ func runDesktopUI() error {
 			return cookies.RunIsolatedBrowserLogin(ctx, "")
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      loginHelperDeadline + 85*time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
@@ -114,13 +113,20 @@ func newDesktopUIHandler(authority string, target url.URL, transport http.RoundT
 			desktopError(w, http.StatusForbidden, "Open the GSB UI at its local address.")
 			return
 		}
-		if r.Method != http.MethodPost || r.URL.Path != desktopLoginPath || r.URL.RawQuery != "" || r.URL.ForceQuery {
-			proxy.ServeHTTP(w, r)
+		origins := r.Header.Values("Origin")
+		if len(origins) > 1 || len(origins) == 1 && origins[0] != "http://"+authority {
+			desktopError(w, http.StatusForbidden, "Open the GSB UI at its local address.")
 			return
 		}
-		origins := r.Header.Values("Origin")
-		if len(origins) > 1 || len(origins) == 1 && origins[0] != "http://"+authority || r.Header.Get("Sec-Fetch-Site") == "cross-site" || r.Header.Get("Sec-Fetch-Site") == "same-site" {
-			desktopError(w, http.StatusForbidden, "Open the GSB UI at its local address.")
+		for _, site := range r.Header.Values("Sec-Fetch-Site") {
+			s := strings.ToLower(strings.TrimSpace(site))
+			if s == "cross-site" || s == "same-site" {
+				desktopError(w, http.StatusForbidden, "Open the GSB UI at its local address.")
+				return
+			}
+		}
+		if r.Method != http.MethodPost || r.URL.Path != desktopLoginPath || r.URL.RawQuery != "" || r.URL.ForceQuery {
+			proxy.ServeHTTP(w, r)
 			return
 		}
 		contentType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -185,7 +191,19 @@ func newDesktopUIHandler(authority string, target url.URL, transport http.RoundT
 }
 
 func copyDesktopHeaders(dst, src http.Header) {
-	for _, name := range []string{"Authorization", "X-GSB-Admin-Key", "Content-Type"} {
+	for _, name := range []string{
+		"Authorization",
+		"X-GSB-Admin-Key",
+		"X-Api-Key",
+		"X-Goog-Api-Key",
+		"Content-Type",
+		"Accept",
+		"If-None-Match",
+		"Mcp-Session-Id",
+		"MCP-Protocol-Version",
+		"Origin",
+		"Sec-Fetch-Site",
+	} {
 		if value := src.Get(name); value != "" {
 			dst.Set(name, value)
 		}

@@ -170,8 +170,9 @@ func TestExtractIsolatedCookies_DomainScoringAndGoogleDomainFilter(t *testing.T)
 		t.Fatalf("expected tracking junk dropped, got %q", parsed["_gcl_au"])
 	}
 
-	// Adding rotation cookies flips rotReady=true.
+	// Adding rotation cookies (including OSID on gemini.google.com) flips rotReady=true.
 	raw = append(raw,
+		domainCookie{Name: "OSID", Value: "osid_1", Domain: "gemini.google.com"},
 		domainCookie{Name: "SIDCC", Value: "sidcc_1", Domain: ".google.com"},
 		domainCookie{Name: "__Secure-1PSIDCC", Value: "psidcc_1", Domain: ".google.com"},
 		domainCookie{Name: "__Secure-3PSIDTS", Value: "3psidts_1", Domain: ".google.com"},
@@ -179,5 +180,17 @@ func TestExtractIsolatedCookies_DomainScoringAndGoogleDomainFilter(t *testing.T)
 	_, baseReady, rotReady = extractIsolatedCookies(raw)
 	if !baseReady || !rotReady {
 		t.Fatalf("expected baseReady=true rotReady=true once rotation cookies settle, got base=%v rot=%v", baseReady, rotReady)
+	}
+}
+
+func TestExtractIsolatedCookies_RequiresSAPISID(t *testing.T) {
+	raw := []domainCookie{
+		{Name: "__Secure-3PAPISID", Value: "3p_only", Domain: ".google.com"},
+		{Name: "__Secure-1PSID", Value: "psid", Domain: ".google.com"},
+		{Name: "__Secure-1PSIDTS", Value: "ts", Domain: ".google.com"},
+	}
+	hdr, baseReady, _ := extractIsolatedCookies(raw)
+	if baseReady || hdr != "" {
+		t.Fatalf("expected baseReady=false when SAPISID is missing, got baseReady=%v hdr=%q", baseReady, hdr)
 	}
 }

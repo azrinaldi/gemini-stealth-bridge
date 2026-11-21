@@ -289,6 +289,27 @@ func main() {
 	srv.Pool.Reset()
 }
 
+func stageAndPersistAccountImport(
+	cfg config.Config,
+	acctName, hdr, cookieDB, profileHint string,
+	bootstrapFn func(context.Context, *gemini.AccountClient) error,
+) (string, *gemini.AccountClient, error) {
+	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
+	srv := server.New(cfg)
+	ac := gemini.NewAccountClient(acctName, hdr, "", srv.Pool, srv.Rotator)
+	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
+		ac.SetAuthUser(prev.AuthUser)
+	}
+	ac.SetProvenance(cookieDB, profileHint)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := bootstrapFn(ctx, ac); err != nil {
+		return outPath, nil, fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	}
+	ac.SaveToFile(outPath)
+	return outPath, ac, nil
+}
+
 func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	if !reSafeAccountName.MatchString(acctName) {
 		return fmt.Errorf("invalid account name %q (use 1-64 chars of A-Z a-z 0-9 . _ -)", acctName)
@@ -325,30 +346,26 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	if isChromiumFamilyDB(dbPath) {
 		fmt.Println("Note: Chromium-family profiles may use Device Bound Session Credentials (DBSC), which keeps imported cookies valid for only a few hours and blocks renewal. gsb --login uses a disposable profile and avoids this; a Firefox profile is the other safe source.")
 	}
-	hdr, err := cookies.ReadChromeCookies(dbPath)
+	readRes, err := cookies.ReadBrowserCookies(dbPath)
+	if err != nil {
+		return err
+	}
+	hdr, err := cookies.ValidateChromeReadResult(dbPath, readRes)
 	if err != nil {
 		return err
 	}
 	if cookies.ExtractSAPISID(hdr) == "" {
 		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first (e.g. `gsb --login %s`), then try again", dbPath, acctName)
 	}
-	if res, resErr := cookies.ReadBrowserCookies(dbPath); resErr == nil {
-		if hint := cookies.SessionCookieHint(res, 7*24*time.Hour); hint != "" {
-			fmt.Printf("Warning: %s in this browser profile. A profile that is not signed in to Gemini Web produces cookies that expire almost immediately.\n", hint)
-			fmt.Printf("         Prefer `gsb --login %s` so you sign in first and the session is captured afterwards.\n", acctName)
-		}
+	if hint := cookies.SessionCookieHint(readRes, 7*24*time.Hour); hint != "" {
+		fmt.Printf("Warning: %s in this browser profile. A profile that is not signed in to Gemini Web produces cookies that expire almost immediately.\n", hint)
+		fmt.Printf("         Prefer `gsb --login %s` so you sign in first and the session is captured afterwards.\n", acctName)
 	}
-	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
-	srv := server.New(cfg)
-	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
-		ac.SetAuthUser(prev.AuthUser)
-	}
-	ac.SetProvenance(dbPath, explicitDB)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	if err := ac.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	outPath, ac, err := stageAndPersistAccountImport(cfg, acctName, hdr, dbPath, explicitDB, func(ctx context.Context, ac *gemini.AccountClient) error {
+		return ac.Bootstrap(ctx)
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)
 	printStandaloneConnectionInfo(cfg, acctName)
@@ -380,17 +397,11 @@ func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error
 	if cookies.ExtractSAPISID(hdr) == "" {
 		return fmt.Errorf("cookie payload does not contain SAPISID")
 	}
-	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
-	srv := server.New(cfg)
-	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
-		ac.SetAuthUser(prev.AuthUser)
-	}
-	ac.SetProvenance(filePath, "cookie-export")
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	if err := ac.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	outPath, ac, err := stageAndPersistAccountImport(cfg, acctName, hdr, filePath, "cookie-export", func(ctx context.Context, ac *gemini.AccountClient) error {
+		return ac.Bootstrap(ctx)
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)
 	printStandaloneConnectionInfo(cfg, acctName)
@@ -501,6 +512,7 @@ func displayHelperToken(token string) error {
 }
 
 func loginHelperHandler(token string, login func(context.Context) (*cookies.IsolatedLoginResult, error)) http.Handler {
+	loginMu := make(chan struct{}, 1)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
@@ -538,6 +550,17 @@ func loginHelperHandler(token string, login func(context.Context) (*cookies.Isol
 		tokens := r.Header.Values(loginHelperHeader)
 		if len(tokens) != 1 || subtle.ConstantTimeCompare([]byte(tokens[0]), []byte(token)) != 1 {
 			http.Error(w, "helper authentication required", http.StatusUnauthorized)
+			return
+		}
+		select {
+		case loginMu <- struct{}{}:
+			defer func() { <-loginMu }()
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "A sign-in window is already open."},
+			})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -686,6 +709,85 @@ func runUnquarantine(cfg config.Config, acctID string) error {
 	return nil
 }
 
+func offlineFallbackModels() []gemini.ModelInfo {
+	// Offline fallback: the live registry is unreachable, so these are the
+	// tiers the web client advertised on 2026-11-13 with the attributes the
+	// otAQ7b registry reported for them. ThinkingLevels is set explicitly so
+	// the payload does not fall back to the name heuristic, which marks
+	// Flash-Lite as non-reasoning while the registry gives it all three levels.
+	levels := []string{"low", "medium", "high"}
+	return []gemini.ModelInfo{
+		{
+			ModelID:             "fbb127bbb056c959",
+			ModelName:           "gemini-4-hydrogen",
+			DisplayName:         "Everyday help",
+			Aliases:             []string{"gemini-everyday-help"},
+			Description:         "4 Hydrogen",
+			Capacity:            2,
+			ModelNumber:         1,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "5bf011840784117a",
+			ModelName:           "gemini-4-hydrogen-thinking",
+			DisplayName:         "Solves complex problems",
+			Aliases:             []string{"gemini-hydrogen-thinking", "gemini-solves-complex-problems"},
+			Description:         "4 Hydrogen Thinking",
+			Capacity:            2,
+			ModelNumber:         5,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "9d8ca3786ebdfbea",
+			ModelName:           "gemini-3.1-pro",
+			DisplayName:         "Detailed research",
+			Aliases:             []string{"gemini-pro", "gemini-detailed-research"},
+			Description:         "3.1 Pro",
+			Capacity:            2,
+			ModelNumber:         3,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "8c46e95b1a07cecc",
+			ModelName:           "gemini-3.5-flash-lite",
+			DisplayName:         "Quick answers",
+			Aliases:             []string{"gemini-flash-lite", "gemini-quick-answers"},
+			Description:         "3.5 Flash-Lite",
+			Capacity:            2,
+			ModelNumber:         6,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			// Router tier: the backend picks a model per request, so its
+			// thinking policy belongs to whichever model it selects.
+			ModelID:             "cf41b0e0dd7d53e5",
+			ModelName:           "gemini-auto",
+			DisplayName:         "Auto",
+			Aliases:             []string{"gemini-adapts-to-your-needs"},
+			Description:         "Adapts to your needs",
+			Capacity:            1,
+			ModelNumber:         2,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "95a4c0abcba24364",
+			ModelName:           "gemini-4-carbon",
+			DisplayName:         "Most complex work",
+			Aliases:             []string{"gemini-carbon", "gemini-most-complex-work"},
+			Description:         "4 Carbon",
+			Capacity:            2,
+			ModelNumber:         8,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+	}
+}
+
 func runModelsJSON(cfg config.Config) {
 	srv := server.New(cfg)
 	_ = srv.LoadCredentials()
@@ -696,82 +798,7 @@ func runModelsJSON(cfg config.Config) {
 		}
 	}
 	if len(models) == 0 {
-		// Offline fallback: the live registry is unreachable, so these are the
-		// tiers the web client advertised on 2026-11-13 with the attributes the
-		// otAQ7b registry reported for them. ThinkingLevels is set explicitly so
-		// the payload does not fall back to the name heuristic, which marks
-		// Flash-Lite as non-reasoning while the registry gives it all three levels.
-		levels := []string{"low", "medium", "high"}
-		models = []gemini.ModelInfo{
-			{
-				ModelID:             "fbb127bbb056c959",
-				ModelName:           "gemini-4-hydrogen",
-				DisplayName:         "Everyday help",
-				Aliases:             []string{"gemini-everyday-help"},
-				Description:         "4 Hydrogen",
-				Capacity:            2,
-				ModelNumber:         1,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "5bf011840784117a",
-				ModelName:           "gemini-hydrogen-thinking",
-				DisplayName:         "Solves complex problems",
-				Aliases:             []string{"gemini-solves-complex-problems"},
-				Description:         "4 Hydrogen Thinking",
-				Capacity:            2,
-				ModelNumber:         5,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "9d8ca3786ebdfbea",
-				ModelName:           "gemini-pro",
-				DisplayName:         "Detailed research",
-				Aliases:             []string{"gemini-detailed-research"},
-				Description:         "3.1 Pro",
-				Capacity:            2,
-				ModelNumber:         3,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "8c46e95b1a07cecc",
-				ModelName:           "gemini-flash-lite",
-				DisplayName:         "Quick answers",
-				Aliases:             []string{"gemini-quick-answers"},
-				Description:         "3.5 Flash-Lite",
-				Capacity:            2,
-				ModelNumber:         6,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				// Router tier: the backend picks a model per request, so its
-				// thinking policy belongs to whichever model it selects.
-				ModelID:             "cf41b0e0dd7d53e5",
-				ModelName:           "gemini-auto",
-				DisplayName:         "Auto",
-				Aliases:             []string{"gemini-adapts-to-your-needs"},
-				Description:         "Adapts to your needs",
-				Capacity:            1,
-				ModelNumber:         2,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "95a4c0abcba24364",
-				ModelName:           "gemini-carbon",
-				DisplayName:         "Most complex work",
-				Aliases:             []string{"gemini-4-carbon"},
-				Description:         "4 Carbon",
-				Capacity:            2,
-				ModelNumber:         8,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-		}
+		models = offlineFallbackModels()
 	}
 	payload := srv.BuildModelsPayload(models)
 	b, _ := json.MarshalIndent(payload, "", "  ")

@@ -101,6 +101,13 @@ func canStreamVerified(eagerStream, rejectDowngrade, identityConflict bool, mode
 	return eagerStream || !rejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(model, servedID, servedLabel))
 }
 
+func canStreamVerifiedWithConfig(cfg config.Config, eagerStream, identityConflict bool, model gemini.ModelInfo, servedID, servedLabel string) bool {
+	if cfg.RejectLabelMismatch && (servedID == "" || gemini.ServedLabelMismatch(model, servedID, servedLabel)) {
+		return false
+	}
+	return canStreamVerified(eagerStream, cfg.RejectDowngrade, identityConflict, model, servedID, servedLabel)
+}
+
 // shouldAbortForModelRejection reports whether the served identity must end the
 // stream immediately, before any of that answer reaches the client.
 //
@@ -158,6 +165,7 @@ type Server struct {
 	adminAuthMu    sync.Mutex
 	adminAuthFails map[string][]time.Time
 	adminImportMu  sync.Mutex
+	browserLoginInFlight atomic.Bool
 
 	mediaMu    sync.RWMutex
 	mediaItems map[string]*mediaEntry
@@ -550,15 +558,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.mu.RLock()
 			mFresh := !a.ModelsAt.IsZero() && now.Sub(a.ModelsAt) < 2*refInterval
 			qFresh := !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < 30*time.Minute
-			authOK := a.ModelsError == nil && !a.Quarantined
+			authOK := a.ModelsError == nil && !a.Quarantined && !looksLikeAuthFailure(a.LastError) && !looksLikeAccountBan(a.LastError)
+			disabled := a.Disabled
 			hasModels := len(a.Models) > 0
-			qState := a.Quarantined
+			qState := a.Quarantined || looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError)
 			id := a.ID
 			a.mu.RUnlock()
 			if qState {
 				quarantinedCount++
 			}
-			if authOK && hasModels {
+			if authOK && !disabled && hasModels {
 				healthyCount++
 			}
 			acctReports = append(acctReports, map[string]any{
@@ -1114,12 +1123,19 @@ func (s *Server) ScheduleAccountTimers(now time.Time) {
 func (s *Server) decollideRotationTimers() {
 	accts := s.Accounts()
 	for i := range accts {
+		accts[i].mu.RLock()
+		ti := accts[i].NextRotateAt
+		accts[i].mu.RUnlock()
+		if ti.IsZero() {
+			continue
+		}
 		for j := i + 1; j < len(accts); j++ {
-			accts[i].mu.RLock()
-			ti := accts[i].NextRotateAt
-			accts[i].mu.RUnlock()
 			accts[j].mu.Lock()
 			tj := accts[j].NextRotateAt
+			if tj.IsZero() {
+				accts[j].mu.Unlock()
+				continue
+			}
 			diff := tj.Sub(ti)
 			if diff < 0 {
 				diff = -diff
@@ -1184,13 +1200,28 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 		// Runtime failure records created by older processes or imported state may
 		// not carry a refresh deadline. Give them the same short recovery probe as
 		// newly recorded failures instead of leaving degraded status sticky.
-		if failing && nextRef.IsZero() {
-			nextRef = now.Add(jitterDuration(5*time.Second, 30*time.Second))
+		if nextRef.IsZero() {
+			if failing {
+				nextRef = now.Add(jitterDuration(5*time.Second, 30*time.Second))
+			} else {
+				_, nextRef = s.nextRefreshAt(now, a)
+			}
 			a.mu.Lock()
 			if a.NextModelRefAt.IsZero() {
 				a.NextModelRefAt = nextRef
 			} else {
 				nextRef = a.NextModelRefAt
+			}
+			a.mu.Unlock()
+		}
+		if cfg.RotateCookiesEvery > 0 && nextRot.IsZero() {
+			baseRotate := cookies.ClampRotateInterval(0, cfg.RotateCookiesEvery)
+			nextRot = now.Add(jitterDuration(baseRotate/10, baseRotate/2))
+			a.mu.Lock()
+			if a.NextRotateAt.IsZero() {
+				a.NextRotateAt = nextRot
+			} else {
+				nextRot = a.NextRotateAt
 			}
 			a.mu.Unlock()
 		}
@@ -1215,7 +1246,7 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 				}
 				nextTime := now.Add(base + randDuration(base/3))
 				a.mu.Lock()
-				if res != nil && res.Rotated {
+				if res != nil && res.Status == 200 && res.Rotated {
 					a.RotatedAt = now
 					// A rotation that produced fresh cookies proves the session is
 					// still renewable, so an expiry verdict recorded earlier is stale.
@@ -1224,7 +1255,7 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 						a.LastFail = time.Time{}
 						a.Fails = 0
 					}
-					if a.ModelsError != nil && looksLikeAuthFailure(a.ModelsError.Error()) {
+					if a.ModelsError != nil && isModelsAuthError(a.ModelsError) {
 						a.ModelsError = nil
 					}
 				}

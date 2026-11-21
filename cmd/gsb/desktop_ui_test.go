@@ -155,3 +155,76 @@ func TestDesktopUIRejectsRemoteHTML(t *testing.T) {
 		t.Fatalf("unexpected desktop response: %d %s", w.Code, w.Body.String())
 	}
 }
+
+func TestDesktopUICSRFBlocksAllRoutesAndForwardsAPIHeaders(t *testing.T) {
+	var seenHeaders http.Header
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer remote.Close()
+	target, err := url.Parse(remote.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newDesktopUIHandler(desktopUIAddr, *target, remote.Client().Transport, nil)
+
+	for _, tc := range []struct {
+		name         string
+		method, path string
+		origin       string
+		secFetchSite string
+		wantStatus   int
+	}{
+		{"cross-origin GET admin", http.MethodGet, desktopConfigPath, "http://evil.example", "", http.StatusForbidden},
+		{"cross-origin POST chat", http.MethodPost, "/v1/chat/completions", "http://evil.example", "", http.StatusForbidden},
+		{"cross-origin POST login with query bypass attempt", http.MethodPost, desktopLoginPath + "?x=1", "http://evil.example", "", http.StatusForbidden},
+		{"sec-fetch-site cross-site", http.MethodGet, desktopConfigPath, "", "cross-site", http.StatusForbidden},
+		{"sec-fetch-site same-site", http.MethodGet, desktopConfigPath, "", "same-site", http.StatusForbidden},
+		{"same-origin allowed", http.MethodGet, desktopConfigPath, "http://" + desktopUIAddr, "same-origin", http.StatusOK},
+		{"non-browser api client allowed", http.MethodPost, "/mcp", "", "", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seenHeaders = nil
+			r := httptest.NewRequest(tc.method, tc.path, nil)
+			r.Host = desktopUIAddr
+			r.RemoteAddr = "127.0.0.1:45000"
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if tc.secFetchSite != "" {
+				r.Header.Set("Sec-Fetch-Site", tc.secFetchSite)
+			}
+			r.Header.Set("X-Api-Key", "k1")
+			r.Header.Set("X-Goog-Api-Key", "gk1")
+			r.Header.Set("Accept", "text/event-stream")
+			r.Header.Set("If-None-Match", `"etag1"`)
+			r.Header.Set("Mcp-Session-Id", "mcp-123")
+			r.Header.Set("MCP-Protocol-Version", "2025-03-26")
+
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("got status %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusForbidden && seenHeaders != nil {
+				t.Fatal("cross-site request reached upstream proxy")
+			}
+			if tc.wantStatus == http.StatusOK {
+				for k, want := range map[string]string{
+					"X-Api-Key":            "k1",
+					"X-Goog-Api-Key":       "gk1",
+					"Accept":               "text/event-stream",
+					"If-None-Match":        `"etag1"`,
+					"Mcp-Session-Id":       "mcp-123",
+					"MCP-Protocol-Version": "2025-03-26",
+				} {
+					if got := seenHeaders.Get(k); got != want {
+						t.Errorf("forwarded header %s = %q, want %q", k, got, want)
+					}
+				}
+			}
+		})
+	}
+}

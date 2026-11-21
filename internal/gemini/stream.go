@@ -443,10 +443,14 @@ func (ac *AccountClient) streamGenerateLocked(
 		videoToolActive  bool
 		frameCount       int
 		lastActivity     string
+		lastText         string
+		lastThoughts     string
+		lastMediaCount   int
 		sawCandidate     bool
 		sawDone          bool
 		sawContextToken  bool
 		sawStreamEnd     bool
+		stoppedEarly     bool
 		grounding        []GroundingSource
 	)
 
@@ -494,12 +498,28 @@ func (ac *AccountClient) streamGenerateLocked(
 			}
 			parsed.AsyncVideoCID = asyncVideoCID
 		}
+		progress := false
 		for _, f := range parsed.Frames {
 			if f.Done {
 				sawDone = true
 			}
-			if f.Done || strings.TrimSpace(f.Text) != "" || strings.TrimSpace(f.Thoughts) != "" || len(f.GeneratedImages) > 0 || len(f.GeneratedVideos) > 0 {
+			trimText := strings.TrimSpace(f.Text)
+			trimThoughts := strings.TrimSpace(f.Thoughts)
+			mediaCount := len(f.GeneratedImages) + len(f.GeneratedVideos)
+			if f.Done || trimText != "" || trimThoughts != "" || mediaCount > 0 {
 				sawCandidate = true
+			}
+			if trimText != "" && trimText != lastText {
+				lastText = trimText
+				progress = true
+			}
+			if trimThoughts != "" && trimThoughts != lastThoughts {
+				lastThoughts = trimThoughts
+				progress = true
+			}
+			if mediaCount > lastMediaCount {
+				lastMediaCount = mediaCount
+				progress = true
 			}
 		}
 		if sawDone && parsed.ContextToken != "" {
@@ -508,8 +528,10 @@ func (ac *AccountClient) streamGenerateLocked(
 		if parsed.StreamEnd {
 			sawStreamEnd = true
 		}
-		if sawCandidate {
+		if sawDone || sawStreamEnd {
 			frameWatch.Disarm()
+		} else if progress {
+			frameWatch.Reset(firstFrameTimeout)
 		} else if activity := strings.TrimSpace(parsed.Activity); activity != "" && activity != lastActivity {
 			lastActivity = activity
 			frameWatch.Reset(firstFrameTimeout)
@@ -552,9 +574,13 @@ func (ac *AccountClient) streamGenerateLocked(
 			}
 			for _, env := range envelopes {
 				if err := emitLine(env); err != nil {
+					if errors.Is(err, transport.ErrStopStreaming) {
+						stoppedEarly = true
+					}
 					return err
 				}
 				if sawStreamEnd || (sawDone && sawContextToken) {
+					stoppedEarly = true
 					return transport.ErrStopStreaming
 				}
 			}
@@ -597,15 +623,17 @@ func (ac *AccountClient) streamGenerateLocked(
 	}
 
 	if res.Status == 200 {
-		if tail := strings.TrimSpace(lineBuf.String()); tail != "" {
-			envelopes, _, _ := extractStreamEnvelopes(tail, inOuterArray, true)
-			for _, env := range envelopes {
-				if err := emitLine(env); err != nil {
-					var ue *transport.UpstreamError
-					if errors.As(err, &ue) && ue.Headers == nil {
-						ue.Headers = res.Headers
+		if !stoppedEarly {
+			if tail := strings.TrimSpace(lineBuf.String()); tail != "" {
+				envelopes, _, _ := extractStreamEnvelopes(tail, inOuterArray, true)
+				for _, env := range envelopes {
+					if err := emitLine(env); err != nil {
+						var ue *transport.UpstreamError
+						if errors.As(err, &ue) && ue.Headers == nil {
+							ue.Headers = res.Headers
+						}
+						return nil, err
 					}
-					return nil, err
 				}
 			}
 		}
@@ -614,6 +642,7 @@ func (ac *AccountClient) streamGenerateLocked(
 		if !sawCandidate && frameWatch.Expired() && ctx.Err() == nil {
 			return nil, noFrameStallError(firstFrameTimeout, res.Headers)
 		}
+		frameWatch.Disarm()
 		if frameCount == 0 && asyncVideoCID != "" {
 			// If the temporary flag was set (inner[45]=1), Google does not persist the
 			// conversation, so hNvQHb polling cannot see it. Re-run once with the flag
@@ -834,7 +863,10 @@ func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, pollCtx.Err()
+			if ctx.Err() != nil {
+				return nil, transport.NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
+			}
+			return nil, transport.NewUpstreamError("async video generation poll timed out", 504, "upstream_timeout", nil, pollCtx.Err())
 		case <-ticker.C:
 			ac.mu.RLock()
 			liveCookie := ac.cookieHeader

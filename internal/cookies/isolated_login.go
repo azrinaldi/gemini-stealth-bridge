@@ -196,9 +196,9 @@ func RunIsolatedBrowserLogin(ctx context.Context, browserBin string) (*IsolatedL
 	}()
 
 	const (
-		pollInterval       = 1 * time.Second
-		cookieStableWindow = 1200 * time.Millisecond
-		cookieGraceCap     = 5 * time.Second
+		pollInterval       = 900 * time.Millisecond
+		cookieStableWindow = 1800 * time.Millisecond
+		cookieGraceCap     = 12 * time.Second
 	)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -238,17 +238,6 @@ func RunIsolatedBrowserLogin(ctx context.Context, browserBin string) (*IsolatedL
 	}
 }
 
-func isGoogleCookieDomain(domain string) bool {
-	d := strings.ToLower(strings.TrimSpace(domain))
-	if d == "" {
-		return false
-	}
-	if strings.HasPrefix(d, ".") {
-		d = d[1:]
-	}
-	return d == "google.com" || (strings.HasSuffix(d, ".google.com") && !strings.HasPrefix(d, "."))
-}
-
 func extractIsolatedCookies(rawCookies []domainCookie) (cookieHeader string, baseReady, rotReady bool) {
 	filtered := make([]domainCookie, 0, len(rawCookies))
 	for _, c := range rawCookies {
@@ -258,13 +247,13 @@ func extractIsolatedCookies(rawCookies []domainCookie) (cookieHeader string, bas
 		filtered = append(filtered, c)
 	}
 	best, hdr := selectBestDomainCookieMap(filtered)
-	baseReady = (best["SAPISID"] != "" || best["__Secure-3PAPISID"] != "") &&
+	baseReady = best["SAPISID"] != "" &&
 		best["__Secure-1PSID"] != "" &&
 		best["__Secure-1PSIDTS"] != ""
 	if !baseReady {
 		return "", false, false
 	}
-	rotReady = best["SIDCC"] != "" && best["__Secure-1PSIDCC"] != "" && best["__Secure-3PSIDTS"] != ""
+	rotReady = best["OSID"] != "" && best["SIDCC"] != "" && best["__Secure-1PSIDCC"] != "" && best["__Secure-3PSIDTS"] != ""
 	return hdr, true, rotReady
 }
 
@@ -320,21 +309,23 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 	}
 
 	wsURL := ""
+	pageWSURL := ""
 	onGeminiApp := false
 	for _, t := range targets {
 		if t.Type == "page" && strings.HasPrefix(t.URL, "https://gemini.google.com/") && !strings.Contains(t.URL, "accounts.google.com") {
 			onGeminiApp = true
-			if t.WebSocketDebuggerURL != "" {
-				wsURL = t.WebSocketDebuggerURL
-				break
+			if pageWSURL == "" && t.WebSocketDebuggerURL != "" {
+				pageWSURL = t.WebSocketDebuggerURL
 			}
 		}
 	}
 	if !onGeminiApp {
 		return "", "", false, false
 	}
-	if wsURL == "" {
+	if verInfo.WebSocketDebuggerURL != "" {
 		wsURL = verInfo.WebSocketDebuggerURL
+	} else {
+		wsURL = pageWSURL
 	}
 	endpoint, err := url.Parse(wsURL)
 	if err != nil || endpoint.Scheme != "ws" || endpoint.Host != net.JoinHostPort("127.0.0.1", fmt.Sprint(port)) ||
@@ -342,7 +333,12 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 		return "", "", false, false
 	}
 
-	rawJSON, err := cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	rawJSON, err := cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Storage.getCookies"}`)
+	if err != nil && pageWSURL != "" && pageWSURL != wsURL {
+		rawJSON, err = cdpCallStdlibWS(cctx, pageWSURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	} else if err != nil {
+		rawJSON, err = cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	}
 	if err != nil {
 		return "", "", false, false
 	}

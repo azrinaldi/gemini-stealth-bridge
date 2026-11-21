@@ -406,6 +406,7 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 		resp, err = res.resp, res.err
 	case <-reqCtx.Done():
 		expiredFirstByte := fbDisarm()
+		received := false
 		if !expiredFirstByte {
 			// Our own deadlines did not expire: this is a caller cancellation or the
 			// per-request timeout. If the response was already handed back, prefer it
@@ -414,6 +415,7 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 			select {
 			case res := <-doneCh:
 				resp, err = res.resp, res.err
+				received = true
 			default:
 			}
 		}
@@ -423,13 +425,18 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 			// pool itself is left alone: a cancelled peer request must not tear down
 			// connections another request on the same account is using. Recovery uses
 			// the explicit FreshSocket flag instead.
-			go func() {
-				if res := <-doneCh; res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-			}()
+			if !received {
+				go func() {
+					if res := <-doneCh; res.resp != nil && res.resp.Body != nil {
+						_ = res.resp.Body.Close()
+					}
+				}()
+			}
 			if expiredFirstByte {
 				timedOutFirstByte.Store(true)
+			}
+			if received && err != nil {
+				return nil, sc.classifyErr(err, ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
 			}
 			return nil, sc.classifyErr(reqCtx.Err(), ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
 		}
@@ -467,27 +474,51 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 	if opts.OnHeaders != nil {
 		opts.OnHeaders(resp.StatusCode)
 	}
-	var stallTimer *time.Timer
-	armStall := func() {
-		if !streaming || stallTimeout <= 0 {
-			return
-		}
-		if stallTimer == nil {
-			stallTimer = time.AfterFunc(stallTimeout, func() {
-				stalled.Store(true)
-				cancel()
-			})
-		} else {
-			stallTimer.Reset(stallTimeout)
-		}
-	}
-	if streaming && stallTimeout > 0 {
-		armStall()
-		defer func() {
+	var (
+		stallMu      sync.Mutex
+		stallTimer   *time.Timer
+		stallEpoch   uint64
+		stallStopped bool
+		armStall     = func() {
+			if !streaming || stallTimeout <= 0 {
+				return
+			}
+			stallMu.Lock()
+			defer stallMu.Unlock()
+			if stallStopped {
+				return
+			}
+			stallEpoch++
+			epoch := stallEpoch
 			if stallTimer != nil {
 				stallTimer.Stop()
 			}
-		}()
+			stallTimer = time.AfterFunc(stallTimeout, func() {
+				stallMu.Lock()
+				if stallStopped || epoch != stallEpoch {
+					stallMu.Unlock()
+					return
+				}
+				stallStopped = true
+				stallMu.Unlock()
+				stalled.Store(true)
+				cancel()
+			})
+		}
+		stopStall = func() {
+			stallMu.Lock()
+			stallStopped = true
+			stallEpoch++
+			t := stallTimer
+			stallMu.Unlock()
+			if t != nil {
+				t.Stop()
+			}
+		}
+	)
+	if streaming && stallTimeout > 0 {
+		armStall()
+		defer stopStall()
 	}
 
 	maxBody := opts.MaxBodyBytes
@@ -523,6 +554,7 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 				}
 				if cbErr := opts.OnChunk(chunkStr); cbErr != nil {
 					if errors.Is(cbErr, ErrStopStreaming) {
+						stopStall()
 						cancel()
 						break
 					}

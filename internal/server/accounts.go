@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
@@ -140,6 +142,7 @@ func (s *Server) loadCredentialsLocked() int {
 			existingByID[a.ID] = a
 		}
 	}
+	keptPrev := make(map[*AccountState]bool, len(deduped))
 	for i, st := range deduped {
 		prev, ok := existingByID[st.ID]
 		if !ok || prev == nil {
@@ -150,6 +153,7 @@ func (s *Server) loadCredentialsLocked() int {
 			prev.mu.Unlock()
 			continue
 		}
+		keptPrev[prev] = true
 		recaptured := (!st.CapturedAt.IsZero() && st.CapturedAt.After(prev.CapturedAt)) ||
 			(prev.Quarantined && !st.Quarantined)
 		prev.FilePath = st.FilePath
@@ -211,7 +215,42 @@ func (s *Server) loadCredentialsLocked() int {
 		}
 	}
 	s.mu.Unlock()
+
+	for _, prev := range existingByID {
+		if prev == nil || keptPrev[prev] {
+			continue
+		}
+		prev.mu.Lock()
+		prev.retired = true
+		client := prev.Client
+		prevID := prev.ID
+		prev.mu.Unlock()
+		if ac, ok := client.(*gemini.AccountClient); ok {
+			_ = ac.RetireCredentialWriter(func() error { return nil })
+		}
+		if _, stillPresent := s.findAccountByIDLocked(prevID); !stillPresent {
+			if s.Pool != nil {
+				s.Pool.Remove(prevID)
+			}
+			if s.Rotator != nil {
+				s.Rotator.Forget(prevID)
+			}
+			s.evictUploadCacheForAccount(prevID)
+		}
+	}
+	s.ScheduleAccountTimers(s.now())
 	return len(deduped)
+}
+
+func (s *Server) findAccountByIDLocked(id string) (*AccountState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.accounts {
+		if a != nil && a.ID == id {
+			return a, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error) {
@@ -368,6 +407,10 @@ func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool
 		a.mu.Lock()
 		a.ModelsError = err
 		a.mu.Unlock()
+		var ue *transport.UpstreamError
+		if errors.As(err, &ue) && ue != nil && ue.Code == "account_banned" {
+			s.markAccountQuarantined(a, err.Error())
+		}
 		return a
 	}
 
@@ -1183,9 +1226,32 @@ func quotaResetHeaders(chosen []gemini.QuotaBucket, now time.Time) map[string]st
 	return out
 }
 
+type accountFailureSnapshot struct {
+	account       *AccountState
+	markedAt      time.Time
+	markedError   string
+	prevFails     int
+	prevLastFail  time.Time
+	prevLastError string
+	prevNextRefAt time.Time
+}
+
 func (s *Server) markAccountFailure(a *AccountState, msg string) {
+	s.markAccountFailureSnapshot(a, msg)
+}
+
+func (s *Server) markAccountFailureSnapshot(a *AccountState, msg string) accountFailureSnapshot {
 	now := s.now()
 	a.mu.Lock()
+	snap := accountFailureSnapshot{
+		account:       a,
+		markedAt:      now,
+		markedError:   msg,
+		prevFails:     a.Fails,
+		prevLastFail:  a.LastFail,
+		prevLastError: a.LastError,
+		prevNextRefAt: a.NextModelRefAt,
+	}
 	a.Fails++
 	a.LastFail = now
 	a.LastError = msg
@@ -1199,6 +1265,95 @@ func (s *Server) markAccountFailure(a *AccountState, msg string) {
 		a.NextModelRefAt = due
 	}
 	a.mu.Unlock()
+	return snap
+}
+
+// rollbackAccountFailure undoes a failure recorded by markAccountFailureSnapshot
+// if the account still holds that exact transient failure (neither cleared by a
+// later success nor overwritten by another failure).
+func (s *Server) rollbackAccountFailure(snap accountFailureSnapshot) {
+	if snap.account == nil {
+		return
+	}
+	a := snap.account
+	a.mu.Lock()
+	if a.Fails > 0 && a.LastFail.Equal(snap.markedAt) && a.LastError == snap.markedError {
+		a.Fails--
+		a.LastFail = snap.prevLastFail
+		a.LastError = snap.prevLastError
+		if a.Fails == 0 {
+			a.NextModelRefAt = snap.prevNextRefAt
+		}
+	}
+	a.mu.Unlock()
+}
+
+// requestStallTracker tracks per-request upstream stall penalties across
+// accounts. When a single request stalls on two distinct accounts (or stalls on
+// one account and then receives upstream_error_reply on another), the fault is
+// likely payload- or globally upstream-induced rather than a broken account, so
+// previously recorded stall penalties for this request are rolled back and
+// further stalls on this request do not penalize healthy accounts.
+type requestStallTracker struct {
+	stalledAccounts map[string]bool
+	snaps           []accountFailureSnapshot
+	poisoned        bool
+}
+
+func (t *requestStallTracker) recordError(s *Server, a *AccountState, errCode, msg string) bool {
+	if a == nil {
+		return false
+	}
+	if errCode == "upstream_error_reply" {
+		if len(t.snaps) > 0 && !t.stalledAccounts[a.ID] {
+			t.poisoned = true
+			t.rollbackAll(s)
+		}
+		return false
+	}
+	if errCode != "upstream_stalled" && errCode != "upstream_timeout" {
+		return false
+	}
+	if t.stalledAccounts == nil {
+		t.stalledAccounts = make(map[string]bool, 2)
+	}
+	t.stalledAccounts[a.ID] = true
+	if t.poisoned || len(t.stalledAccounts) >= 2 {
+		t.poisoned = true
+		t.rollbackAll(s)
+		return true
+	}
+	t.snaps = append(t.snaps, s.markAccountFailureSnapshot(a, msg))
+	return true
+}
+
+func (t *requestStallTracker) rollbackAll(s *Server) {
+	for _, snap := range t.snaps {
+		s.rollbackAccountFailure(snap)
+	}
+	t.snaps = nil
+}
+
+// noFrameTimeoutForAttempt returns the first-frame watchdog deadline for an
+// attempt. An explicit BRIDGE_NO_FRAME_TIMEOUT_MS always wins verbatim; under
+// the default 75s ceiling, low-effort calls use a shorter deadline so stalled
+// fast turns fail over sooner without clipping medium/high thinking turns.
+func noFrameTimeoutForAttempt(cfg config.Config, model gemini.ModelInfo, effort string) time.Duration {
+	if cfg.NoFrameTimeout <= 0 {
+		return 0
+	}
+	if cfg.NoFrameTimeoutExplicit || effort != "low" {
+		return cfg.NoFrameTimeout
+	}
+	name := strings.ToLower(model.ModelName + " " + model.ModelID)
+	capDur := 45 * time.Second
+	if strings.Contains(name, "hydrogen") || strings.Contains(name, "flash") || strings.Contains(name, "lite") || strings.Contains(name, "adapts") || strings.Contains(name, "auto") {
+		capDur = 30 * time.Second
+	}
+	if cfg.NoFrameTimeout > capDur {
+		return capDur
+	}
+	return cfg.NoFrameTimeout
 }
 
 // fillFirstFailCooldown temporarily demotes an account that just failed so a
@@ -1306,7 +1461,9 @@ func (s *Server) accountReady(a *AccountState, requested string) (*gemini.ModelI
 		return nil, false
 	}
 	a.mu.RLock()
-	qState := a.Quarantined || a.Disabled
+	qState := a.Quarantined || a.Disabled || a.retired ||
+		looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) ||
+		looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError)
 	a.mu.RUnlock()
 	if qState {
 		return nil, false
@@ -1458,7 +1615,10 @@ func diagnosticChatAccount(accts []*AccountState, requested string, start int) *
 			continue
 		}
 		a.mu.RLock()
-		blocked, hasModels := a.Quarantined || a.Disabled, len(a.Models) > 0
+		blocked := a.Quarantined || a.Disabled || a.retired ||
+			looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) ||
+			looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError)
+		hasModels := len(a.Models) > 0
 		a.mu.RUnlock()
 		if blocked {
 			continue
@@ -1607,8 +1767,125 @@ func (s *Server) prepareGeneration(
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
 	}
 
-	account := s.resolveChatAccount(accts, scope, requested, hasher)
+	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	candidatePool := accts
+	if scope.AccountID == "" && scope.Group != "" {
+		grouped := make([]*AccountState, 0, len(accts))
+		for _, a := range accts {
+			if a == nil {
+				continue
+			}
+			a.mu.RLock()
+			g := a.AccountGroup
+			a.mu.RUnlock()
+			if g == scope.Group {
+				grouped = append(grouped, a)
+			}
+		}
+		candidatePool = grouped
+	}
+
+	var (
+		account *AccountState
+		model   *gemini.ModelInfo
+		mid     string
+		lastErr error
+	)
+	rejected := make(map[string]bool, len(candidatePool))
+	maxTries := 1
+	if scope.AccountID == "" && len(candidatePool) > 1 {
+		maxTries = len(candidatePool)
+	}
+	for tryIdx := 0; tryIdx < maxTries; tryIdx++ {
+		var poolSlice []*AccountState
+		if len(rejected) == 0 {
+			poolSlice = accts
+		} else {
+			poolSlice = make([]*AccountState, 0, len(accts))
+			for _, a := range accts {
+				if a != nil && !rejected[a.ID] {
+					poolSlice = append(poolSlice, a)
+				}
+			}
+		}
+		cand := s.resolveChatAccount(poolSlice, scope, requested, hasher)
+		if cand == nil {
+			break
+		}
+		rejected[cand.ID] = true
+		if bErr := accountBlockedError(cand); bErr != nil {
+			lastErr = bErr
+			if scope.AccountID != "" {
+				return nil, bErr
+			}
+			continue
+		}
+		cand.mu.RLock()
+		hasModels := len(cand.Models) > 0
+		cand.mu.RUnlock()
+		if !hasModels {
+			s.RefreshAccount(ctx, cand, false)
+		}
+		cand.mu.RLock()
+		hasModels = len(cand.Models) > 0
+		mErr := cand.ModelsError
+		cand.mu.RUnlock()
+		if !hasModels && mErr != nil {
+			lastErr = mErr
+			if scope.AccountID != "" {
+				return nil, mErr
+			}
+			continue
+		}
+		m := resolveModelOnAccount(cand, requested)
+		if m == nil {
+			reqLabel := requested
+			if reqLabel == "" {
+				reqLabel = "(unspecified)"
+			}
+			notFoundErr := transport.NewUpstreamError(fmt.Sprintf("account %s cannot serve model %s", cand.ID, reqLabel), 404, "model_not_found", nil, nil)
+			if lastErr == nil {
+				lastErr = notFoundErr
+			}
+			if scope.AccountID != "" {
+				return nil, notFoundErr
+			}
+			continue
+		}
+		if qErr := s.checkPreFlightQuota(cand, *m, m.ModelName); qErr != nil {
+			lastErr = qErr
+			if scope.AccountID != "" {
+				return nil, qErr
+			}
+			continue
+		}
+		if rErr := s.checkAccountRateLimit(cand); rErr != nil {
+			lastErr = rErr
+			if scope.AccountID != "" {
+				return nil, rErr
+			}
+			continue
+		}
+		account = cand
+		model = m
+		mid = m.ModelName
+		break
+	}
+
 	if account == nil {
+		if lastErr != nil {
+			if scope.AccountID == "" {
+				var ue *transport.UpstreamError
+				if errors.As(lastErr, &ue) && ue != nil && (ue.StatusCode == 429 || ue.Code == "rate_limit_error") {
+					return nil, s.poolAvailabilityError(accts, requested, lastErr)
+				}
+			}
+			return nil, lastErr
+		}
 		disabled := false
 		for _, a := range accts {
 			if a == nil {
@@ -1633,53 +1910,6 @@ func (s *Server) prepareGeneration(
 			msg = fmt.Sprintf("group key is bound to group %q, which has no loaded account", scope.Group)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
-	}
-
-	if err := accountBlockedError(account); err != nil {
-		return nil, err
-	}
-
-	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
-	if err != nil {
-		return nil, err
-	}
-
-	account.mu.RLock()
-	hasModels := len(account.Models) > 0
-	account.mu.RUnlock()
-	if !hasModels {
-		s.RefreshAccount(ctx, account, false)
-	}
-
-	account.mu.RLock()
-	hasModels = len(account.Models) > 0
-	mErr := account.ModelsError
-	account.mu.RUnlock()
-	if !hasModels && mErr != nil {
-		return nil, mErr
-	}
-
-	model := resolveModelOnAccount(account, requested)
-	if model == nil {
-		reqLabel := requested
-		if reqLabel == "" {
-			reqLabel = "(unspecified)"
-		}
-		return nil, transport.NewUpstreamError(fmt.Sprintf("account %s cannot serve model %s", account.ID, reqLabel), 404, "model_not_found", nil, nil)
-	}
-	mid := model.ModelName
-
-	if err := s.checkPreFlightQuota(account, *model, mid); err != nil {
-		if scope.AccountID == "" {
-			return nil, s.poolAvailabilityError(accts, requested, err)
-		}
-		return nil, err
-	}
-	if err := s.checkAccountRateLimit(account); err != nil {
-		if scope.AccountID == "" {
-			return nil, s.poolAvailabilityError(accts, requested, err)
-		}
-		return nil, err
 	}
 
 	fullPrompt, overflowParts, flattenStats, err := prompt.FlattenMessagesWithStats(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
@@ -1731,7 +1961,7 @@ func (s *Server) prepareGeneration(
 		HasTools:        hasTools,
 		ProtocolMode:    cfg.ProtocolMode,
 		PersonalContext: cfg.PersonalContext,
-		NoFrameTimeout:  cfg.NoFrameTimeout,
+		NoFrameTimeout:  noFrameTimeoutForAttempt(cfg, *model, effortStr),
 	}
 
 	curPrompt := fullPrompt

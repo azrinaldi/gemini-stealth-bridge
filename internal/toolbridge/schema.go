@@ -55,6 +55,12 @@ func checkSchemaWithRoot(schema any, root map[string]any, value any, path string
 		root = sMap
 	}
 
+	if value == nil {
+		if nullable, _ := sMap["nullable"].(bool); nullable {
+			return ""
+		}
+	}
+
 	if refStr, ok := sMap["$ref"].(string); ok && strings.TrimSpace(refStr) != "" {
 		target, resolved := resolveSchemaRef(root, strings.TrimSpace(refStr))
 		if !resolved {
@@ -68,12 +74,6 @@ func checkSchemaWithRoot(schema any, root map[string]any, value any, path string
 	if notSchema, exists := sMap["not"]; exists && notSchema != nil {
 		if checkSchemaWithRoot(notSchema, root, value, path, depth+1) == "" {
 			return fmt.Sprintf("%s matches forbidden not-schema", path)
-		}
-	}
-
-	if value == nil {
-		if nullable, _ := sMap["nullable"].(bool); nullable {
-			return ""
 		}
 	}
 
@@ -125,12 +125,10 @@ func checkSchemaWithRoot(schema any, root map[string]any, value any, path string
 			return fmt.Sprintf("%s is longer than %d", path, maxLen)
 		}
 		if pat, ok := sMap["pattern"].(string); ok && pat != "" {
-			re, err := regexp.Compile(pat)
-			if err != nil {
-				return fmt.Sprintf("%s has invalid schema pattern %q", path, pat)
-			}
-			if !re.MatchString(strVal) {
-				return fmt.Sprintf("%s does not match the required pattern", path)
+			if re, err := regexp.Compile(pat); err == nil {
+				if !re.MatchString(strVal) {
+					return fmt.Sprintf("%s does not match the required pattern", path)
+				}
 			}
 		}
 	}
@@ -377,12 +375,11 @@ func extractEnumSlice(raw any) ([]any, bool) {
 }
 
 var nonFunctionalSchemaKeys = map[string]bool{
-	"$schema":              true,
-	"title":                true,
-	"additionalProperties": true,
-	"examples":             true,
-	"$id":                  true,
-	"$comment":             true,
+	"$schema":  true,
+	"title":    true,
+	"examples": true,
+	"$id":      true,
+	"$comment": true,
 }
 
 // TruncateUTF8 truncates s on a UTF-8 rune boundary to at most maxRunes runes,
@@ -406,8 +403,9 @@ func TruncateUTF8(s string, maxRunes int) string {
 }
 
 // CompactSchemaMap recursively copies a JSON Schema map while stripping
-// non-functional metadata keys ($schema, title, additionalProperties, examples, $id, $comment)
-// and truncating "description" strings to maxDescChars runes. User-controlled
+// non-functional metadata keys ($schema, title, boolean additionalProperties, examples, $id, $comment)
+// and truncating "description" strings to maxDescChars runes. Object-valued
+// additionalProperties schemas are compacted and preserved. User-controlled
 // names under properties, patternProperties, $defs, and definitions are kept
 // verbatim; literal keyword values are never interpreted as schema maps.
 func CompactSchemaMap(raw map[string]any, maxDescChars int) map[string]any {
@@ -424,6 +422,12 @@ func compactSchemaNode(raw map[string]any, maxDescChars int) map[string]any {
 	out := make(map[string]any, len(raw))
 	for k, v := range raw {
 		if nonFunctionalSchemaKeys[k] {
+			continue
+		}
+		if k == "additionalProperties" {
+			if addMap, ok := v.(map[string]any); ok && addMap != nil {
+				out[k] = copySchemaValue(addMap, maxDescChars)
+			}
 			continue
 		}
 		switch k {
@@ -609,6 +613,14 @@ func coerceValueWithRoot(schema any, root map[string]any, val any, path string, 
 						}
 						if checkSchemaWithRoot(sMap, root, arr, path, 0) == "" {
 							return arr, true
+						}
+					} else if strings.HasSuffix(trimmed, "]") {
+						var emptyArr []any
+						if err := json.Unmarshal([]byte(trimmed), &emptyArr); err == nil && emptyArr != nil && len(emptyArr) == 0 {
+							if checkSchemaWithRoot(sMap, root, emptyArr, path, 0) == "" {
+								return emptyArr, true
+							}
+							return val, false
 						}
 					}
 				}

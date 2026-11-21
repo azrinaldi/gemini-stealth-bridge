@@ -77,12 +77,14 @@ type AccountClient struct {
 	Pool     *transport.Pool
 	Rotator  *cookies.Rotator
 
-	mu               sync.RWMutex
-	bootMu           sync.Mutex
-	persistMu        sync.Mutex
-	persistRetired   atomic.Bool // set under persistMu after a successful replacement
-	cookieHeader     string
-	cookieGen        atomic.Uint64
+	mu                     sync.RWMutex
+	bootMu                 sync.Mutex
+	persistMu              sync.Mutex
+	persistRetired         atomic.Bool // set under persistMu after a successful replacement
+	cookieHeader           string
+	cookieGen              atomic.Uint64
+	reloadGen              atomic.Uint64
+	unsavedExplicitCookies bool
 	email            string
 	userTier         string
 	at               string
@@ -118,19 +120,33 @@ type AccountClient struct {
 // NewAccountClient creates an AccountClient for a specific Google account.
 func NewAccountClient(id, cookieHeader, filePath string, pool *transport.Pool, rotator *cookies.Rotator) *AccountClient {
 	ac := &AccountClient{
-		ID:           id,
-		FilePath:     filePath,
-		Pool:         pool,
-		Rotator:      rotator,
-		cookieHeader: cookieHeader,
-		pushID:       defaultPushID,
-		locale:       "en",
-		protocolMode: "bridge",
-		surfaces:     make(map[string]string),
+		ID:                     id,
+		FilePath:               filePath,
+		Pool:                   pool,
+		Rotator:                rotator,
+		cookieHeader:           cookieHeader,
+		unsavedExplicitCookies: cookieHeader != "",
+		pushID:                 defaultPushID,
+		locale:                 "en",
+		protocolMode:           "bridge",
+		surfaces:               make(map[string]string),
+	}
+	if filePath != "" {
+		if st, err := os.Stat(filePath); err == nil {
+			ac.fileMtimeMs = st.ModTime().UnixMilli()
+		}
 	}
 	ac.cookieGen.Store(cookieVersion.Add(1))
 	ac.reqCounter.Store(100000 + time.Now().UnixNano()%800000)
 	return ac
+}
+
+// SaveToFile binds the account client to path and persists its current state atomically.
+func (ac *AccountClient) SaveToFile(path string) {
+	ac.mu.Lock()
+	ac.FilePath = path
+	ac.mu.Unlock()
+	ac.persistState()
 }
 
 // LoadAccountFromFile loads an AccountClient from an account JSON file.
@@ -150,6 +166,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.fSid = rec.FSid
 	ac.authUser = rec.AuthUser
 	ac.fileMtimeMs = mtime
+	ac.unsavedExplicitCookies = false
 	ac.capturedAt = rec.CapturedAt
 	ac.rotatedAt = rec.RotatedAt
 	ac.cookieDB = rec.CookieDB
@@ -213,12 +230,8 @@ func (ac *AccountClient) SetRuntimeOptions(locale, blOverride, protocolMode, acc
 	if protocolMode != "" {
 		ac.protocolMode = protocolMode
 	}
-	if accountGroup != "" {
-		ac.accountGroup = accountGroup
-	}
-	if proxyURL != "" {
-		ac.proxyURL = proxyURL
-	}
+	ac.accountGroup = accountGroup
+	ac.proxyURL = proxyURL
 }
 
 // SetQuarantined updates the quarantine state and persists it to disk.
@@ -235,7 +248,7 @@ func (ac *AccountClient) SetQuarantined(quarantined bool, reason string) {
 		ac.surfaces["geminiWeb"] = "ok"
 	}
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
 }
 
 // SetDisabled updates the operator-disabled flag and persists it to disk.
@@ -243,7 +256,7 @@ func (ac *AccountClient) SetDisabled(disabled bool) {
 	ac.mu.Lock()
 	ac.disabled = disabled
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
 }
 
 // SetSurfaceStatus updates a surface status (e.g. "geminiWeb": "ok") and persists to disk.
@@ -254,7 +267,7 @@ func (ac *AccountClient) SetSurfaceStatus(surface, status string) {
 	}
 	ac.surfaces[surface] = status
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
 }
 
 // SetAuthUser updates the secondary Google account chooser index (/u/N/app) in memory.
@@ -277,8 +290,9 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	ac.mu.RLock()
 	path := ac.FilePath
 	lastMtime := ac.fileMtimeMs
+	unsaved := ac.unsavedExplicitCookies
 	ac.mu.RUnlock()
-	if path == "" {
+	if path == "" || unsaved {
 		return false
 	}
 	st, err := os.Stat(path)
@@ -297,7 +311,7 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 		return false
 	}
 	ac.mu.Lock()
-	if mtime <= ac.fileMtimeMs {
+	if ac.unsavedExplicitCookies || mtime <= ac.fileMtimeMs {
 		ac.mu.Unlock()
 		ac.persistMu.Unlock()
 		return false
@@ -372,6 +386,7 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	if cookiesChanged {
 		newGen = cookieVersion.Add(1)
 		ac.cookieGen.Store(newGen)
+		ac.reloadGen.Add(1)
 		ac.bootstrappedAt = time.Time{}
 		ac.modelsCache = nil
 	}
@@ -499,6 +514,10 @@ func (ac *AccountClient) RetireCredentialWriter(commit func() error) error {
 }
 
 func (ac *AccountClient) persistState() {
+	ac.persistStateWithOptions(true)
+}
+
+func (ac *AccountClient) persistStateWithOptions(bumpRotatedAt bool) {
 	ac.persistMu.Lock()
 	defer ac.persistMu.Unlock()
 	if ac.persistRetired.Load() {
@@ -515,7 +534,9 @@ func (ac *AccountClient) persistState() {
 	if ac.capturedAt == "" {
 		ac.capturedAt = nowISO
 	}
-	ac.rotatedAt = nowISO
+	if bumpRotatedAt {
+		ac.rotatedAt = nowISO
+	}
 	surfCopy := make(map[string]string, len(ac.surfaces))
 	for k, v := range ac.surfaces {
 		surfCopy[k] = v
@@ -547,6 +568,7 @@ func (ac *AccountClient) persistState() {
 	ac.mu.Unlock()
 	if mtime, err := cookies.SaveCredentialFile(path, rec); err == nil {
 		ac.mu.Lock()
+		ac.unsavedExplicitCookies = false
 		if mtime > ac.fileMtimeMs {
 			ac.fileMtimeMs = mtime
 		}
@@ -958,7 +980,7 @@ func (ac *AccountClient) rotateOnClient(ctx context.Context, sc *transport.Steal
 	}
 	ac.mu.RLock()
 	startCookie := ac.cookieHeader
-	startGen := ac.cookieGen.Load()
+	startReloadGen := ac.reloadGen.Load()
 	key := ac.sessionKeyLocked()
 	ac.mu.RUnlock()
 
@@ -966,9 +988,9 @@ func (ac *AccountClient) rotateOnClient(ctx context.Context, sc *transport.Steal
 	if err != nil {
 		return nil, err
 	}
-	if res.Rotated && res.CookieHeader != "" {
+	if res.Rotated && (len(res.SetCookies) > 0 || res.CookieHeader != "") {
 		ac.mu.Lock()
-		if ac.persistRetired.Load() || ac.cookieGen.Load() != startGen {
+		if ac.persistRetired.Load() || ac.reloadGen.Load() != startReloadGen {
 			curCookie := ac.cookieHeader
 			ac.mu.Unlock()
 			return &cookies.RotateResult{
@@ -979,16 +1001,42 @@ func (ac *AccountClient) rotateOnClient(ctx context.Context, sc *transport.Steal
 				RetryAfter:   res.RetryAfter,
 			}, nil
 		}
-		ac.cookieHeader = res.CookieHeader
+		var merged string
+		var changed bool
+		if len(res.SetCookies) > 0 {
+			merged, changed = cookies.AbsorbSetCookie(ac.cookieHeader, res.SetCookies)
+		} else if res.CookieHeader != "" && res.CookieHeader != ac.cookieHeader {
+			merged, changed = res.CookieHeader, true
+		}
+		if !changed {
+			curCookie := ac.cookieHeader
+			ac.mu.Unlock()
+			return &cookies.RotateResult{
+				Status:       res.Status,
+				Rotated:      false,
+				CookieHeader: curCookie,
+				NextInterval: res.NextInterval,
+				RetryAfter:   res.RetryAfter,
+			}, nil
+		}
+		ac.cookieHeader = merged
 		newGen := cookieVersion.Add(1)
 		ac.cookieGen.Store(newGen)
 		ac.mu.Unlock()
 		if ac.Pool != nil {
 			if s := ac.Pool.Existing(key); s != nil {
-				s.QueueCookieUpdateWithGen(res.CookieHeader, newGen)
+				s.QueueCookieUpdateWithGen(merged, newGen)
 			}
 		}
 		ac.persistState()
+		return &cookies.RotateResult{
+			Status:       res.Status,
+			Rotated:      true,
+			CookieHeader: merged,
+			SetCookies:   res.SetCookies,
+			NextInterval: res.NextInterval,
+			RetryAfter:   res.RetryAfter,
+		}, nil
 	}
 	return res, nil
 }

@@ -31,6 +31,7 @@ type Session struct {
 	mu               sync.Mutex
 	ready            bool
 	active           int
+	queued           int
 	reservedUntil    time.Time
 	lastUsed         time.Time
 	cookieHeader     string
@@ -80,10 +81,7 @@ func (s *Session) Active() int {
 func (s *Session) Queued() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active <= 1 {
-		return 0
-	}
-	return s.active - 1
+	return s.queued
 }
 
 // QueueCookieUpdate schedules a fresh cookie header to be applied before the next request.
@@ -159,11 +157,14 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 		s.execSem = make(chan struct{}, 1)
 	}
 	sem := s.execSem
-	waiting := 0
-	if s.active > 0 {
-		waiting = s.active - 1
+	acquired := false
+	select {
+	case sem <- struct{}{}:
+		acquired = true
+	default:
 	}
-	if waiting >= s.MaxQueueDepth {
+	if !acquired && s.queued >= s.MaxQueueDepth {
+		waiting := s.queued
 		s.mu.Unlock()
 		return NewUpstreamError(
 			fmt.Sprintf("session %s is busy: %d request(s) already queued", s.Name, waiting),
@@ -174,40 +175,13 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 		)
 	}
 	s.active++
+	isQueued := !acquired
+	if isQueued {
+		s.queued++
+	}
 	s.reservedUntil = time.Time{}
 	s.lastUsed = time.Now()
 	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.active--
-		s.lastUsed = time.Now()
-		s.mu.Unlock()
-	}()
-
-	// Acquire the 1-slot execution semaphore directly in select so timed-out or
-	// cancelled waiters never spawn background goroutines.
-	var waitCh <-chan time.Time
-	var timer *time.Timer
-	if s.WaitTimeout > 0 {
-		timer = time.NewTimer(s.WaitTimeout)
-		defer timer.Stop()
-		waitCh = timer.C
-	}
-
-	select {
-	case sem <- struct{}{}:
-	case <-waitCh:
-		return NewUpstreamError(
-			fmt.Sprintf("session %s is busy: timed out after %s waiting for active generation", s.Name, s.WaitTimeout),
-			429,
-			"session_busy",
-			map[string]string{"retry-after": "2"},
-			nil,
-		)
-	case <-ctx.Done():
-		return NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
-	}
 
 	var releaseOnce sync.Once
 	release := func() {
@@ -215,7 +189,53 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 			<-sem
 		})
 	}
-	defer release()
+	if acquired {
+		defer release()
+	}
+
+	defer func() {
+		s.mu.Lock()
+		s.active--
+		if isQueued {
+			s.queued--
+			isQueued = false
+		}
+		s.lastUsed = time.Now()
+		s.mu.Unlock()
+	}()
+
+	if !acquired {
+		// Acquire the 1-slot execution semaphore directly in select so timed-out or
+		// cancelled waiters never spawn background goroutines.
+		var waitCh <-chan time.Time
+		var timer *time.Timer
+		if s.WaitTimeout > 0 {
+			timer = time.NewTimer(s.WaitTimeout)
+			defer timer.Stop()
+			waitCh = timer.C
+		}
+
+		select {
+		case sem <- struct{}{}:
+			defer release()
+			s.mu.Lock()
+			if isQueued {
+				s.queued--
+				isQueued = false
+			}
+			s.mu.Unlock()
+		case <-waitCh:
+			return NewUpstreamError(
+				fmt.Sprintf("session %s is busy: timed out after %s waiting for active generation", s.Name, s.WaitTimeout),
+				429,
+				"session_busy",
+				map[string]string{"retry-after": "2"},
+				nil,
+			)
+		case <-ctx.Done():
+			return NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
+		}
+	}
 
 	if err := ctx.Err(); err != nil {
 		return NewUpstreamError("request cancelled", 499, "client_cancelled", nil, err)
@@ -522,6 +542,22 @@ func (p *Pool) ReapIdle(maxIdle time.Duration) int {
 	return len(toClose)
 }
 
+// Remove evicts and closes the session associated with key, if present.
+func (p *Pool) Remove(key string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	s, ok := p.sessions[key]
+	if ok {
+		delete(p.sessions, key)
+	}
+	p.mu.Unlock()
+	if ok && s != nil {
+		s.Close()
+	}
+}
+
 // Status returns a diagnostic snapshot of all open sessions in the pool.
 func (p *Pool) Status() []SessionStatus {
 	now := time.Now()
@@ -530,15 +566,11 @@ func (p *Pool) Status() []SessionStatus {
 	out := make([]SessionStatus, 0, len(p.sessions))
 	for k, s := range p.sessions {
 		s.mu.Lock()
-		queued := 0
-		if s.active > 1 {
-			queued = s.active - 1
-		}
 		st := SessionStatus{
 			Key:     k,
 			Ready:   s.ready,
 			Busy:    s.active > 0,
-			Queued:  queued,
+			Queued:  s.queued,
 			Active:  s.active,
 			Stale:   s.Generation != p.generation,
 			IdleSec: int64(now.Sub(s.lastUsed).Seconds()),

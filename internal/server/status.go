@@ -2,10 +2,12 @@ package server
 
 import (
 	"strconv"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 // Account status values reported by /v1/accounts and `gsb --accounts`.
@@ -75,11 +77,24 @@ func accountStatusLocked(a *AccountState, now time.Time) (status string, reason 
 		}
 		return StatusQuarantined, a.QuarantineReason
 	}
+	if looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) {
+		reason := strings.TrimSpace(a.QuarantineReason)
+		if reason == "" && a.ModelsError != nil {
+			reason = a.ModelsError.Error()
+		}
+		if reason == "" {
+			reason = truncateReason(a.LastError)
+		}
+		if reason == "" {
+			reason = "restricted upstream"
+		}
+		return StatusQuarantined, reason
+	}
 
 	// An auth failure means the saved session cannot be used at all until a new
 	// login, which is more severe than a quota problem and should not be hidden
 	// behind one.
-	if looksLikeAuthFailure(a.LastError) || (a.ModelsError != nil && looksLikeAuthFailure(a.ModelsError.Error())) {
+	if looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError) {
 		return StatusExpired, "session expired; run `gsb --login <name>`"
 	}
 
@@ -173,12 +188,40 @@ func exhaustedBucket(quota []gemini.QuotaBucket, now time.Time) (label string, r
 // looksLikeAccountBan reports whether a recorded failure was upstream restricting
 // the account itself. Such a verdict survives a healthy registry read: the account
 // can list models and still be refused for every generation.
+func isModelsBanError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil && ue.Code == "account_banned" {
+		return true
+	}
+	return looksLikeAccountBan(err.Error())
+}
+
+func isModelsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil && (ue.Code == "upstream_auth_error" || ue.Code == "auth_redirect") {
+		return true
+	}
+	return looksLikeAuthFailure(err.Error())
+}
+
 func looksLikeAccountBan(msg string) bool {
 	m := strings.ToLower(strings.TrimSpace(msg))
 	if m == "" {
 		return false
 	}
-	for _, needle := range []string{"account_banned", "tos_violation", "permission_denied", "quarantin"} {
+	for _, needle := range []string{
+		"account_banned",
+		"tos_violation",
+		"permission_denied",
+		"quarantin",
+		"upstream rejected this account (code ",
+	} {
 		if strings.Contains(m, needle) {
 			return true
 		}
@@ -196,12 +239,17 @@ func looksLikeAuthFailure(msg string) bool {
 		"auth_redirect",
 		"redirected to google sign-in",
 		"code 1016",
-		"1016",
 		"session is unauthenticated",
 		"session expired",
 		"snlm0e",
 		"sign in again",
 		"invalid api key",
+		"upstream http 401",
+		"upstream http 403",
+		"file upload failed with http 401",
+		"file upload failed with http 403",
+		"cookie rotation rejected (http 401)",
+		"cookie rotation rejected (http 403)",
 	} {
 		if strings.Contains(m, needle) {
 			return true
