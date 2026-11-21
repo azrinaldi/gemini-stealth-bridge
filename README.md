@@ -1,198 +1,99 @@
 # gemini-stealth-bridge (`gsb`)
 
 [![release](https://img.shields.io/github/v/release/azrinaldi/gemini-stealth-bridge?sort=semver)](https://github.com/azrinaldi/gemini-stealth-bridge/releases/latest)
-[![release workflow](https://github.com/azrinaldi/gemini-stealth-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/azrinaldi/gemini-stealth-bridge/actions/workflows/release.yml)
+[![release workflow](https://img.shields.io/github/actions/workflow/status/azrinaldi/gemini-stealth-bridge/release.yml)](https://github.com/azrinaldi/gemini-stealth-bridge/actions/workflows/release.yml)
 [![go](https://img.shields.io/github/go-mod/go-version/azrinaldi/gemini-stealth-bridge)](go.mod)
 [![license](https://img.shields.io/github/license/azrinaldi/gemini-stealth-bridge)](LICENSE)
 [![ghcr](https://img.shields.io/badge/ghcr.io-gemini--stealth--bridge-blue)](https://github.com/azrinaldi/gemini-stealth-bridge/pkgs/container/gemini-stealth-bridge)
 
-OpenAI-compatible proxy for [Gemini Web](https://gemini.google.com/app). Point coding agents, routers, and OpenAI SDK clients at `gsb` and use your Gemini account through Chat Completions or Responses — with account pooling, quota-aware failover, native image/video generation, Google Search grounding, and a built-in MCP server.
+OpenAI-compatible HTTP proxy for [Gemini Web](https://gemini.google.com/app). Point OpenAI SDK clients, routers (such as `9router`), and coding agents at `gsb` to use Gemini Web via **Chat Completions**, **Responses**, **Image/Video Generation**, and a built-in **MCP Search server** — backed by multi-account pooling, 5h/weekly quota-aware failover, and an embedded Web Control Plane.
 
 ![gsb Web Control Plane](docs/assets/web-ui.png)
 
-`gsb` translates OpenAI-style messages, images, and tool definitions into Gemini Web requests, then converts the results back into JSON or Server-Sent Events (SSE). It authenticates with your Google session cookies, not a Gemini Developer API key. Model access and quotas depend on the connected account.
-
-The daemon runs without headless Chrome or CDP. Browserless transport is an implementation detail; the API bridge is the interface your clients use.
-
-> **Unofficial.** This is a bridge to the Gemini web app, not Google's supported Gemini Developer API or an OpenAI service. Changes to Google's web protocol, sign-in requirements, account restrictions, and quotas can interrupt operation. The transport does not guarantee protection from detection or account restrictions. Use only accounts you are authorized to access and review Google's applicable terms.
+> **Unofficial.** `gsb` authenticates using Google session cookies rather than Gemini Developer API keys and does not run headless Chrome at runtime (it uses a Go uTLS/HTTP2 transport). Upstream protocol changes, sign-in checks, quota rules, and account limits can change without notice. Use only accounts you are authorized to access.
 
 ---
 
-## Contents
+## What `gsb` Does
 
-1. [What `gsb` provides](#1-what-gsb-provides)
-2. [Requirements](#2-requirements)
-3. [Quick start](#3-quick-start)
-4. [Core concepts](#4-core-concepts)
-5. [Web Control Plane](#5-web-control-plane)
-6. [Account onboarding](#6-account-onboarding)
-7. [Client integration](#7-client-integration)
-8. [API reference](#8-api-reference)
-9. [Native image and video generation](#9-native-image-and-video-generation)
-10. [Web search grounding](#10-web-search-grounding)
-11. [Configuration reference](#11-configuration-reference)
-12. [Data layout](#12-data-layout)
-13. [Security](#13-security)
-14. [Docker and deployment](#14-docker-and-deployment)
-15. [Operations and troubleshooting](#15-operations-and-troubleshooting)
-16. [How it works](#16-how-it-works)
-17. [Development](#17-development)
-18. [License](#18-license)
-
----
-
-## 1. What `gsb` provides
-
-### Capabilities
-
-| Capability | Behavior |
+| Feature | Summary |
 |---|---|
-| Chat Completions | `POST /v1/chat/completions`, JSON or SSE output |
-| Responses | `POST /v1/responses`, JSON or SSE output, including `function_call`, `custom_tool_call`, `local_shell`, and namespaced tools |
-| Function calling | Translates tool definitions into a prompt contract, validates returned arguments against the tool's JSON Schema, repairs common model mistakes, and emits OpenAI-style calls. The client executes the tools |
-| Image input | Base64 data URLs, remote HTTPS images, and Anthropic-style `image` parts |
-| Thinking effort | Maps `low`, `medium`, and `high` to Gemini Web thinking levels; accepts many client-specific field names |
-| Conversation history | Reuses Gemini continuation tokens when matching history is available; offloads older turns into text attachments when the inline prompt budget is exceeded |
-| Multiple accounts and quota | Pool key routes across accounts (`rotate`, `lru`, `fill-first`); per-account keys pin one account; group keys serve one user's accounts with failover inside the group. Exposes rolling **5-hour** and **7-day weekly** quota windows |
-| Per-account proxies | Each account can egress through its own HTTP/SOCKS5 proxy, configured per account file, the Web UI, or `BRIDGE_EGRESS_PER_ACCOUNT` |
-| Web search grounding | Extracts the Google Search citations Gemini Web returned and appends them to the answer as a numbered `Sources:` list |
-| MCP server | Built-in Streamable HTTP MCP endpoint at `POST /mcp` (alias `/v1/mcp`) exposing grounding as a `web_search` tool for Claude Code, Cursor, OMP, and other MCP clients |
-| Native image and video | Imagen / Nano Banana images and Veo MP4 video with audio through Chat, Coding Agent tool-calling (`generate_media`), `POST /v1/images/generations`, `POST /v1/videos/generations`, and the local `GET /v1/media/<id>` proxy |
-| Web Control Plane | Embedded single-binary dashboard at `GET /ui` for account onboarding, quota bars, priority ordering, pause/quarantine actions, and runtime configuration |
-| Session maintenance | Background cookie rotation, model/quota refresh, idle-session reaping, and persistence of updated credentials |
-| Diagnostics | `X-GSB-*` response headers, request timing logs, redacted request dumps, and fingerprint comparison scripts |
+| **OpenAI Chat & Responses** | `POST /v1/chat/completions` and `POST /v1/responses` (JSON and SSE streaming), supporting thinking/reasoning effort (`low`/`medium`/`high`), image inputs, and continuation caching |
+| **Function Calling** | Translates tool definitions into a strict prompt contract, validates arguments against JSON Schema, repairs common model formatting issues, and prevents mid-stream tool-call leaks |
+| **Multi-Account Pool & Quotas** | `rotate`, `lru`, and `fill-first` pool routing across accounts with 5-hour & 7-day weekly quota tracking, group isolation (`BRIDGE_GROUP_TOKENS`), and per-account egress proxies |
+| **Native Image & Video** | Imagen / Nano Banana images and Veo MP4 videos (with audio) via `/v1/images/generations`, `/v1/videos/generations`, Chat, or Coding Agent `generate_media` tool, served over `/v1/media/<id>` |
+| **Web Search Grounding & MCP** | Extracts Google Search citations as `Sources:` and exposes `web_search` over Streamable HTTP MCP at `POST /mcp` (`/v1/mcp`) |
+| **Web Control Plane** | Single-binary embedded dashboard at `GET /ui` for account onboarding, priority reordering, live quota bars, and runtime configuration (`config.env`) |
 
-### Compatibility boundaries
+### Compatibility Notes
 
-Compatibility covers the endpoints and fields documented here, not the entire OpenAI API:
-
-- Sampling controls such as `temperature`, `top_p`, and `seed` are **not forwarded** and do not change output. Output-shaping controls **are** enforced locally: `max_tokens` / `max_completion_tokens` truncate the answer and report `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format` with `type: "json_object"` or `"json_schema"` strips Gemini's code fence so the client receives a bare JSON object. `max_tokens` and `stop` are honoured while streaming: only the prefix inside the limit is emitted, so the client never receives text the final answer would not contain. `response_format` is the exception — a JSON object cannot be unwrapped before it is complete, so that request is emitted once at the end.
-- Responses clients must resend conversation history in `input`; `previous_response_id` is not a continuation mechanism. Response retrieval, deletion, and background jobs are not implemented.
-- Function calling is prompt-based, not native Gemini Developer API function calling. Malformed or schema-invalid calls can fail with `tool_call_error`.
-- Token usage is estimated locally, not reported by Google's billing/tokenizer API. The model registry advertises a 1,048,576-token context window and 65,536-token output limit as metadata, not a guarantee for every account or request.
-- Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
-- The daemon serves plain HTTP. It does not terminate TLS.
-
-### What's new in v0.4.5
-- **Complete session cookies & isolated login hardening** (incorporating PR #12 / Fixes #11): `EssentialNames` now retains `OSID`, `__Secure-OSID`, `LSID`, `__Host-1PLSID`, `__Host-3PLSID`, `__Host-GAPS`, and `ACCOUNT_CHOOSER` with per-domain scoring (`gemini.google.com` preferred for `OSID`, `accounts.google.com` for `LSID`/`__Host-*`, `.google.com` for `SID`/`SAPISID`). Isolated browser login (`--login`, `--login-helper`, `--desktop-ui`) now reads browser-level cookies via CDP `Storage.getCookies`, waits for `OSID` to settle before closing the disposable browser, and retries once on transient post-login cookie propagation delays. CLI imports (`--login`, `--import-cookie`, `--import-chrome`) stage credentials to a temporary file and commit atomically only after `Bootstrap` succeeds.
-- **Safe cookie rotation & zero-race persistence**: non-200 rotation responses (`401`/`403`/`429`) never absorb cookie deletions or mark the session as rotated; `reloadGen` is separated from `cookieGen` so concurrent `GetQuota`/`AvailableModels` `Set-Cookie` headers no longer discard freshly rotated `__Secure-1PSIDTS`; `ReloadFromDiskIfNewer` never overwrites fresher in-memory cookies with stale disk state; and replaced/deleted account clients retire their writers and clean up pool/rotator/upload-cache state.
-- **Streaming stability, full-lifetime frame watchdog, & smart stall recovery**:
-  - `frameWatch` now stays armed across the entire stream until `Done`/`StreamEnd`, resetting on any text, reasoning, media, or activity change (`trimThoughts != lastThoughts` / `trimText != lastText`) so long reasoning turns never trip false stalls while mid-stream hangs are caught cleanly.
-  - Adaptive default no-frame deadlines (`30s` for `low`-effort fast tiers `hydrogen`/`flash`/`lite`/`adapts`/`auto`, `45s` for other `low`-effort models, `75s` for `medium`/`high` unless `BRIDGE_NO_FRAME_TIMEOUT_MS` is explicitly configured).
-  - Stalled or timed-out continuation caches are evicted automatically, and cross-account stall rollbacks prevent a single stuck prompt from poisoning healthy pool accounts.
-  - Pool failover now covers `incomplete_upstream_response`, `upstream_transport_error`, `upstream_http_error`, `upstream_parse_error`, `upstream_upload_error`, `account_disabled`, and `prepareGeneration` candidate exhaustion while preserving `429` precedence over `404`.
-  - Fixed a goroutine leak in `StealthClient.Do` on context cancellation, guarded `stallTimer` against races, skipped `lineBuf` tail flush after early `ErrStopStreaming`, and followed safe same-origin `gemini.google.com` redirects during bootstrap while reserving `auth_redirect` for actual Google sign-in redirects.
-- **Tool-calling anti-leak & schema fidelity**:
-  - Multi-line fenced `tool_calls` blocks are no longer leaked as plain text when a model glues trailing chatter onto the closing fence (e.g. ```` ```Groq ````) or glues an opening ```` ```json ```` block after a sentence period; duplicate adjacent tool-call blocks are automatically deduplicated.
-  - Fixed `LiveToolCallStreamer` partial-argument slicing (`partialArgs[:argsEnd]`), forced-function enforcement across all call indices, `nullable`/`"null"` unions, `"[]"` coercion, object-valued `additionalProperties` preservation during schema compaction, and non-RE2 `pattern` safety.
-- **Desktop one-port VPS UI (`--desktop-ui`), Control Plane polish, & Responses parity**:
-  - `gsb --desktop-ui` proxies both the daemon Web UI and API over a private SSH Unix socket on `127.0.0.1:20133` with local isolated-browser sign-in, strict `Origin`/`Sec-Fetch-Site` enforcement, full API/MCP header forwarding, and no artificial proxy header timeout on long streams.
-  - Web Control Plane supports account priority reordering, single-flight browser login with pre-validation, accurate `runtime` config source badges, `aliasesEnabled` visibility, and clear inline + banner error reporting.
-  - Responses API now emits `response.reasoning_summary_part.done`, handles `stop` at index `0` and `max_tokens` with tools, and preserves attachment parts across server-side media continuation rounds.
-  - Fixed three Windows-only unit tests in `internal/cookies` (`HOME`/`USERPROFILE` lookup and POSIX `0600` mode check).
-
-### What's new in v0.4.4
-- **The SSE grace timer actually runs in a default deployment**: `BRIDGE_EARLY_SSE_GRACE_MS` was gated on downgrade rejection being disabled, and that guard is on by default, so the timer never fired where it was needed. A thinking-heavy tier therefore held its response headers for minutes and a reverse proxy abandoned the request with "timeout awaiting response headers" while the bridge was still working. The grace flush now applies whenever buffering would otherwise outlast it; the downgrade guard keeps running on the stream body, which stops a mismatch just as the status line did.
-### What's new in v0.4.3
-- **The published model id is the versioned one**: the catalogue keeps the short tier name in the category (`Carbon`) while the description carries the product name (`4 Carbon`). `GET /v1/models` now publishes `gemini-4-carbon`, `gemini-3.1-pro` and `gemini-3.5-flash-lite`, which is what a capability table downstream is keyed by. The bare spellings (`gemini-carbon`, `gemini-pro`, `gemini-flash-lite`) remain as aliases and still resolve.
-- **Why it mattered**: a bare id matched no versioned capability row in front of the bridge, so `reasoning_effort` was dropped before it arrived and the model was advertised with a 128k window and no thinking levels. Requests to a bare id now reach the bridge with the effort the client asked for.
-### What's new in v0.4.2
-- **The 2026-11-13 catalogue release**: Google renamed the everyday tier from `3.8 Flash` to `4 Hydrogen`, moved `4 Argon` to code-and-analysis, and kept `4 Carbon` for the most complex work. The new names resolve, keep their thinking levels, and still map to the `Gemini Flash` and `Gemini Pro` quota buckets, so an exhausted bucket is reported against the model that spends it.
-- **Router tiers are exempt from the label guard**: `gemini-auto` picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is correct behaviour. It had been reported as `label_mismatch` on every response, and `BRIDGE_REJECT_LABEL_MISMATCH=1` would have taken those accounts offline entirely.
-- **Thinking-suffixed tier names match themselves**: `4 Hydrogen Thinking` was stripped to `4-hydrogen` before comparison, so it never matched its own catalogue entry. Both sides of the comparison are now expanded.
-- **The offline fallback matches the live registry**: `gsb --models-json` with no loaded accounts previously reported invented model IDs and marked Flash-Lite as non-reasoning while the registry gives it all three levels.
-### What's new in v0.4.1
-- **Frontier model tier tracked through the rename**: upstream renamed the top tier from `gemini-argon` to `gemini-carbon` on 2026-11-10. Thinking level and model selection now come from the live registry instead of name tables, so a renamed or newly introduced tier is described correctly without a code change. The name tables remain only as a fallback for a registry that publishes no thinking policy. Pin clients from `GET /v1/models`; a name upstream has dropped returns `404 model_not_found`.
-- **Documented limits actually apply**: the limit table was keyed from `displayName`, but the live registry carries the versioned name in `description` and a UI label in `displayName`, so every model silently reported `limitsSource: config`. Each candidate is now tried in turn.
-- **Frontier quota attribution**: the quota bucket behind the top tier is still named "Gemini Pro", so both the current and previous tier names map to it when reporting an exhausted bucket.
-
-### What's new in v0.4.0
-
-- **Web search grounding**: answers include a `Sources:` list; `BRIDGE_INCLUDE_GROUNDING=0` suppresses it.
-- **Built-in MCP server**: `POST /mcp` exposes `web_search` with a per-call `timeout_seconds` deadline.
-- **Per-account egress proxies**: `BRIDGE_EGRESS_PER_ACCOUNT` or the Web UI's *Outbound Proxy* field.
-- **Group keys**: `BRIDGE_GROUP_TOKENS` + `BRIDGE_ACCOUNT_GROUP` for multi-user deployments.
-- **Faster tool streaming**: the tool-envelope detector is a hand-rolled scan instead of a regexp over the whole accumulated answer.
-
-Older release notes are on the [GitHub releases page](https://github.com/azrinaldi/gemini-stealth-bridge/releases).
+- **Sampling controls (`temperature`, `top_p`, `seed`)** are accepted but ignored because Gemini Web does not expose them.
+- **Output controls** (`max_tokens` / `max_completion_tokens`, `stop`, `response_format` JSON unwrapping) are enforced locally by the bridge.
+- **History**: Clients using `/v1/responses` must resend history in `input` (`previous_response_id` is not a server-side session store). Token counts are estimated locally.
+- **Plain HTTP**: `gsb` does not terminate TLS; use loopback (`127.0.0.1:20133`), SSH tunneling, or a TLS reverse proxy for remote access.
 
 ---
 
-## 2. Requirements
+## What's New in v0.4.5
 
-| Component | Requirement |
-|---|---|
-| Runtime | Linux, macOS, or Windows on `amd64` or `arm64`. Static binaries need no runtime dependencies |
-| Build | **Go 1.26.0 or newer**, Git |
-| Account | A Google account that can use [Gemini Web](https://gemini.google.com/app) |
-| Browser (optional) | Chrome, Chromium, Brave, Edge, Vivaldi, or Arc for `--login` / `--import-chrome`; Firefox cookie databases are also readable |
-| Docker (optional) | Any recent Docker Engine with Compose v2 |
-| Scripts (optional) | `python3` for `scripts/check-router-metadata.sh` and `scripts/diff-fingerprint.sh`; POSIX `sh` |
+- **Full Session Cookie & Isolated Login Fix**: Incorporates [PR #12](https://github.com/azrinaldi/gemini-stealth-bridge/pull/12) (fixes [Issue #11](https://github.com/azrinaldi/gemini-stealth-bridge/issues/11)) — huge thanks to [@PramaAditya](https://github.com/PramaAditya)! Preserves `OSID`, `__Secure-OSID`, `LSID`, `__Host-1PLSID`, `__Host-3PLSID`, `__Host-GAPS`, and `ACCOUNT_CHOOSER` with per-domain scoring; `--login` / `--login-helper` / `--desktop-ui` read browser-level CDP cookies (`Storage.getCookies`), wait for `OSID` to settle before closing the temporary browser, retry transient post-login propagation errors once, and commit atomically after `Bootstrap` succeeds.
+- **Zero-Race Cookie Rotation & Cleanup**: Non-200 `/RotateCookies` responses no longer clear cookies or mark rotation complete; `reloadGen` is isolated from `cookieGen`; stale disk state cannot overwrite newer in-memory cookies.
+- **Streaming Stability & Smart Stall Recovery**: `frameWatch` stays armed for the entire stream lifecycle with adaptive per-model no-frame deadlines (`30s` / `45s` / `75s`), evicts stalled continuation caches, adds cross-account stall rollback, and fails over cleanly on transport, upload, HTTP, parse, and incomplete upstream errors.
+- **Tool-Calling Anti-Leak Hardening**: Prevents plain-text leakage when models append trailing text after closing code fences (e.g. ```` ```Groq ````) or glue ```` ```json ```` immediately after punctuation, deduplicates repeated blocks, and fixes `LiveToolCallStreamer` slicing and schema edge cases.
+- **One-Port Desktop UI (`--desktop-ui`) & UI/UX Refresh**: Redesigned Web Control Plane with quick-connect Pool/MCP cards, drag/arrow priority ordering, runtime config source badges, and a single-port (`127.0.0.1:20133`) desktop proxy over a private SSH Unix socket for headless VPS servers.
+- **Cross-Platform CI & Windows Fixes**: Fixed Windows home/mode unit tests and restored POSIX executable permissions on helper scripts.
 
-Shell examples use a POSIX shell. On Windows, run the binary as `gsb.exe` and adapt environment-variable assignments to your shell.
+> Older release notes are available on [GitHub Releases](https://github.com/azrinaldi/gemini-stealth-bridge/releases).
 
 ---
 
-## 3. Quick start
+## Requirements
 
-### 3.1 Install
+- **Runtime**: Linux, macOS, or Windows (`amd64` / `arm64`) — single static binary, zero runtime dependencies.
+- **Build from source**: Go **1.26.0+** and Git.
+- **Account**: A Google account with access to [Gemini Web](https://gemini.google.com/app).
+- **Browser (optional)**: Chrome, Chromium, Brave, Edge, or Vivaldi for `--login`; Firefox/Arc profiles are also readable via `--import-chrome`.
 
-Pick whichever path fits: a prebuilt binary, a Go install, or the container image.
+---
 
-**Prebuilt binary (recommended)** — every release publishes static binaries for Linux, macOS, and Windows on both `amd64` and `arm64`, plus `SHA256SUMS`:
+## Quick Start
+
+### 1. Install
+
+**Prebuilt static binary (recommended):**
 
 ```sh
-# Linux x86_64; swap in darwin_arm64, linux_arm64, windows_amd64.exe, ...
+# Linux amd64 (other targets: linux_arm64, darwin_amd64, darwin_arm64, windows_amd64.exe, windows_arm64.exe)
 curl -fL -o gsb https://github.com/azrinaldi/gemini-stealth-bridge/releases/latest/download/gsb_linux_amd64
 chmod +x gsb
 ./gsb --version
 ```
 
-Verify the download against the release checksums:
+Optional checksum verification:
 
 ```sh
 curl -fLO https://github.com/azrinaldi/gemini-stealth-bridge/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-**From source**:
-
-```sh
-git clone https://github.com/azrinaldi/gemini-stealth-bridge.git
-cd gemini-stealth-bridge
-go build -o gsb ./cmd/gsb
-```
-
-Or install into your Go binary directory:
+**Or build from source / `go install`:**
 
 ```sh
 go install github.com/azrinaldi/gemini-stealth-bridge/cmd/gsb@latest
+# or from a local clone:
+go build -o gsb ./cmd/gsb
 ```
 
-**Container** — Docker is optional. If you only want the binary, you can use the image purely as an installer and never leave a container running:
-
-```sh
-cid=$(docker create ghcr.io/azrinaldi/gemini-stealth-bridge:latest)
-docker cp "$cid:/usr/local/bin/gsb" ./gsb
-docker rm "$cid"
-```
-
-See [Docker and deployment](#14-docker-and-deployment) for the full container setup.
-
-### 3.2 Connect a Gemini account
-
-Sign in through `gsb` so the session is captured in an isolated disposable browser profile that never conflicts with background cookie rotation:
+### 2. Sign In & Verify
 
 ```sh
 ./gsb --login acc1
 ./gsb --probe
 ```
 
-`--login` opens a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, waits for Google sign-in and Gemini's `OSID` session cookie to settle, captures the full cookie set through CDP (`Storage.getCookies`), verifies the session against Gemini Web before committing atomically, and deletes the temporary profile. No background browser process is left competing with `gsb` for `__Secure-1PSIDTS` rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so the captured session is not bound to a device key that `gsb` cannot present and stays renewable by the daemon.
+`--login` opens a disposable browser profile with Device Bound Session Credentials (DBSC) disabled so the captured cookies remain renewable by `gsb` without a background browser competing for rotation. `--probe` verifies model discovery and 5h/weekly quota.
 
-`--probe` prints the account's models and 5-hour/weekly quota. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
-
-### 3.3 Start the daemon
+### 3. Start the Daemon
 
 ```sh
 ./start.sh
@@ -200,445 +101,96 @@ Sign in through `gsb` so the session is captured in an isolated disposable brows
 ./gsb --web
 ```
 
-The default address is `http://127.0.0.1:20133` and the Web Control Plane is at `http://127.0.0.1:20133/ui`. Keep this default local-only setup on loopback; see [Security](#13-security) before sharing access.
+- **API Base URL**: `http://127.0.0.1:20133/v1`
+- **Web Control Plane**: `http://127.0.0.1:20133/ui`
 
-`start.sh` builds a missing or outdated binary when a Go toolchain is available, falls back to the existing binary when it is not, exports `BRIDGE_HOME` (default `~/.gemini-stealth-bridge`), enables the Web UI, and then `exec`s `gsb`.
-
-### 3.4 Send a request
-
-There are three kinds of key. Pick one:
-
-| Key | Value | Behavior |
-|---|---|---|
-| **Pool key** | `BRIDGE_API_KEY` (default `public`) | Routes each request across all loaded accounts using `BRIDGE_ACCOUNT_STRATEGY`. Use this normally |
-| **Group key** | `BRIDGE_GROUP_TOKENS` entry (`token:group`) | Serves only the accounts of its group and fails over inside that group. Use this in multi-user deployments |
-| **Account key** | A `BRIDGE_ACCOUNT_TOKENS` entry; `gsb-<name>` or `<name>` in public mode without explicit account tokens | Pins the request to that account and never fails over |
-
-List the models available to the pool:
+### 4. Send a Test Request
 
 ```sh
-curl -sS http://127.0.0.1:20133/v1/models \
-  -H 'Authorization: Bearer public'
-```
+# List live models
+curl -sS http://127.0.0.1:20133/v1/models -H 'Authorization: Bearer public'
 
-Set `MODEL` to an `id` returned by that endpoint. `gemini-flash` below is an example, not a promise of availability:
-
-```sh
-export MODEL=gemini-flash
+# Send a chat completion using the pool key (auto-failover across all accounts)
 curl -sS http://127.0.0.1:20133/v1/chat/completions \
   -H 'Authorization: Bearer public' \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}"
+  -d '{"model":"gemini-4-hydrogen","messages":[{"role":"user","content":"Reply with OK."}]}'
 ```
 
-Read the answer from `choices[0].message.content`. `/health` checks that the daemon is running; only a successful model request verifies upstream generation.
-
-`X-GSB-Account` in the response headers names the account that served the request, which is the quickest way to see the pool working. Replace `public` with `gsb-acc1` to pin the same request to one account.
+Inspect the `X-GSB-Account` response header to see which account served the request.
 
 ---
 
-## 4. Core concepts
+## Account Management & Keys
 
-### 4.1 Accounts
+### API Keys
 
-An account is one saved Google session under `$BRIDGE_HOME/accounts/<name>.json`. Account names accept 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`.
-
-Each account has its own:
-
-- cookie jar and rotating session cookies,
-- live model list and quota state,
-- transport session and optional egress proxy,
-- failure/quarantine/disabled state,
-- account group and priority position.
-
-Accounts are deduplicated by email address. Multiple files for the same Google account do not create additional upstream quota; the freshest credential wins.
-
-### 4.2 API keys
-
-| | **Pool key** | **Group key** | **Account key** |
-|---|---|---|---|
-| Value | `BRIDGE_API_KEY` (default `public`) | A `BRIDGE_GROUP_TOKENS` entry (`token:group`) | A `BRIDGE_ACCOUNT_TOKENS` entry (`token:account_id`), or a public-mode alias |
-| Scope | All loaded accounts | The accounts assigned to one group via `BRIDGE_ACCOUNT_GROUP` | Exactly one account |
-| Account selection | Automatic, per `BRIDGE_ACCOUNT_STRATEGY` | Automatic, inside the group only | None; the named account is always used |
-| Failover on quota, ban, or failure | Yes | Yes, but only among the group's accounts | No; the error is returned to the caller |
-| `/v1/accounts` and `/v1/quota` | All accounts | Only the group's accounts | Only the named account |
-| Best for | Normal use, agents, routers | Multi-user deployments where each user has their own accounts | Testing one account, per-project quota isolation |
-
-Notes:
-
-- `BRIDGE_API_KEY=public` means the pool key is `public` and requests **without** a key are accepted. The Web UI also derives a stable `gsb-pool-<hash>` token from `BRIDGE_HOME` and accepts it as the pool key.
-- When exactly one account is loaded, the pool key resolves to that account's scope rather than the admin/all-accounts scope.
-- Filename aliases (`gsb-<name>` and `<name>`) work only with `BRIDGE_API_KEY=public` and no `BRIDGE_ACCOUNT_TOKENS` configured. They are routing aliases, not secrets. With a private pool key, configure explicit account tokens for pinning.
-- `BRIDGE_GROUP_TOKENS` adds `token:group_name` mappings. A group key cannot reach accounts outside its group.
-- `BRIDGE_ADMIN_KEY` grants the admin scope: all accounts, plus `/v1/admin/*`. A non-public `BRIDGE_API_KEY` also satisfies admin authentication when `BRIDGE_ADMIN_KEY` is empty.
-- Accepted credential headers: `Authorization: Bearer <key>` (recommended), `x-api-key`, `x-goog-api-key`, and `?key=`. Query keys can leak into URL logs.
-
-### 4.3 Pool routing strategies
-
-`BRIDGE_ACCOUNT_STRATEGY` controls pool-key selection:
-
-- **`rotate` (default)** — keep using one account until it is exhausted, banned, rate-limited, or failing, then advance to the next and wrap around. Best session continuity, and it leaves other accounts at full quota as standby. It does not jump back to an earlier account the moment that account recovers.
-- **`lru`** — spread load to the least recently used healthy account. Ties prefer fewer recorded failures, then the oldest `LastUsed`.
-- **`fill-first`** — drain a fixed order set by `BRIDGE_ACCOUNT_PRIORITY`, then load order. A recent failure demotes an account only for the 60-second cooldown, so a preferred account reclaims its rank as soon as it is healthy.
-
-All strategies share the same eligibility rules. An account is skipped when it is:
-
-- disabled (`Paused`) or quarantined,
-- missing the requested model,
-- known to have the requested model's quota exhausted (per `BRIDGE_QUOTA_PREFLIGHT`),
-- in a synthetic model-substitution cooldown,
-- at its per-account RPM or concurrency limit,
-- in the 60-second failure cooldown.
-
-An account that already holds the conversation's continuation cache is preferred, so a multi-turn conversation stays on one Gemini session even when the pool rotates.
-
-Failover respects account groups. Once a request is being served by an account in a group, retries stay inside that group. A pool-key request that starts on an ungrouped account also stays on ungrouped accounts, because a grouped account is not a valid fallback for it.
-
-### 4.4 Quota model
-
-`gsb` queries two upstream sources:
-
-- `batchexecute` RPC `qpEbW` (`CHECK_GEMINI_QUOTA`), and
-- Gemini Web's GraphQL `GetUserQuotaService` pools `GXU_FIVE_HOURLY` and `GXU_WEEKLY`.
-
-The resulting buckets are exposed in `/v1/accounts`, `/v1/quota`, `gsb --accounts`, and the Web UI:
-
-| Window | Default credits | Meaning |
+| Key Type | Value | Behavior |
 |---|---|---|
-| `5h` | `2,400` | Rolling five-hour window |
-| `weekly` | `48,384` | Seven-day weekly allowance |
-
-The 5-hour window is nested under the weekly allowance, so `gsb` caps effective 5-hour remaining credits to the weekly remaining credits when the weekly pool runs lower.
-
-When an account reaches `0` credits, non-lite models (`gemini-hydrogen`, `gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable. `gsb` also records synthetic per-model cooldowns when upstream silently substitutes a model, escalating `1m → 5m → 15m → 1h → 6h → 24h` across repeated observations.
-
-`quotaWindow` in `/v1/accounts` describes what the numbers cover, including `weeklyExposed`, `weeklyRemaining`, `weeklyTotal`, `nextResetAt`, and `nextResetInSeconds`.
-
-### 4.5 Sessions and continuation cache
-
-Gemini Web conversations are continued with internal metadata (`cid`, `rid`, `rcid`, context token). `gsb` hashes the conversation history, tools, and tool choice, then stores continuation metadata per `(account, model, history prefix)`:
-
-- TTL: **30 minutes**
-- Maximum entries: **256**
-- Persisted to `$BRIDGE_HOME/session-cache.json`
-- Disabled with `BRIDGE_SESSION_CACHE=0`
-- Bypassed for `temporary: true` requests
-
-Uploaded images and offloaded text attachments are cached separately for **25 minutes** (maximum 128 entries) so repeated turns do not re-upload the same bytes.
-
-`BRIDGE_HISTORY_OFFLOAD=1` (default) uploads older conversation turns as text attachments when the inline prompt budget is exceeded. Setting it to `0` forces inline compaction instead.
-
-### 4.6 Media cache
-
-Generated images and videos are registered in memory and served through `GET /v1/media/<id>`:
-
-- Maximum **96** entries, oldest evicted first
-- Not persisted across restarts
-- Served with `Cache-Control: public, max-age=86400` and `Access-Control-Allow-Origin: *`
-- Unauthenticated, because upstream media URLs require Google cookies that browsers and `curl` do not have
-
----
-
-## 5. Web Control Plane
-
-Start `gsb` with `./start.sh`, `./gsb --web`, or `BRIDGE_WEB_UI=1` and open `http://127.0.0.1:20133/ui`.
-
-The UI is a single embedded HTML/CSS/JS page compiled into the binary. It can be excluded at build time with `-tags nowebui`.
-
-### 5.1 Access control
-
-- **Loopback access with no admin key** is allowed.
-- **Remote access** (any non-loopback peer, or a loopback peer with a non-loopback `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` / `Forwarded` header) is locked with HTTP `403` while `BRIDGE_API_KEY` is `public` and `BRIDGE_ADMIN_KEY` is empty.
-- When a key is configured, the page prompts for it. The key is kept in the tab's `sessionStorage` and sent as both `Authorization: Bearer` and `X-GSB-Admin-Key`.
-- Five failed admin authentications from one IP within 60 seconds trigger HTTP `429`.
-- Admin requests with `Sec-Fetch-Site: cross-site` are rejected.
-
-This matters for Docker: bridge NAT makes every request look remote, so the control plane stays locked until `BRIDGE_ADMIN_KEY` or a non-public `BRIDGE_API_KEY` is set.
-
-### 5.2 Accounts tab
-
-- **Quick-connect cards**: Pool Base URL + pool key, per-account key chips (`gsb-<name>`), and the MCP endpoint URL/key. Every value is click-to-copy.
-- **Pool telemetry**: current strategy, rotation cursor, active HTTP/2 sessions, and continuation cache hits/misses.
-- **Filters**: All, Ready, Exhausted, Attention.
-- **Per-account row**: status badge, email, 5-hour and weekly quota bars with reset countdowns, model list, RPM/stream telemetry, and a `Key:` chip.
-- **Priority controls**: `↑` / `↓` move an account in `BRIDGE_ACCOUNT_PRIORITY`; the order is persisted to `config.env`.
-- **`⋯` action menu**:
-  - *Refresh Quota & Session* (`probe`)
-  - *Pause Account in Pool* / *Resume Account in Pool* (`toggle`)
-  - *Unquarantine Account* or *Reset Failure Counter* (`unquarantine`)
-  - *Copy Key*
-  - *Remove Account* (two-step confirmation)
-- **Refresh All** queries upstream with `/v1/accounts?live=1`.
-
-An account that records a failure is re-checked automatically within about two minutes instead of waiting the full `BRIDGE_MODEL_REFRESH_MS` interval. The re-check is a real model-registry read, so a successful one proves the account is reachable and authenticated and clears the transient failure label on its own. A rejected session (`code 1016`) or a restricted account is not disproved by listing models, so those keep their own status and their own remedy. Nothing here requires a manual Refresh.
-
-Status badges map the API statuses to UI labels: `ok` → Ready, `disabled` → Paused, `exhausted` → Exhausted, `cooling` → Cooling, `degraded` → Degraded, `quarantined` → Quarantined, `expired` → Expired, `unknown` → Unprobed.
-
-### 5.3 Add Account
-
-The **+ Add Account** dialog offers two isolated methods. Only the cookie box is visible by default; account name, proxy, and group live under **Optional settings**.
-
-1. **Isolated browser window** (recommended): the daemon opens a disposable browser profile and captures the session after sign-in. For a headless VPS, run `gsb --login-helper` in a terminal on your laptop, tunnel the daemon port (`ssh -L 20133:127.0.0.1:20133 user@vps`), and paste the helper token into **Desktop helper token** before selecting **Launch**.
-2. **Incognito session cookies** (works locally and over SSH):
-   - Open a new Incognito window (`Ctrl+Shift+N`), sign in to `gemini.google.com/app`, export cookies with Cookie-Editor (or copy the `Cookie` header), then immediately close the Incognito window **without signing out**.
-   - Paste the JSON array or raw header into the dialog.
-
-Optional fields:
-
-- **Account name** — leave blank to derive an ID from the Google email.
-- **Outbound proxy** — per-account HTTP/SOCKS5 proxy; blank uses `BRIDGE_PROXY_SERVER`.
-- **Account group** — only needed when you issue group keys; ignore it for a single pool key.
-
-For an already-signed-in local browser profile, use the CLI: `gsb --import-chrome <name>`.
-
-### 5.4 Runtime configuration tab
-
-The UI can change these settings live and optionally persist them to `$BRIDGE_HOME/config.env` (mode `0600`):
-
-| UI field | Environment variable | Allowed values |
-|---|---|---|
-| Account Strategy | `BRIDGE_ACCOUNT_STRATEGY` | `rotate`, `lru`, `fill-first` |
-| Quota Preflight | `BRIDGE_QUOTA_PREFLIGHT` | `strict`, `advisory`, `off` |
-| Account Priority | `BRIDGE_ACCOUNT_PRIORITY` | Comma-separated account IDs |
-| Default Thinking | `BRIDGE_DEFAULT_THINKING` | `low`, `medium`, `high` |
-| Max RPM per Account | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `0`–`600` (`0` disables) |
-| Max Concurrent Streams | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `0`–`64` (`0` disables) |
-| Reject Downgrade | `BRIDGE_REJECT_DOWNGRADE` | Boolean |
-| Reject Label Mismatch | `BRIDGE_REJECT_LABEL_MISMATCH` | Boolean |
-| Stream `reasoning_content` | `BRIDGE_LIVE_THOUGHTS` | Boolean |
-| Stream `tool_calls` deltas | `BRIDGE_LIVE_TOOL_CALLS` | Boolean |
-| Keep pre-tool preamble | `BRIDGE_TOOL_PREAMBLE` | Boolean |
-| Offload long history | `BRIDGE_HISTORY_OFFLOAD` | Boolean |
-
-**Apply In-Memory Only** changes the running daemon without writing a file. **Save to config.env** writes the values atomically. Values set in the process environment take precedence over `config.env` at the next start; the UI shows each field's source (`env`, `file`, `runtime`, or `default`).
-
-Timeouts, proxy settings, keys, and transport fingerprint options are environment-only; they are not exposed in the UI.
-
-### 5.5 Admin REST API
-
-All admin routes require the admin key when one is configured, and are only mounted when the Web UI is enabled.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/admin/config` | Effective runtime config, field sources, pool key, rotation cursor, uptime, metrics |
-| `PATCH` | `/v1/admin/config` | Update the 12 runtime fields above; `persist: true` writes `config.env` |
-| `POST` | `/v1/admin/accounts/import` | Import an account from a cookie payload; body: `id`, `cookie`, `accountGroup`, `proxyUrl` |
-| `POST` | `/v1/admin/accounts/browser-login` | Run an isolated browser login (4-minute timeout) and import the result |
-| `DELETE` | `/v1/admin/accounts/<id>` | Remove the account file and unload it |
-| `POST` | `/v1/admin/accounts/<id>/probe` | Bootstrap, refresh models/quota, clear failures on success |
-| `POST` | `/v1/admin/accounts/<id>/rotate` | Rotate rotating cookies |
-| `POST` | `/v1/admin/accounts/<id>/unquarantine` | Clear quarantine, failures, and synthetic cooldowns |
-| `POST` | `/v1/admin/accounts/<id>/toggle` | Pause/resume the account in the pool |
-| `POST` | `/v1/admin/accounts/<id>/move` | Reorder priority; body: `{"direction":"up"\|"down"}` |
-
----
-
-## 6. Account onboarding
-
-Each imported account is stored in `~/.gemini-stealth-bridge/accounts/<name>.json`, or under `$BRIDGE_HOME/accounts/` when configured. Cookie imports bootstrap the account against Gemini Web before reporting success. Treat both source cookie exports and saved account files as credentials.
-
-### 6.1 Sign in with `--login` (recommended)
-
-```sh
-./gsb --login acc1
-```
-
-`--login` launches a temporary Chrome/Chromium/Brave/Edge window using a disposable `--user-data-dir`, opens `https://gemini.google.com/app`, and monitors cookies via CDP. As soon as Google sign-in completes and the `SAPISID` cookie is present, `gsb` captures the session, verifies it against Gemini Web, and deletes the temporary browser directory.
-
-1. Run `./gsb --login <name>` and complete Google sign-in, including any 2FA or "verify it's you" prompt.
-2. If operating on a headless server without a local browser, paste a `Cookie` header or Cookie-Editor JSON export from an **Incognito** window that you immediately close after copying.
-3. Run `./gsb --probe` and confirm the account reports models and 5h/weekly quota without an auth error.
-
-If an account later fails with an expired-session error, repeat `gsb --login <name>` instead of re-exporting stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
-
-### 6.2 Reuse a signed-in browser profile
-
-Despite its name, `--import-chrome` also recognizes other Chromium browsers and Firefox cookie databases. No browser is launched during import. Use this only when that browser profile is already signed in to Gemini.
-
-```sh
-# Auto-detect a local cookie database.
-./gsb --import-chrome acc1
-
-# Choose a profile by name.
-./gsb --import-chrome acc1 --chrome-profile "Profile 4"
-
-# Choose a profile directory or cookie database explicitly.
-./gsb --import-chrome acc1 --cookie-db "$HOME/.config/google-chrome/Default"
-```
-
-`--chrome-profile` also accepts a directory or cookie database path. `--cookie-db` takes precedence when both are supplied.
-
-Supported browsers and typical paths:
-
-| Browser | Linux | macOS | Windows |
-|---|---|---|---|
-| Chrome | `~/.config/google-chrome/Default` | `~/Library/Application Support/Google/Chrome/Default` | `%LOCALAPPDATA%\Google\Chrome\User Data\Default` |
-| Chromium | `~/.config/chromium/Default` | `~/Library/Application Support/Chromium/Default` | `%LOCALAPPDATA%\Chromium\User Data\Default` |
-| Brave | `~/.config/BraveSoftware/Brave-Browser/Default` | `~/Library/Application Support/BraveSoftware/Brave-Browser/Default` | `%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\Default` |
-| Edge | `~/.config/microsoft-edge/Default` | `~/Library/Application Support/Microsoft Edge/Default` | `%LOCALAPPDATA%\Microsoft\Edge\User Data\Default` |
-| Vivaldi | `~/.config/vivaldi/Default` | `~/Library/Application Support/Vivaldi/Default` | `%LOCALAPPDATA%\Vivaldi\User Data\Default` |
-| Arc | — | `~/Library/Application Support/Arc/User Data` | MSIX package directory `%LOCALAPPDATA%\Packages\TheBrowserCompany.Arc_*\LocalCache\Local\Arc\User Data` |
-| Firefox | `~/.mozilla/firefox/<profile>/cookies.sqlite` | `~/Library/Application Support/Firefox/Profiles/<profile>/cookies.sqlite` | `%APPDATA%\Mozilla\Firefox\Profiles\<profile>\cookies.sqlite` |
-
-Arc is auto-detected on Windows through the MSIX glob. When no profile is given, auto-detection scans every known browser and prefers the first database that actually contains a `SAPISID` cookie, so an unsigned-in Chrome install does not shadow a signed-in Arc, Brave, or Edge profile.
-
-```sh
-# macOS Arc
-./gsb --import-chrome acc1 --cookie-db "$HOME/Library/Application Support/Arc/User Data/Default"
-
-# Or just name the browser and let gsb find the profile.
-./gsb --import-chrome acc1 --chrome-profile arc
-```
-
-Decryption depends on the browser, OS, and access to the browser's encryption keys:
-
-- **Linux**: keyring-backed cookies may require `secret-tool` and an unlocked desktop keyring.
-- **macOS**: `gsb` queries the login Keychain for the matching `<Browser> Safe Storage` item (`Chrome Safe Storage`, `Arc Safe Storage`, `Brave Safe Storage`, …). macOS asks you to allow access the first time; `CHROME_PASS` overrides the lookup when Keychain access is unavailable.
-- **Windows**: DPAPI decryption requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export.
-
-A detected database is not a guarantee that its cookies can be decrypted. `gsb` warns when the profile looks active or when long-lived session cookies are already expired or about to expire.
-
-### 6.3 Cookie header or JSON export
-
-Import either a raw `Cookie` header value or a Cookie-Editor JSON array:
-
-```sh
-./gsb --import-cookie acc1 --cookie-file /path/to/cookies.json
-```
-
-The same payload can be supplied on stdin:
-
-```sh
-./gsb --import-cookie acc1 < /path/to/cookies.json
-```
-
-`--cookie-value` accepts an inline payload, but puts credentials in shell history and potentially process listings. Prefer a protected file or stdin.
-
-### 6.4 Remote VPS and headless servers
-
-Recommended flow:
-
-```sh
-# On your laptop:
-ssh -L 20133:127.0.0.1:20133 user@vps
-
-# On the VPS:
-gsb --web
-```
-
-Then open `http://127.0.0.1:20133/ui` locally and use **+ Add Account**:
-
-- **Incognito session cookies** (works everywhere), or
-- **Isolated browser window → Launch** with `gsb --login-helper` running on the laptop.
-
-`gsb --login-helper` listens on `127.0.0.1:20134` on the laptop. Do not tunnel that port. Paste the token shown in the helper terminal into **Desktop helper token**. The token changes when the helper restarts.
-
-**Desktop browser login on VPS:** keep GSB daemon UI as only UI. Use one local port, `20133`, for API, daemon Web UI, and local browser login. Keep the private SSH socket tunnel open, then start `gsb --desktop-ui` on laptop.
-
-```sh
-install -d -m 700 "$XDG_RUNTIME_DIR/gsb-desktop"
-ssh -NT -o ExitOnForwardFailure=yes -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes \
-  -L "$XDG_RUNTIME_DIR/gsb-desktop/bridge.sock:127.0.0.1:20133" user@vps
-gsb --desktop-ui
-```
-
-Open `http://127.0.0.1:20133/ui`. This is VPS daemon UI served through local proxy. No **Connect desktop** button, second UI, or second TCP port. **Add Account → Launch** invokes local browser capture; other UI/API requests pass through to daemon. API clients use same `http://127.0.0.1:20133/v1`.
-
-### 6.5 Additional accounts
-
-Repeat the login with another name:
-
-```sh
-./gsb --login acc2
-```
-
-Or, if that account is already signed in to a different browser profile:
+| **Pool key** (default) | `BRIDGE_API_KEY` (default `public`, or `gsb-pool-*` shown in UI) | Routes and fails over automatically across all eligible accounts. **Use this for agents and routers.** |
+| **Group key** | `BRIDGE_GROUP_TOKENS` (`token:group`) | Routes and fails over only within the accounts assigned to that group (`BRIDGE_ACCOUNT_GROUP`). |
+| **Account key** | `BRIDGE_ACCOUNT_TOKENS` (`token:account_id`), or `gsb-<name>` in `public` mode | Pins requests to one account with **no failover**. |
+
+Accepted headers: `Authorization: Bearer <key>` (recommended), `x-api-key`, `x-goog-api-key`, or `?key=`.
+
+### Remote VPS & Headless Onboarding
+
+1. **Desktop UI + Local Browser over one SSH socket (`--desktop-ui`)** *(recommended)*:
+   ```sh
+   # On the VPS:
+   gsb --web
+
+   # On your laptop:
+   install -d -m 700 "$XDG_RUNTIME_DIR/gsb-desktop"
+   ssh -NT -o ExitOnForwardFailure=yes -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes \
+     -L "$XDG_RUNTIME_DIR/gsb-desktop/bridge.sock:127.0.0.1:20133" user@vps
+   gsb --desktop-ui
+   ```
+   Open `http://127.0.0.1:20133/ui` locally — clicking **+ Add Account → Launch** runs browser sign-in on your laptop and imports directly into the VPS daemon.
+2. **Desktop Login Helper (`--login-helper`)**: Run `gsb --login-helper` on your laptop (port `20134`), tunnel `20133` with `ssh -L 20133:127.0.0.1:20133 user@vps`, and paste the helper token into the Web UI dialog.
+3. **Incognito Cookie Export**: Sign in inside a new Incognito window, copy cookies via Cookie-Editor JSON or raw `Cookie` header, **close the Incognito window immediately without signing out**, and paste into **+ Add Account** or `gsb --import-cookie <name>`.
+
+### Importing Existing Browser Profiles & Groups
 
 ```sh
 ./gsb --import-chrome acc2 --chrome-profile "Profile 2"
+./gsb --import-cookie acc3 --cookie-file /path/to/cookies.json
 ```
 
-Each account has its own cookie state, model list, quota state, and transport session. Files belonging to the same Google account are deduplicated by email.
-
-### 6.6 Account groups
-
-Assign accounts to a group and map a key to that group:
+Multi-user groups and per-account proxies:
 
 ```sh
-BRIDGE_ACCOUNT_GROUP="acct-a:team-a,acct-b:team-a,acct-c:team-b" \
-BRIDGE_GROUP_TOKENS="alice-key:team-a,bob-key:team-b" ./gsb
+BRIDGE_ACCOUNT_GROUP="acc1:team-a,acc2:team-b" \
+BRIDGE_GROUP_TOKENS="alice-tok:team-a,bob-tok:team-b" \
+BRIDGE_EGRESS_PER_ACCOUNT="acc1:socks5://127.0.0.1:1081" ./gsb --web
 ```
-
-The group can also be set per account in the Web UI's *Account Group* field, or with `accountGroup` in the account file.
-
-A group key:
-
-- serves only that group's accounts,
-- fails over only inside the group,
-- sees only the group's accounts in `/v1/accounts` and `/v1/quota`,
-- never consumes another group's quota.
-
-### 6.7 Per-account egress proxies
-
-```sh
-BRIDGE_EGRESS_PER_ACCOUNT="acct-a:socks5://127.0.0.1:1081,acct-b:http://user:pass@proxy.example:3128" ./gsb
-```
-
-The same is available in the Web UI's *Outbound Proxy* field and as `proxyUrl` in the account file. The value applies to that account's transport session only; changing it rebuilds the session so no connection survives from the previous egress. Accounts without their own proxy use `BRIDGE_PROXY_SERVER`.
-
-`BRIDGE_PROXY_SERVER` applies to Gemini transport, not to the separate remote-image downloader. It does not provide a process-wide proxy or privacy boundary.
 
 ---
 
-## 7. Client integration
+## Client & Router Integration
 
-### 7.1 Direct connection
+### Direct OpenAI SDK / Coding Agents
 
-Configure any client that supports a custom OpenAI-compatible endpoint:
+- **Base URL**: `http://127.0.0.1:20133/v1`
+- **API Key**: Pool key (`public` or your `BRIDGE_API_KEY`)
+- **Model**: Pick an ID from `GET /v1/models` (prefixes `gsb/`, `google/`, `models/`, `vx/`, `vertex/` and suffix `@think=low|medium|high` are supported).
 
-| Setting | Value |
-|---|---|
-| Base URL | `http://127.0.0.1:20133/v1` |
-| API key | Pool key (`BRIDGE_API_KEY`, default `public`) for automatic rotation/failover, a group key, or `gsb-acc1` to pin `acc1` |
-| API mode | Chat Completions or Responses, matching the client's adapter |
-| Model | An ID from `GET /v1/models` using the same key |
-
-Choose Chat Completions for clients that consume `choices` / `tool_calls`, or Responses for clients that consume `output` items and `response.*` events. Client support for reasoning fields varies. OpenAI compatibility does not imply that every coding agent or every client-specific feature has been tested.
-
-### 7.2 Through `9router`
-
-Add `gsb` as an OpenAI-compatible provider in `9router`:
-
-| Provider setting | Value |
-|---|---|
-| Name | `Gemini Stealth Bridge` |
-| Base URL | `http://127.0.0.1:20133/v1` |
-| API type | Chat Completions (`chat`) or Responses (`responses`) |
-| Prefix | `gsb` |
-| Credential | Pool key (`BRIDGE_API_KEY`) to let `gsb` rotate accounts, or an account key (`gsb-acc1`) to pin one account |
-
-Point the coding agent at the router's URL with the router's own API key; use the model name/prefix exposed by the router, for example `gsb/gemini-flash`. The bridge also accepts the `gsb/` model prefix directly, plus `google/`, `models/`, `vx/`, and `vertex/` prefixes and a `@think=<level>` suffix.
-
-**Prefer one connection with the pool key.** Account rotation belongs to `gsb` because it is the only component that knows per-account quota, quarantine state, and conversation continuation affinity. A router that spreads requests across per-account connections cannot see any of that: it only learns about exhaustion from a `429`, and it will move the next turn to a different account, discarding the cached Gemini session. Use per-account connections only when you deliberately want to pin traffic to one account.
-
-The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures in [Security](#13-security).
-
-If your router caches or overrides model metadata, verify what survives:
+For **OMP**, an optional wait-timer extension is included:
 
 ```sh
-# Check the bridge alone (all fields required)
-./scripts/check-router-metadata.sh http://127.0.0.1:20133 public
-
-# Compare the bridge against the router; reports exactly which fields the router dropped
-./scripts/check-router-metadata.sh --compare \
-  http://127.0.0.1:20133 http://127.0.0.1:20130 - sk-router-key
+omp --extension ./scripts/omp-gsb-progress.ts
 ```
 
-The compare form distinguishes a bridge problem from a router problem. A router that drops `capabilities.thinkingLevels` is why a harness cannot render a low/medium/high selector, and the script names that field rather than blaming the bridge.
+### `9router`
 
-### 7.3 MCP clients
+Configure **one** OpenAI-compatible provider pointing to `http://127.0.0.1:20133/v1` with the **pool key** (let `gsb` handle account rotation and session affinity instead of creating per-account router connections). Verify metadata forwarding:
 
-`gsb` speaks MCP Streamable HTTP at `POST /mcp` (alias `/v1/mcp`) and exposes one tool, `web_search`.
+```sh
+./scripts/check-router-metadata.sh http://127.0.0.1:20133 public
+./scripts/check-router-metadata.sh --compare http://127.0.0.1:20133 http://127.0.0.1:20130 - sk-router-key
+```
+
+### MCP Client (`web_search`)
 
 ```json
 {
@@ -652,1082 +204,112 @@ The compare form distinguishes a bridge problem from a router problem. A router 
 }
 ```
 
-The endpoint accepts the pool key, a group key, or an account key. See [MCP server](#811-mcp-server) for protocol details.
-
-### 7.4 Coding agents
-
-For agent workflows, point the agent at the Chat Completions or Responses base URL with the pool key. When the prompt asks for an image, diagram, or video, `gsb` injects the server-side `generate_media` tool so the agent can save generated media directly into the workspace. See [Native image and video generation](#9-native-image-and-video-generation).
-
-For OMP, load the optional wait indicator from this checkout:
-
-```sh
-omp --extension ./scripts/omp-gsb-progress.ts
-```
-
-For `gsb/` models (including through 9router) or a direct provider named `gsb`, the indicator shows elapsed time until the first reasoning, text, or tool output. It is local to the terminal, not model reasoning or proof that upstream is making progress. Gemini Web reasoning and activity can stream only when Gemini sends them.
-
 ---
 
-## 8. API reference
-
-### 8.1 Authentication
-
-All `/v1/*` endpoints except `/v1/media/*` and `/v1/admin/*` use the same credential resolver. `/v1/admin/*` uses the admin key resolver. `/health`, `/readyz`, `/`, `/ui`, and `/media/*` have their own rules noted below; `/mcp` uses the API-key resolver.
-
-Accepted forms:
-
-```http
-Authorization: Bearer <key>
-x-api-key: <key>
-x-goog-api-key: <key>
-GET /v1/models?key=<key>
-```
-
-Admin routes additionally accept `X-GSB-Admin-Key`.
-
-Failure shape for a bad API key:
-
-```json
-{
-  "error": {
-    "message": "invalid api key",
-    "type": "authentication_error"
-  }
-}
-```
-
-Chat and Responses errors also include a `code` field. Simpler handlers such as `/v1/models`, `/v1/accounts`, `/v1/quota`, and the media proxy return only `message` and `type`.
-
-### 8.2 Common response headers
-
-Chat, Responses, and MCP responses can include:
-
-| Header | Meaning |
-|---|---|
-| `X-GSB-Account` | Account ID that served the request |
-| `X-GSB-Model` | Model ID used for the request |
-| `X-GSB-Attempt` | 1-based attempt number |
-| `X-GSB-Upstream-Status` | Last upstream HTTP status observed |
-| `X-GSB-Retry-Reason` | Why the last retry/failover happened (`model_substitution`, `session_busy`, `rate_limit_error`, …) |
-| `X-GSB-Duration-Ms` | MCP only: search duration |
-| `X-GSB-Sources` | MCP only: number of citations |
-| `Retry-After` | Seconds to wait when quota/rate limited |
-| `X-Resets-At` | RFC 3339 quota reset timestamp, when known |
-
-Chat and Responses can stream activity and interim reasoning summaries before the upstream model identity arrives. In `verified` mode, answer text and tool calls still wait for verification; a detected downgrade stops the stream. If no output is ready within `BRIDGE_EARLY_SSE_GRACE_MS` (20000 by default), both endpoints send headers and a keepalive ping. Set it to `0` to disable the timed flush.
-
-### 8.3 Error format and codes
-
-Non-streaming errors use HTTP status codes with the envelope above. Streaming requests can emit an error after HTTP 200; clients must inspect SSE events, not only the status line.
-
-| Code | Typical HTTP | Meaning |
-|---|---|---|
-| `invalid_request_error` | 400 | Malformed body, tool schema, image, or model field |
-| `authentication_error` | 401 | Invalid or missing API key |
-| `auth_unavailable` | 503 | No accounts configured or loaded |
-| `account_banned` | 403 | Upstream restricted the account (`TOS_VIOLATION` / `PERMISSION_DENIED`); account is quarantined |
-| `upstream_auth_error` | 401 | Saved Google session expired or rejected |
-| `auth_redirect` | 401 | Upstream redirected to Google sign-in |
-| `model_not_found` | 404 | Account cannot serve the requested model |
-| `model_substitution` | 429 | Upstream served a different model and downgrade rejection is enabled |
-| `model_identity_unknown` | 502 | Upstream did not identify the served model |
-| `model_identity_conflict` | 502 | Upstream reported conflicting served models |
-| `rate_limit_error` | 429 | Quota, RPM, concurrency, or session-busy limit |
-| `session_busy` | 429 | Transport session queue or wait timeout |
-| `tool_call_error` | 502 | Tool call missing, malformed, or schema-invalid |
-| `empty_upstream_response` | 502 | Upstream completed without an answer |
-| `incomplete_upstream_response` | 502 | Upstream ended before the candidate completed |
-| `upstream_error_reply` | 502 | Gemini returned a canned refusal/error text |
-| `upstream_revision` | 502 | Upstream changed an answer or tool call after part of it was already streamed |
-| `upstream_http_error` | 502+ | Upstream returned a non-2xx status |
-| `upstream_error` | 502 | Generic upstream failure type, also used by the media proxy |
-| `upstream_parse_error` | 502 | Malformed upstream frame |
-| `upstream_callback_error` | 502 | A frame callback failed while processing the stream |
-| `upstream_transport_error` | 502 | TLS/HTTP transport failure |
-| `model_discovery_error` | 502 | Upstream model registry was malformed or unavailable |
-| `upstream_connect_timeout` | 504 | First-byte timeout |
-| `upstream_timeout` | 504 | Overall upstream timeout |
-| `upstream_stalled` | 504 | No upstream data within `BRIDGE_STALL_TIMEOUT_MS`, or no new text, reasoning, media, final status, or changed activity within `BRIDGE_NO_FRAME_TIMEOUT_MS` before the candidate completes |
-| `upstream_degraded` | 502 | Gemini Web failed the turn or temporarily restricted the account (code 1185 / 1014); retrying on another account usually succeeds |
-| `upstream_transient` | 503 | Gemini reported a temporary model error (code 1013); retried automatically |
-| `upstream_upload_error` | 502 | Attachment upload failed |
-| `search_timeout` | 504 | MCP search deadline exceeded |
-| `media_generation_failed` | 502 | No media returned by upstream |
-| `not_found_error` | 404 | Unknown media ID or route |
-| `client_cancelled` | 499 | The caller disconnected or cancelled the request |
-| `server_error` | 500 | Local filesystem/state failure |
-| `remote_web_ui_locked` | 403 | Remote control-plane access while no admin key is configured |
-| `admin_auth_required` | 401 | Admin key required |
-| `admin_auth_rate_limited` | 429 | Too many failed admin auth attempts |
-| `cross_site_forbidden` | 403 | Cross-site admin request |
-
-`upstream_stalled` is usually a real silence, not a queue. A captured `gemini-4-carbon` turn with `reasoning_effort: high` and a ~108 KB prompt produced exactly one frame, `[{"37":[0]}]`, and no candidate for the full 75 s deadline; there was no queue-status block to distinguish it from a dead stream. Raise `BRIDGE_NO_FRAME_TIMEOUT_MS` only if that model class is expected to spend minutes before its first frame, and expect the larger prompts in that class to be the ones that trip it.
-
-For a pool-key request, a `429` may say that no pool account can serve the requested model and summarize unavailable accounts by reason (`exhausted`, `substitution_cooldown`, `cooling`, `rate_limited`, `busy`, `model_unavailable`, `quarantined`). The message reports counts rather than emails or credentials; use `/v1/accounts?live=1` for per-account detail. Account-key requests keep the precise account-specific error.
-
-### 8.4 Health and readiness
+## API Reference
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/health` | None | `{status, service, transport, profile, accounts, models, upstream}`; proves the daemon is running, not that upstream generation works |
-| `GET` | `/` | None | `/health` when the Web UI is disabled; the UI when enabled |
-| `GET` | `/readyz` | None | Per-account `models_fresh`, `quota_fresh`, `auth_ok`, `quarantined`; `?strict=1` returns `503` when no healthy account is available |
-
-`/readyz` reports `degraded` when there are no accounts, no healthy account, any quarantined account, or fewer healthy accounts than loaded accounts. A model list is considered fresh for twice `BRIDGE_MODEL_REFRESH_MS`; quota is fresh for 30 minutes.
-
-### 8.5 Models
-
-```http
-GET /v1/models
-GET /v1/models?fresh=1
-```
-
-Returns an OpenAI-style list plus OpenRouter-style metadata:
-
-- `id`, `display_name`, `description`, `aliases`
-- `context_length`, `context_window`, `max_output_tokens`, `max_completion_tokens`
-- `reasoning`, `supported_parameters`
-- `architecture`, `top_provider`, `pricing`
-- `thinking` (`mode`, `default`, `defaultLevel`, `efforts`, `requiresEffort`)
-- `capabilities` (`vision`, `search`, `tools`, `reasoning`, `thinkingLevels`, `defaultThinkingLevel`, `limitsSource`, …)
-
-Responses carry an `ETag`; send `If-None-Match` to get `304`. The HTTP response is cacheable for 60 seconds (`Cache-Control: max-age=60`), while the per-account upstream model registry is cached for 10 minutes and refreshed in the background every `BRIDGE_MODEL_REFRESH_MS`. `?fresh=1` forces live discovery.
-
-Model IDs are whatever Gemini Web currently advertises, for example `gemini-4-hydrogen`, `gemini-hydrogen-thinking`, `gemini-pro`, `gemini-flash-lite`, `gemini-argon`, `gemini-carbon`, or the free tier's `gemini-auto`. Aliases and display names are matched too. Prefixes `gsb/`, `google/`, `models/`, `vx/`, and `vertex/` are stripped before matching; a `@think=<level>` suffix sets thinking effort for that request.
-
-`gemini-auto` is an aggregator tier rather than one fixed model: upstream picks a backing model per request and labels the answer with the model it chose, so an `Auto` request commonly comes back labelled `3.5 Flash-Lite`. That is its documented behaviour, not a substitution, and the label guard and `BRIDGE_REJECT_LABEL_MISMATCH` both leave it alone. Every other tier answers under its own label.
-
-Upstream renames a model in place without notice: on 2026-11-10 the frontier tier moved from `gemini-argon` to `gemini-carbon`, and on 2026-11-13 the everyday tier moved from `3.8 Flash` to `4 Hydrogen` while `4 Argon` became the code-and-analysis tier. A name that upstream has stopped advertising no longer resolves and returns `404 model_not_found`. Pin clients to a name after checking `GET /v1/models` rather than assuming one lasts across an upstream release.
-
-`gsb --models-json` prints the same payload without starting the daemon. With no loaded accounts it prints a static fallback list.
-
-### 8.6 Accounts, quota, sessions, refresh
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/v1/accounts` | Account IDs, emails, computed `status`/`statusReason`, failures, timestamps, provenance, quarantine/disabled state, models, quota buckets, `quotaWindow`, load telemetry. `?live=1` or `?fresh=1` refreshes upstream first |
-| `GET` | `/v1/quota` | Cached quota buckets; `?fresh=1` queries upstream. A cold cache triggers a refresh automatically |
-| `GET` | `/v1/sessions` | Transport session status (`ready`, `busy`, `queued`, `active`, `stale`, `idleSec`) plus continuation cache hits/misses |
-| `POST` | `/v1/refresh` | Reloads credential files and refreshes the model registry. Rejects requests carrying an `Origin` header |
-
-Account objects include:
-
-```json
-{
-  "id": "acc1",
-  "email": "user@example.com",
-  "status": "ok",
-  "statusReason": "",
-  "capacity": 2,
-  "fails": 0,
-  "lastError": "",
-  "lastFailAt": "",
-  "models": ["gemini-flash", "gemini-pro"],
-  "quota": [{"id": "5h", "label": "5h Window", "total": 2400, "remaining": 2310, "resetAt": "…"}],
-  "quotaWindow": {"scope": "rolling", "label": "5h", "nestedUnderWeekly": true, "weeklyExposed": true},
-  "capturedAt": "…",
-  "rotatedAt": "…",
-  "modelsAt": "…",
-  "quotaAt": "…",
-  "lastUsedAt": "…",
-  "quarantined": false,
-  "quarantineReason": "",
-  "disabled": false,
-  "accountGroup": "team-a",
-  "importedFrom": "web-ui",
-  "profileId": "cookie-export",
-  "proxyConfigured": true,
-  "activeStreams": 0,
-  "recentRpm": 0,
-  "peakRpm": 1,
-  "totalRequests": 12,
-  "offloadRequests": 0,
-  "surfaces": {"geminiWeb": "ok"}
-}
-```
-
-### 8.7 Chat Completions
-
-```http
-POST /v1/chat/completions
-Content-Type: application/json
-```
-
-Minimal request:
-
-```json
-{
-  "model": "gemini-flash",
-  "messages": [{ "role": "user", "content": "Reply with OK." }]
-}
-```
-
-Accepted fields:
-
-| Field | Notes |
-|---|---|
-| `model` | Optional; empty uses the first model on the selected account. Supports router prefixes and `@think=` |
-| `messages` | Required, non-empty array. Roles: `system`, `developer`, `user`, `assistant`, `tool`, `function` |
-| `stream` | Boolean; SSE when true |
-| `tools` | Array of `{"type":"function","function":{name,description,parameters}}`. Tool names match `^[A-Za-z0-9_.:-]{1,128}$`; duplicates are rejected |
-| `tool_choice` | `auto`, `none`, `required`, or `{"type":"function","function":{"name":"…"}}` |
-| `temporary` | Boolean; requests a temporary Gemini conversation and skips continuation-cache reuse |
-| `reasoning_effort` | `low`, `medium`, `high` (also numeric aliases) |
-| `thinking_level`, `thinkingLevel` | Aliases for the effort |
-| `reasoning` | Object: `enabled`, `effort`, `level` |
-| `thinking` | Object: `enabled`, `type`, `effort`, `level`, `thinkingLevel`, `budget_tokens` |
-| `thinking_budget` | Token budget mapped to `low` ≤4096, `medium` ≤16384, `high` above |
-| `thinkingConfig`, `generationConfig.thinkingConfig` | `thinkingLevel` or `thinkingBudget` |
-| `output_config` | `effort` |
-
-Sampling parameters `temperature`, `top_p`, and `seed` are accepted but ignored: Gemini Web exposes no equivalent. Output controls are enforced by the bridge instead of upstream — `max_tokens` / `max_completion_tokens` cut the answer and set `finish_reason: "length"`, `stop` cuts at the first matching sequence, and `response_format` (`{"type": "json_object"}` or `{"type": "json_schema"}`) returns an unwrapped JSON object. `max_tokens` and `stop` keep incremental streaming (only the prefix inside the limit is emitted, holding back any trailing partial `stop` prefix until resolved), whereas `response_format` is buffered and emitted once at the end because a JSON object cannot be unwrapped before it is complete.
-
-Message content can be a string or an array of parts. Supported image shapes:
-
-```json
-{ "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
-{ "type": "input_image", "image_url": "https://example.com/image.png" }
-{ "type": "image", "data": "<base64>", "mimeType": "image/png" }
-```
-
-Remote images are limited to 20 MiB, follow at most 5 redirects, and reject private/loopback destinations unless `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS=1`.
-
-The total request body is limited to 32 MiB.
-
-#### Streaming Chat
-
-Use `curl -N` to avoid buffering:
-
-```sh
-curl -N -sS http://127.0.0.1:20133/v1/chat/completions \
-  -H 'Authorization: Bearer gsb-acc1' \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"reasoning_effort\":\"high\",\"messages\":[{\"role\":\"user\",\"content\":\"Explain how this bridge works.\"}]}"
-```
-
-Wire format:
-
-- `data: {"object":"chat.completion.chunk", ...}` events
-- a first role-only delta (`{"role":"assistant","content":""}`)
-- text in `choices[0].delta.content`
-- reasoning in `choices[0].delta.reasoning_content` when extracted and enabled
-- tool calls in `choices[0].delta.tool_calls`
-- a final chunk with `finish_reason` (`stop` or `tool_calls`) and `usage`
-- `data: [DONE]`
-- `: ping` comments every 15 seconds
-
-`usage` is included on the final chunk regardless of `stream_options`.
-
-Streaming behavior:
-
-- The first client-visible delta is held until the served model identity is verified when downgrade rejection is enabled; `BRIDGE_STREAM_BUFFER=eager` or `BRIDGE_REJECT_DOWNGRADE=0` relaxes that.
-- With tools enabled, prose answers longer than 240 bytes stream live once identity is verified. Mid-answer tool envelopes and fenced look-alikes stay out of the streamed prefix until parsing commits the turn; quoted envelope examples pass through as text.
-- `BRIDGE_LIVE_TOOL_CALLS=false` (default) buffers and validates the complete tool call before emitting it; `true` emits incremental deltas and cannot repair a late upstream revision.
-- `BRIDGE_LIVE_THOUGHTS=false` suppresses `reasoning_content` without changing the upstream thinking level.
-- Errors can arrive after HTTP 200 as `data: {"error":{...}}`; inspect the stream, not just the status code.
-
-#### Non-streaming Chat
-
-```json
-{
-  "id": "chatcmpl-…",
-  "object": "chat.completion",
-  "created": 1760000000,
-  "model": "gemini-flash",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "OK",
-        "reasoning_content": "…",
-        "tool_calls": []
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 12,
-    "completion_tokens": 3,
-    "total_tokens": 15,
-    "prompt_tokens_details": { "cached_tokens": 0 }
-  }
-}
-```
-
-If the served model differs from the requested one, the payload also includes `requested_model` and `model_served`.
-The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`, in which case the relabel ends the stream on the first frame that carries it and a pool request fails over to another account instead of waiting out the generation. Router tiers are exempt: `gemini-auto` (the free tier's `Auto — adapts to your needs` entry, id `cf41b0e0dd7d53e5` on the 2026-11-13 registry) picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is its documented behaviour rather than a relabel.
-
-#### Function calling behavior
-
-Function calling is prompt-based, not native Gemini function calling. `gsb` renders the tool definitions into the prompt, asks the model for a JSON tool-call envelope, parses it, validates it against the tool's JSON Schema, and emits OpenAI-style calls. The client executes the tools.
-
-Validation covers `type` (including unions), `enum`, `const`, local `$ref`, string length/pattern, numeric bounds and `multipleOf`, array bounds and `uniqueItems`, object `required`/`additionalProperties`, and `allOf`/`anyOf`/`oneOf`/`not`/`nullable`.
-
-- **Anti-leak tool parsing**: multi-line fenced `tool_calls` blocks remain recognized even when a model glues trailing chatter onto the closing fence (e.g. ```` ```Groq ````) or glues an opening ```` ```json ```` block after a sentence period, while duplicate adjacent tool blocks are deduplicated automatically.
-- Before validation, `gsb` coerces common model mistakes into the declared types (`"42"` → `42`, `"true"` → `true`, JSON-encoded objects/arrays in strings including `"[]"`, scalar → single-element array). It also strips stray closing braces/brackets, removes trailing commas, quotes bare identifier keys, repairs string escapes, and retries truncated envelopes or invented refusals.
-
-An invented refusal is detected from the **opening** of the reply (first 2000 bytes), not the whole reply. The shape this catches is the one the model actually produces when it gives up on tools: a one-line claim that the tool budget is spent, followed by step-by-step manual instructions. That reply is a `tool_call_error` and is retried with a correction note, so it never reaches the client as a final answer. A long genuine answer that only mentions a tool budget further down stays an answer. Refusals are also dropped from assistant history, so a fabricated budget claim cannot poison the next turn.
-
-A schema-invalid call returns `tool_call_error`. To force a function, use `tool_choice: {"type":"function","function":{"name":"get_status"}}` for Chat or `{"type":"function","name":"get_status"}` for Responses. The bridge returns calls; it never executes your functions. Append the assistant call and matching tool result to the next request's history.
-
-### 8.8 Responses
-
-```http
-POST /v1/responses
-Content-Type: application/json
-```
-
-```json
-{
-  "model": "gemini-flash",
-  "instructions": "Keep answers concise.",
-  "input": "Explain how this bridge works."
-}
-```
-
-`input` accepts:
-
-- a string,
-- an array of items (`message`, `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `reasoning`, `input_text`, `input_image`, `image`),
-- or `messages` as a fallback.
-
-`instructions` becomes a system message. `tools` accepts flat Responses definitions (`{type:"function", name, description, parameters}`), nested Chat-style definitions, `custom` tools, `local_shell`, and `namespace` wrappers. `tool_choice` accepts `auto`, `none`, `required`, or `{type:"function", name}`.
-
-`max_output_tokens` caps estimated answer tokens. Hitting the cap sets `status: "incomplete"` and `incomplete_details.reason: "max_output_tokens"`. `stop` cuts at the earliest match. `text.format.type` values `json_object` and `json_schema` unwrap the JSON object; this does not guarantee schema validation.
-
-For multi-turn calls, resend the conversation in `input`, including assistant output and any `function_call` / `function_call_output` items. The bridge's internal continuation cache is separate from OpenAI's `previous_response_id` feature.
-
-Output items:
-
-- `reasoning` with a `summary` array
-- `message` with `output_text` content
-- `function_call` with `call_id`, `name`, `arguments`
-- `custom_tool_call` with `call_id`, `name`, `input`
-
-#### Streaming Responses
-
-Set `stream: true`. The wire format is named SSE events:
-
-```
-event: response.created
-data: {"type":"response.created","response":{...},"sequence_number":1}
-```
-
-Events include:
-
-- `response.created`
-- `response.in_progress`
-- `response.output_item.added`
-- `response.content_part.added`
-- `response.output_text.delta`
-- `response.output_text.done`
-- `response.content_part.done`
-- `response.reasoning_summary_part.added`
-- `response.reasoning_summary_text.delta`
-- `response.reasoning_summary_text.done`
-- `response.reasoning_summary_part.done`
-- `response.function_call_arguments.delta`
-- `response.function_call_arguments.done`
-- `response.custom_tool_call_input.delta`
-- `response.custom_tool_call_input.done`
-- `response.output_item.done`
-- `response.completed`
-
-The stream ends with `response.completed`, `response.incomplete` (output cap), or an `error` event after headers have been sent. There is no `[DONE]` marker. `: ping` comments keep idle connections open.
-
-### 8.9 Images and videos
-
-#### `POST /v1/images/generations`
-
-```sh
-curl -sS http://127.0.0.1:20133/v1/images/generations \
-  -H 'Authorization: Bearer public' \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Minimalist flat vector architecture diagram of an API bridge in light mode","aspect_ratio":"16:9","format":"png","response_format":"url"}'
-```
-
-Fields:
-
-| Field | Notes |
-|---|---|
-| `prompt` | Required |
-| `model` | Optional. Empty, `dall-e*`, `gpt-image*`, `imagen*`, and `veo*` map to `gemini-pro` |
-| `response_format` | `url` (default) or `b64_json` |
-| `size` | Parsed as `WxH` and snapped to the nearest supported ratio (e.g. `1280x720` → `16:9`); `auto` is accepted and ignored |
-| `aspect_ratio` | `1:1`, `16:9`, `9:16`, `4:3`, `3:4` (also `square`, `landscape`, `portrait`, or any `W:H`, snapped to the nearest supported ratio) |
-| `format` / `output_format` | `png` (lossless `=s0-rp`), `jpeg` (original `=s0-d`), or `gif` |
-
-`size` and `aspect_ratio` must agree when both are sent; a conflict or a malformed value returns `400 invalid_request_error`. The generator decides the final dimensions, so the response reports the *produced* `width`, `height`, `size`, and the ratio they resolve to rather than echoing the request.
-
-Response:
-
-```json
-{
-  "created": 1760000000,
-  "data": [
-    {
-      "url": "http://127.0.0.1:20133/v1/media/<id>.png",
-      "revised_prompt": "…",
-      "mime_type": "image/png",
-      "aspect_ratio": "16:9",
-      "width": 1376,
-      "height": 768,
-      "size": "1376x768"
-    }
-  ]
-}
-```
-
-`b64_json` is added when requested and the bytes are available.
-
-Media URLs use the request's `Host` and connection scheme. A reverse proxy should preserve the public Host; untrusted `X-Forwarded-*` values do not set download URLs.
-
-#### `POST /v1/videos/generations`
-
-```sh
-curl -sS --max-time 240 http://127.0.0.1:20133/v1/videos/generations \
-  -H 'Authorization: Bearer public' \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"A glowing neon paper airplane flying smoothly through a rainy cyberpunk alley at night","aspect_ratio":"16:9","duration":10}'
-```
-
-Returns Veo MP4 with audio plus `thumbnail_url`. Video generation is slow; give the client a generous timeout (measured runs are commonly 60–150 seconds).
-
-### 8.10 Media proxy
-
-```http
-GET /v1/media/<id>
-GET /media/<id>
-```
-
-Serves cached generated images and videos. This endpoint is unauthenticated; share media URLs only with intended recipients. Unknown content types are served as downloads, not rendered as pages.
-
-Unknown, expired, or evicted IDs return `404`. The in-memory cache holds up to 96 entries and 128 MiB for at most 24 hours. Restarting `gsb` invalidates old URLs.
-
-### 8.11 MCP server
-
-```http
-POST /mcp
-POST /v1/mcp
-```
-
-Protocol: MCP Streamable HTTP over JSON-RPC 2.0, protocol version `2025-06-18` (the server echoes the client's requested version on `initialize`).
-
-Behavior:
-
-- `POST` only; `GET` returns `405` because there is no server-initiated stream.
-- `OPTIONS` returns CORS preflight headers.
-- Notifications (messages without an `id`) return HTTP `202` with an empty body.
-- Request body limit: 8 MiB.
-- Methods: `initialize`, `ping`, `tools/list`, `tools/call`.
-- `tools/list` returns one tool, `web_search`.
-- Unknown methods return JSON-RPC `-32601`; invalid params `-32602`; parse errors `-32700`.
-- JSON-RPC errors are returned with HTTP `200`; check the `error` object.
-
-`web_search` arguments:
-
-| Argument | Required | Notes |
-|---|---|---|
-| `query` | Yes | Search query or question |
-| `model` | No | Any id from `GET /v1/models`; omit to use the account's default model |
-| `timeout_seconds` | No | 10–600 seconds; defaults to `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
-
-A search runs as a temporary chat on the same account pool, quota accounting, and failover as normal requests. It does not add threads to the user's Gemini history. The result text is the synthesized answer followed by a `Sources:` list; snippets are included when Gemini provided them.
-
-A grounded answer is a full model turn, not a search-API lookup. Measured searches on a live pool took **14–110 seconds**, so give the client a generous timeout. Cutting a search short throws away the quota it already spent.
-
-```sh
-curl -sS --max-time 240 http://127.0.0.1:20133/mcp \
-  -H 'Authorization: Bearer public' \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"latest Go release notes","timeout_seconds":180}}}'
-```
-
-### 8.12 Endpoint index
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| `GET` | `/` | None | Health JSON, or the Web UI when enabled |
-| `GET` | `/dashboard` | UI gate | Alias for `/ui` |
-| `GET` | `/ui`, `/ui/` | UI gate | Embedded Web Control Plane |
-| `GET` | `/health` | None | Liveness and counts |
-| `GET` | `/readyz` | None | Per-account readiness; `?strict=1` |
-| `GET` | `/v1/models`, `/models` | API key | Model catalog with metadata and ETag |
-| `POST` | `/v1/chat/completions`, `/chat/completions` | API key | Chat Completions |
-| `POST` | `/v1/responses`, `/responses` | API key | Responses |
-| `POST` | `/v1/images/generations`, `/images/generations` | API key | Image generation |
-| `POST` | `/v1/videos/generations`, `/videos/generations` | API key | Video generation |
-| `GET`/`HEAD` | `/v1/media/<id>`, `/media/<id>` | None | Generated media proxy |
-| `POST` | `/mcp`, `/v1/mcp` | API key | MCP Streamable HTTP |
-| `GET` | `/v1/accounts`, `/accounts` | API key | Account state; `?live=1` |
-| `GET` | `/v1/quota`, `/quota` | API key | Quota buckets; `?fresh=1` |
-| `GET` | `/v1/sessions`, `/sessions` | API key | Transport and cache status |
-| `POST` | `/v1/refresh`, `/refresh` | API key | Reload credentials and models |
-| `*` | `/v1/admin/*` | Admin key | Control-plane API (UI enabled only) |
-
-Unknown routes return `404` with `invalid_request_error`.
+| `GET` | `/ui`, `/dashboard` | UI gate | Embedded Web Control Plane |
+| `GET` | `/health`, `/readyz` | None | Health check & per-account readiness (`?strict=1`) |
+| `GET` | `/v1/models` | API key | Live model catalog with capabilities & `ETag` (`?fresh=1`) |
+| `POST` | `/v1/chat/completions` | API key | Chat Completions (JSON or SSE, `tools`, `reasoning_effort`, images) |
+| `POST` | `/v1/responses` | API key | Responses API (`input`, `instructions`, `tools`, named SSE events) |
+| `POST` | `/v1/images/generations` | API key | Generate images (`url` or `b64_json`, `aspect_ratio`, `size`, `format`) |
+| `POST` | `/v1/videos/generations` | API key | Generate Veo MP4 videos with audio (`aspect_ratio`, `duration`) |
+| `GET` | `/v1/media/<id>` | None | Local proxy for generated images & videos (24h in-memory cache) |
+| `POST` | `/mcp`, `/v1/mcp` | API key | MCP Streamable HTTP (`web_search` tool) |
+| `GET` | `/v1/accounts`, `/v1/quota`, `/v1/sessions` | API key | Account health/status, 5h/7d quotas (`?live=1` / `?fresh=1`), H2/cache state |
+| `POST` | `/v1/refresh` | API key | Reload credential files and refresh models (rejects browser `Origin`) |
+| `*` | `/v1/admin/*` | Admin key | Web UI runtime config & account control API |
+
+### Native Media Generation in Coding Agents
+
+When a request includes `tools` (with `tool_choice` unset or `auto`) and recent user messages ask for an image, diagram, or video, `gsb` automatically injects `generate_media` and returns local `/v1/media/<id>` URLs plus a ready-to-run download command.
 
 ---
 
-## 9. Native image and video generation
+## Configuration
 
-`gsb` exposes Gemini Web's native image generation (**Nano Banana / Imagen**) and video generation (**Veo MP4 with audio**) across three surfaces. Because upstream `lh3.googleusercontent.com` and `contribution.usercontent.google.com` media URLs require authenticated Google session cookies, `gsb` automatically registers and serves generated media through `GET /v1/media/<id>`.
+Settings load from environment variables first, then `$BRIDGE_HOME/config.env` (`0600`), then built-in defaults. Settings in the **Runtime** group can also be edited live in the Web UI.
 
-### 9.1 Coding Agent Mode (`tools` enabled)
-
-When a coding agent (`OpenCode`, `OMP`, `Cursor`, `Cline`, etc.) sends a Chat Completions or Responses request with `tools`, and the prompt asks for an image, diagram, illustration, or video, `gsb` injects a server-side tool named `generate_media`. Non-media coding turns are left untouched so `SessionCache` hits are preserved.
-
-Injection happens only when:
-
-- the request has at least one client tool and `tool_choice` is `auto` or unset, and
-- the last three user messages contain explicit media intent, or the history already contains a `generate_media` call.
-
-Supported `generate_media` parameters:
-
-| Parameter | Type | Notes |
+| Variable | Default | Description |
 |---|---|---|
-| `media_type` | `"image"` \| `"video"` | Required |
-| `prompt` | string | Required; detailed visual description |
-| `aspect_ratio` | `"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"` | Optional |
-| `format` | `"png"`, `"jpeg"`, `"gif"` | `png` uses lossless `=s0-rp`, `jpeg` uses original `=s0-d` |
-| `duration` | `10`, `15`, `30` | Video only |
-| `output_path` | string | Optional relative filename in the workspace |
+| `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `20133` | Listen host and port (`HOST`/`PORT` also supported) |
+| `BRIDGE_HOME` | `~/.gemini-stealth-bridge` | Directory for `accounts/*.json`, `config.env`, and `session-cache.json` |
+| `BRIDGE_API_KEY` / `BRIDGE_ADMIN_KEY` | `public` / empty | Pool API key and admin key for remote `/ui` & `/v1/admin/*` |
+| `BRIDGE_WEB_UI` | `false` (`1` in `start.sh`/Docker) | Enable `/ui` and `/v1/admin/*` |
+| `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing: `rotate`, `lru`, or `fill-first` |
+| `BRIDGE_ACCOUNT_PRIORITY` | empty | Comma-separated account order for `fill-first` & UI ranking |
+| `BRIDGE_QUOTA_PREFLIGHT` | `strict` | `strict` skips spent accounts, `advisory` logs, `off` disables |
+| `BRIDGE_DEFAULT_THINKING` | `low` | Default thinking effort: `low`, `medium`, `high` |
+| `BRIDGE_MAX_RPM_PER_ACCOUNT` / `..._CONCURRENT_...` | `24` / `2` | Per-account rolling RPM and active stream caps (`0` disables) |
+| `BRIDGE_REJECT_DOWNGRADE` / `..._LABEL_MISMATCH` | `true` / `false` | Failover/reject if upstream silently serves another model or label |
+| `BRIDGE_LIVE_THOUGHTS` / `BRIDGE_LIVE_TOOL_CALLS` | `true` / `false` | Stream `reasoning_content`; validate complete tool calls vs deltas |
+| `BRIDGE_HISTORY_OFFLOAD` / `BRIDGE_SESSION_CACHE` | `true` / `true` | Offload long history as attachments; persist continuation metadata |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` / `BRIDGE_STALL_TIMEOUT_MS` | `75000` / `90000` | Liveness and inter-frame stream deadlines |
+| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Flush SSE keepalive headers while waiting for slow reasoning turns |
+| `BRIDGE_PROXY_SERVER` / `BRIDGE_EGRESS_PER_ACCOUNT` | empty | Global or per-account (`id:url`) HTTP/SOCKS5 outbound proxy |
+| `BRIDGE_IMPERSONATE` | `chrome_150_psk` | uTLS fingerprint (`chrome_152_psk`, `chrome_150_psk`, `firefox_148`, …) |
+| `BRIDGE_LOG_REQUESTS` | `false` | Log one redacted JSON telemetry line per request |
 
-When the model invokes `generate_media` (or Gemini Web's native generator returns media directly on a tool-enabled turn):
-
-1. `gsb` runs the generation on Gemini Web and downloads full-resolution media (`=s0-d` / `=s0-rp`), following both HTTP redirects and application-level `text/plain` URL redirects.
-2. `gsb` caches and serves the file at `http://127.0.0.1:20133/v1/media/<id>.png|.jpg|.mp4`.
-3. `gsb` feeds a tool result back into a continuation turn with `url`, `urls`, `revised_prompt`, `markdown`, `suggested_filename`, and a ready-to-run `local_download_cmd` (`curl`), so the coding agent can save the file into the user's workspace.
-
-If generation fails on the selected account, a pool or group request retries on other eligible accounts.
-
-### 9.2 Direct Chat / Responses (without tools)
-
-Ask for an image or video in a normal chat request; `gsb` enables Gemini Web's media extensions and rewrites returned Markdown URLs to local `/v1/media/<id>` URLs. The rewritten URL opens or downloads without Google cookies.
-
-### 9.3 Dedicated OpenAI media endpoints
-
-Use `POST /v1/images/generations` and `POST /v1/videos/generations` as documented in [Images and videos](#89-images-and-videos). These endpoints run a dedicated generation turn, do not require client tools, and return OpenAI-style `data` arrays.
+Run `./gsb --check-config` to verify your configuration. For all advanced variables, see [`AGENTS.md`](./AGENTS.md).
 
 ---
 
-## 10. Web search grounding
+## Docker & Security
 
-When Gemini Web answers with Google Search grounding, `gsb` extracts the citations and appends them to the answer:
-
-```
-<answer text>
-
----
-Sources:
-1. Article title — https://example.com/article
-2. Another page — https://example.com/other
-```
-
-- `BRIDGE_INCLUDE_GROUNDING=0` returns the answer without the citation list.
-- The MCP `web_search` result uses the same `Sources:` block and additionally includes a snippet line for each source when Gemini provided one.
-- Citations are merged across streaming frames and deduplicated.
-- Grounding does not require a special request flag; it is whatever Gemini Web decided to do for that turn.
-
-The built-in MCP server is documented in [MCP server](#811-mcp-server).
-
----
-
-## 11. Configuration reference
-
-### 11.1 Precedence and files
-
-Configuration is read from:
-
-1. process environment variables,
-2. `$BRIDGE_HOME/config.env` (dotenv-style `KEY=VALUE`; `export ` prefixes and surrounding quotes are accepted),
-3. built-in defaults.
-
-`$BRIDGE_HOME/config.env` is written atomically with mode `0600` by the Web UI and admin API. `HOST`/`PORT` are accepted as fallbacks when `BRIDGE_HOST`/`BRIDGE_PORT` are empty.
-
-Boolean values accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
-
-Duration values are milliseconds unless the variable name says otherwise.
-### 11.1a What should users change?
-
-| Scope | Examples | Recommendation |
-|---|---|---|
-| Per request | `model`, `reasoning_effort`, `thinking_level`, `stream`, `tools`, `tool_choice`, `max_tokens`, `stop`, `response_format`, `temporary` | Choose for one turn or one client. No daemon restart. |
-| Safe runtime | `BRIDGE_ACCOUNT_STRATEGY`, `BRIDGE_ACCOUNT_PRIORITY`, `BRIDGE_QUOTA_PREFLIGHT`, `BRIDGE_DEFAULT_THINKING`, `BRIDGE_MAX_RPM_PER_ACCOUNT`, `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT`, `BRIDGE_LIVE_THOUGHTS`, `BRIDGE_LIVE_TOOL_CALLS`, `BRIDGE_TOOL_PREAMBLE`, `BRIDGE_HISTORY_OFFLOAD`, `BRIDGE_REJECT_DOWNGRADE`, `BRIDGE_REJECT_LABEL_MISMATCH` | Change through Configuration UI/admin API. Defaults are recommended. |
-| Advanced runtime | `BRIDGE_STREAM_BUFFER`, `BRIDGE_EARLY_SSE`, `BRIDGE_EARLY_SSE_GRACE_MS`, `BRIDGE_MAX_ATTEMPTS`, `BRIDGE_MAX_UPSTREAM_ATTEMPTS`, `BRIDGE_RETRY_BUDGET_MS`, `BRIDGE_MAX_SESSIONS`, `BRIDGE_MAX_QUEUE`, `BRIDGE_SESSION_WAIT_MS` | Tune only after reading request timing and retry headers. Wrong values can hide model identity or increase upstream load. |
-| Deployment/security | `HOST`, `PORT`, `BRIDGE_HOME`, `BRIDGE_API_KEY`, `BRIDGE_ADMIN_KEY`, account/group tokens, proxies, TLS profile, IPv6, private image URLs | Set in service environment or `config.env`. Keep secrets out of chat, logs, and commits. |
-| Fixed behavior | Tool-schema validation, SSRF checks, cookie file permissions, account quarantine, automatic degraded recheck | Not user toggles. Change only in code when behavior is proven wrong. |
-
-Recommended starting point: `rotate` + `strict` + thinking `low` + live thoughts enabled + live tool calls disabled + session cache/history offload enabled + downgrade rejection enabled. Raise thinking per request instead of changing daemon default.
-
-
-`gsb --check-config` validates the environment and exits.
-
-### 11.2 Listener, home, and identity
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `HOST` / `BRIDGE_HOST` | `127.0.0.1` | Listen address |
-| `PORT` / `BRIDGE_PORT` | `20133` | Listen port |
-| `BRIDGE_HOME` | `~/.gemini-stealth-bridge` | Root for account files, `config.env`, and continuation cache |
-| `BRIDGE_API_KEY` | `public` | Pool key. `public` also permits unauthenticated requests |
-| `BRIDGE_ADMIN_KEY` | Empty | Dedicated admin key for `/v1/admin/*` and remote `/ui`. When empty, a non-public `BRIDGE_API_KEY` is used as the admin key |
-| `BRIDGE_ACCOUNT_TOKENS` | Empty | `token:account_id` pairs for custom account keys |
-| `BRIDGE_GROUP_TOKENS` | Empty | `token:group_name` pairs for group keys |
-| `BRIDGE_ACCOUNT_GROUP` | Empty | `account_id:group_name` assignments |
-| `BRIDGE_WEB_UI` | `false` (`1` in `start.sh` and Docker) | Enable `/ui` and `/v1/admin/*` |
-| `WEB_CRED_FILE` | `$BRIDGE_HOME/web-credentials.json` | Parsed for compatibility but not used by the credential loader. The loader always reads `$BRIDGE_HOME/web-credentials.json` and every `$BRIDGE_HOME/accounts/*.json` |
-
-### 11.3 Credentials and onboarding
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `CHROME_COOKIES` | Empty | Browser cookie database/profile hint for import/login; also enables a live-cookie fallback when no saved accounts load |
-| `CHROME_PASS` | Empty | Browser cookie-encryption password override (not your Google password); treat as a secret |
-| `BRIDGE_LOCALE` | `en` | Gemini language and `Accept-Language` base |
-| `BRIDGE_PROTOCOL_MODE` | `bridge` | Payload shape: `bridge` or `web`. `web` changes the consumer-tool and personal-context flags for tool-free requests |
-| `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flags: `auto` (off in `bridge`, on in pure `web`), `on`, `off` |
-| `BRIDGE_BL_OVERRIDE` | Empty | Raw `bl` token override for diagnostics; logged when used |
-
-### 11.4 Egress and transport
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_PROXY_SERVER` | Empty | Outbound HTTP or SOCKS5 proxy URL for Gemini transport, used by accounts without their own proxy |
-| `BRIDGE_EGRESS_PER_ACCOUNT` | Empty | `account_id:proxy_url` pairs; overrides `BRIDGE_PROXY_SERVER` per account |
-| `BRIDGE_IMPERSONATE` | `chrome_150_psk` | uTLS profile. See [TLS profiles](#115-tls-profiles) |
-| `BRIDGE_UA_OS` | Host OS | Override the OS string in User-Agent / `Sec-CH-UA*`: `linux`, `windows`, `macos` |
-| `BRIDGE_TLS_EXT_ORDER` | `fixed` | TLS extension order: `fixed` or `random` |
-| `BRIDGE_FOLLOW_REDIRECTS` | `true` | Follow upstream HTTP redirects |
-| `BRIDGE_IPV6` | `auto` | `auto`, `off`, or `on` |
-| `BRIDGE_DISABLE_IPV6` | Empty | `1` sets the default IPv6 mode to `off` when `BRIDGE_IPV6` is unset |
-| `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS` | Disabled | Exactly `1` permits private/loopback image destinations; weakens SSRF protection |
-| `BRIDGE_MAX_SESSIONS` | `16` | Transport session pool limit |
-| `BRIDGE_MAX_QUEUE` | `4` | Per-session wait-queue bound |
-| `BRIDGE_SESSION_WAIT_MS` | `10000` | Wait timeout for an available transport session |
-| `BRIDGE_IDLE_SESSION_MS` | `180000` | Idle transport-session expiry |
-
-### 11.5 TLS profiles
-
-`BRIDGE_IMPERSONATE` accepts:
-
-`chrome_152_psk`, `chrome_152`, `chrome_150_psk` (default; aliases `chrome150_psk`, `chrome_latest`, empty), `chrome_150`, `chrome_146_psk`, `chrome_146`, `chrome_144_psk`, `chrome_144`, `chrome_133_psk`, `chrome_133`, `chrome_131_psk`, `chrome_131`, `brave_146_psk` / `brave`, `firefox_148` / `firefox`, `firefox_147_psk`, `safari_16_0` / `safari`.
-
-An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` version numbers are derived from the profile name.
-
-### 11.6 Routing and quota
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | `rotate`, `lru`, or `fill-first` |
-| `BRIDGE_ACCOUNT_PRIORITY` | Empty | Comma-separated account IDs for `fill-first` and UI order |
-| `BRIDGE_QUOTA_PREFLIGHT` | `strict` | `strict` skips spent accounts, `advisory` logs and proceeds, `off` disables the check. With `BRIDGE_REJECT_DOWNGRADE=0`, `strict` is also skipped: quota is only enforced by the upstream response |
-| `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | Per-account requests per rolling minute; `0` disables |
-| `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active streams; `0` disables |
-| `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject detected upstream model substitution instead of silently returning another model. Keep enabled for predictable model selection |
-| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject a different served tier label when backend id matches. Keep off unless strict tier naming matters; Google can rename tiers in place |
-| `BRIDGE_QUIET_HOURS` | Empty | `HH:MM-HH:MM` window in which background rotation/model refresh pauses (requests still work) |
-
-### 11.7 Generation and history
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends none: `low`, `medium`, `high` |
-| `BRIDGE_LIVE_THOUGHTS` | `true` | Include separately extracted reasoning in API output |
-| `BRIDGE_TEMPORARY` | `false` | Request temporary Gemini conversations; skips continuation-cache reuse |
-| `BRIDGE_SESSION_CACHE` | `true` | Persist and reuse conversation continuation metadata |
-| `BRIDGE_TOOL_PREAMBLE` | `false` | Preserve assistant text before tool calls as answer text instead of moving it into reasoning |
-| `BRIDGE_MAX_PROMPT_CHARS` | `850000` | Inline history budget in bytes before older turns are offloaded; not a token count |
-| `BRIDGE_MAX_OLD_TOOL_CHARS` | `32000` | Compaction threshold for older tool-result messages |
-| `BRIDGE_HISTORY_OFFLOAD` | `true` | Upload older turns as text attachments when inline budget is exceeded; `false` forces inline compaction |
-| `BRIDGE_INCLUDE_GROUNDING` | `true` | Append Google Search citations to answers as a `Sources:` list |
-| `BRIDGE_CONTEXT_WINDOW` | `1048576` | Fallback context window for models Google has not published limits for |
-| `BRIDGE_MAX_OUTPUT_TOKENS` | `65536` | Fallback output limit, used on the same terms |
-| `BRIDGE_TOKEN_ESTIMATOR` | `script` | `script` (CJK-aware) or `bytes4` (~4 UTF-8 bytes per token) |
-
-Models with documented limits always use the documented value; `capabilities.limitsSource` reports `documented` or `config`.
-
-### 11.8 Tools and streaming
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_LIVE_TOOL_CALLS` | `false` | Emit incremental tool-call deltas instead of buffering and validating the complete call |
-| `BRIDGE_TOOL_SCHEMA_COMPACT` | `true` | Compact tool schemas in the prompt contract |
-| `BRIDGE_TOOL_DESC_MAX_CHARS` | `400` | Maximum tool-description length in the compact contract (minimum 64) |
-| `BRIDGE_STREAM_BUFFER` | `verified` | `verified` buffers until model identity is verified; `eager` streams earlier |
-| `BRIDGE_EARLY_SSE` | `false` | Flush streaming headers immediately instead of waiting for the identity check (requires `BRIDGE_STREAM_BUFFER=eager` or downgrade rejection off) |
-| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Flush headers after this long even if identity is unverified and no frame has arrived; the downgrade check then runs on the body. `0` keeps them buffered |
-| `BRIDGE_MAX_ATTEMPTS` | `3` | Total attempts per request, including failover (1–10) |
-| `BRIDGE_MAX_UPSTREAM_ATTEMPTS` | `3` | Maximum upstream calls per request (1–10) |
-| `BRIDGE_RETRY_BUDGET_MS` | `150000` | Total wall-clock budget for retries; `0` disables the deadline |
-
-### 11.9 Timeouts and background work
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Upstream HTTP response-header deadline; stops when headers arrive |
-| `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
-| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Per-stream liveness deadline after HTTP 200 headers until the candidate completes (`Done`/`StreamEnd`). Resets on any new text, reasoning, media, or changed activity; unchanged activity, empty candidates, and keepalives do not extend it. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models (`medium`/`high` and explicit values use the full deadline) |
-| `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
-| `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval, clamped to 60 s–3600 s. Idle accounts rotate at half frequency |
-| `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh interval |
-| `BRIDGE_SEARCH_TIMEOUT_MS` | `180000` | Default MCP `web_search` deadline; clamped to 10 s–600 s |
-
-### 11.10 Diagnostics
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BRIDGE_LOG_REQUESTS` | `false` | Log one JSON line per request with timings, byte counts, cache/attempt telemetry |
-| `BRIDGE_DUMP_REQUEST` | Empty | Directory for redacted outbound request dumps (header order, cookie names and hashes, body SHA-256) |
-
-`gsb --capture-reference` writes `$BRIDGE_HOME/reference-fingerprint.json`. Compare a live dump against it with:
+Docker image (~12 MB, non-root `uid 10001`, Web UI enabled):
 
 ```sh
-BRIDGE_DUMP_REQUEST=/tmp/gsb-dumps ./gsb --probe
-./scripts/diff-fingerprint.sh /tmp/gsb-dumps/req-*.json ~/.gemini-stealth-bridge/reference-fingerprint.json
-```
-
-### 11.11 Environment-only settings
-
-These are **not** editable from the Web UI: listener, keys, home directory, proxies, TLS/fingerprint options, timeouts, session limits, prompt budgets, logging/dump paths, and quiet hours. Change them in the process environment or `config.env`, then restart.
-
----
-
-## 12. Data layout
-
-```text
-$BRIDGE_HOME/                     # default ~/.gemini-stealth-bridge
-├── .lock                         # single-writer lock (pid + start time)
-├── config.env                    # UI/admin-persisted runtime settings, mode 0600
-├── session-cache.json            # continuation metadata, mode 0600
-├── reference-fingerprint.json    # only after --capture-reference
-├── web-credentials.json          # legacy single-account credential file
-└── accounts/
-    ├── acc1.json                 # one Google session
-    └── acc2.json
-```
-
-Account file fields include:
-
-`kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `authUser`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
-
-Account files and `session-cache.json` contain credentials or sensitive continuation metadata. They are written with mode `0600` on POSIX systems. Protect the whole data directory with OS permissions and exclude it from version control and shared backups. On Windows, use filesystem ACLs rather than relying on POSIX mode bits.
-
-Only one daemon may use a `BRIDGE_HOME` at a time. A second instance exits with a lock error naming the owning PID.
-
-One-shot commands behave differently:
-
-- `--login`, `--login-helper`, `--import-chrome`, `--import-cookie`, `--accounts`, `--accounts-live`, `--models-json`, `--unquarantine`, `--check-config`, and `--capture-reference` run without taking the daemon lock.
-- `--probe` tries to take the lock but proceeds when it is already held, so it can inspect a running daemon's data directory.
-- `--rotate` takes the lock and fails when the daemon is already running. Use the Web UI or `POST /v1/admin/accounts/<id>/rotate` for a live daemon.
-
----
-
-## 13. Security
-
-The daemon listens on loopback by default. **`BRIDGE_API_KEY` defaults to `public`, and unauthenticated access is allowed in that mode.**
-
-### 13.1 Exposure checklist
-
-- Set `BRIDGE_API_KEY` to a random value before exposing the daemon beyond loopback. Account keys keep working alongside it.
-- Set `BRIDGE_ADMIN_KEY` (or a non-public pool key) before opening `/ui` remotely. Docker bridge NAT always looks remote.
-- The daemon serves plain HTTP, not HTTPS. Use a private network, an SSH tunnel, or an authenticated TLS reverse proxy that restricts access independently of routing keys.
-- Do not publish port `20133` directly to an untrusted network.
-- Startup warns about a non-loopback bind with default authentication; it does **not** refuse to start.
-- `/health`, `/readyz`, and `/v1/media/*` are reachable without an API key. `/mcp` uses the same API-key resolver as `/v1/*`, so it always requires a valid pool, group, or account key.
-- `/v1/refresh` rejects requests carrying an `Origin` header to reduce cross-site request forgery.
-- The UI sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a restrictive CSP.
-- Admin authentication is rate-limited to five failures per IP per 60 seconds.
-- Remote-image fetching blocks private, loopback, link-local, multicast, and unspecified addresses unless `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS=1`. Request bodies are capped at 32 MiB; MCP bodies at 8 MiB; remote images at 20 MiB.
-- `BRIDGE_PROXY_SERVER` is not a process-wide proxy and does not protect the remote-image downloader.
-
-### 13.2 Credential handling
-
-- Treat cookie exports, `Cookie` headers, account JSON, and `session-cache.json` as credentials.
-- Do not paste them into chat, issues, logs, or commit messages.
-- Do not commit `$BRIDGE_HOME` to version control.
-- Account keys are derived from filenames and are not secrets. Use a pool key or group key when access control matters.
-- `BRIDGE_DUMP_REQUEST` redacts cookie values, but the dump still reveals header order and cookie names; keep it private.
-
----
-
-## 14. Docker and deployment
-
-Docker is **optional**. The published image is multi-stage and zero-CGO (about 12 MB, non-root `uid 10001`, Web UI enabled on `:20133`). `docker compose up` pulls it from GHCR, so no Go toolchain and no local build is needed:
-
-```sh
-docker compose up -d
-```
-
-To build from this checkout instead:
-
-```sh
-BRIDGE_IMAGE=gemini-stealth-bridge:dev docker compose up -d --build
-```
-
-### 14.1 Compose defaults
-
-`docker-compose.yml` sets:
-
-| Setting | Value |
-|---|---|
-| Image | `${BRIDGE_IMAGE:-ghcr.io/azrinaldi/gemini-stealth-bridge:latest}` |
-| Container user | `${BRIDGE_UID:-10001}:${BRIDGE_GID:-10001}` |
-| Port binding | `${BRIDGE_BIND_IP:-127.0.0.1}:${BRIDGE_PORT:-20133}:20133` |
-| `BRIDGE_HOME` | `/data` |
-| `BRIDGE_HOST` / `BRIDGE_PORT` | `0.0.0.0` / `20133` |
-| `BRIDGE_WEB_UI` | `1` |
-| `BRIDGE_API_KEY` | `${BRIDGE_API_KEY:-public}` |
-| `BRIDGE_ADMIN_KEY` | `${BRIDGE_ADMIN_KEY:-}` |
-| `BRIDGE_DEFAULT_THINKING` | `${BRIDGE_DEFAULT_THINKING:-low}` |
-| `BRIDGE_ACCOUNT_STRATEGY` | `${BRIDGE_ACCOUNT_STRATEGY:-rotate}` |
-| `BRIDGE_REJECT_DOWNGRADE` | `${BRIDGE_REJECT_DOWNGRADE:-1}` |
-| Volume | `${BRIDGE_DATA_DIR:-gsb-data}:/data` |
-
-The named volume `gsb-data` is pre-owned by the container user.
-
-### 14.2 Bind mounts
-
-To keep data on the host, either `chown` the directory to `10001:10001` or run the container as your own UID:
-
-```sh
-mkdir -p data
-
-# option A: give the directory to the container user
-sudo chown -R 10001:10001 data
-BRIDGE_DATA_DIR=./data docker compose up -d
-
-# option B: FUSE / NTFS / exFAT mounts that reject chown -> run as your own UID
-BRIDGE_DATA_DIR=./data BRIDGE_UID=$(id -u) BRIDGE_GID=$(id -g) docker compose up -d
-```
-
-### 14.3 Docker auth
-
-Because Docker's bridge NAT makes every request look remote, the control plane stays locked (HTTP `403`) while `BRIDGE_API_KEY` is the default `public`. Set an admin key before opening it:
-
-```sh
+# Recommended: set an admin key since Docker bridge NAT appears non-loopback
 BRIDGE_ADMIN_KEY=$(openssl rand -hex 24) docker compose up -d
-# then open http://127.0.0.1:20133/ui and paste that key into the auth prompt
 ```
 
-Or with `docker run` bound to loopback:
-
-```sh
-docker run -d --name gsb \
-  -p 127.0.0.1:20133:20133 \
-  -v gsb-data:/data \
-  -e BRIDGE_ADMIN_KEY="$(openssl rand -hex 24)" \
-  ghcr.io/azrinaldi/gemini-stealth-bridge:latest
-```
-
-Open `http://127.0.0.1:20133/ui` (or forward the port via `ssh -L 20133:127.0.0.1:20133 user@server`) to add accounts and configure the pool.
-
-### 14.4 Image details
-
-- Build: `golang:1.26-alpine`, `CGO_ENABLED=0`, `-trimpath`, stripped symbols.
-- Runtime: `alpine:3.21` with CA certificates and tzdata.
-- Entrypoint: `/usr/local/bin/gsb`.
-- Healthcheck: `gsb --healthcheck` every 30 s.
-- Published tags: `X.Y.Z`, `X.Y`, and `latest` on GHCR.
-- `VERSION` build arg is injected into `internal/config.Version`.
-
-### 14.5 Binary release artifacts
-
-Every `v*` tag publishes:
-
-`gsb_linux_amd64`, `gsb_linux_arm64`, `gsb_darwin_amd64`, `gsb_darwin_arm64`, `gsb_windows_amd64.exe`, `gsb_windows_arm64.exe`, and `SHA256SUMS`.
-
-The release workflow runs `go vet ./...`, `go test ./...`, and `go test -race ./...` before building.
+Security essentials:
+- **Never expose `127.0.0.1:20133` with `BRIDGE_API_KEY=public` to an untrusted network.** Set both `BRIDGE_API_KEY` and `BRIDGE_ADMIN_KEY` and place `gsb` behind SSH tunneling or an authenticated TLS reverse proxy.
+- **Keep `$BRIDGE_HOME` private (`0600`).** Never paste cookies, `accounts/*.json`, or `session-cache.json` into issues, chats, or commits.
 
 ---
 
-## 15. Operations and troubleshooting
+## CLI & Troubleshooting
 
-### 15.1 Daily checks
-
-```sh
-./gsb --help
-./gsb --version
-./gsb --check-config
-./gsb --probe
-./gsb --accounts              # read saved account files
-./gsb --accounts --accounts-live   # query upstream for fresh models and quota
-./gsb --rotate                # renew rotating cookies
-./gsb --models-json           # print the canonical /v1/models payload
-curl -sS http://127.0.0.1:20133/health
-curl -sS http://127.0.0.1:20133/readyz
-curl -sS http://127.0.0.1:20133/v1/quota \
-  -H 'Authorization: Bearer gsb-acc1'
-curl -sS -X POST http://127.0.0.1:20133/v1/refresh \
-  -H 'Authorization: Bearer gsb-acc1'
-```
-
-`--accounts` prints one row per loaded account with the same computed status the HTTP API reports, plus 5-hour and weekly quota columns when available.
-
-`--probe` bootstraps configured accounts and prints model/quota details. Inspect per-account errors, not just the command's exit status. A banned account is quarantined and persisted.
-
-`--rotate` attempts cookie renewal, but cannot restore a revoked Google session. Re-import credentials when sign-in is required.
-
-`--unquarantine <id>` clears quarantine state in the account file. While the daemon is running, prefer the Web UI or `POST /v1/admin/accounts/<id>/unquarantine`, which updates memory and disk together.
-
-Run `./gsb` directly for predictable environment handling. `./start.sh` is a convenience wrapper that builds when needed, exports `BRIDGE_HOME`, enables the Web UI, and `exec`s the daemon.
-
-### 15.2 Account status semantics
-
-Statuses are computed in this precedence order:
-
-| Status | UI label | Meaning |
-|---|---|---|
-| `disabled` | Paused | Operator paused the account in the control plane |
-| `quarantined` | Quarantined | Upstream restricted the account (`TOS_VIOLATION`, `PERMISSION_DENIED`) |
-| `expired` | Expired | Saved session is no longer valid; run `gsb --login <name>` |
-| `exhausted` | Exhausted | A real quota window is spent until `resetAt`, or a model stayed exhausted across retries |
-| `cooling` | Cooling | Failed within the last 60 seconds; temporarily skipped |
-| `degraded` | Degraded | Cooldown elapsed, but the failure counter has not been cleared by a success or by the automatic re-check |
-| `unknown` | Unprobed | No quota check has run in this process |
-| `ok` | Ready | Loaded, authenticated, no known limit |
-
-The CLI statuses are the same strings (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `disabled`, `unknown`).
-
-### 15.3 Common failures
-
-| Symptom | What to check |
+| Command | Purpose |
 |---|---|
-| `503 auth_unavailable` / no accounts configured | Connect an account with `gsb --login <name>`; ensure the daemon and the import use the same `BRIDGE_HOME`; reload with `/v1/refresh` or restart |
-| `401 authentication_error` | Check `BRIDGE_API_KEY`, `BRIDGE_GROUP_TOKENS`, or `BRIDGE_ACCOUNT_TOKENS`. Filename aliases only work in public mode without explicit account tokens |
-| Cookie import/decryption failure | Run `gsb --login <name>` instead; cookie import only works when that browser profile is already signed in. If decryption itself fails, unlock the keyring, set `CHROME_PASS`, or use a cookie export |
-| Bootstrap/sign-in failure | Open Gemini Web with the same account, complete any Google sign-in checks, then re-import |
-| `401 upstream_auth_error` / `code 1016` on a previously working account | The saved session expired. Run `gsb --login <name>`, complete sign-in, then `gsb --probe`. Re-exporting the same browser cookies will not help |
-| `403 account_banned` / `TOS_VIOLATION` | The account is restricted upstream. Do not retry in a loop; the account is quarantined. Review the account and Google's terms |
-| `404 model_not_found` | Query `/v1/models` with the same key; do not assume another account's model is available |
-| `429` quota/rate-limit error | Inspect `/v1/quota`; wait for `resetAt` or choose an account/model with available quota. Check `Retry-After` and `X-Resets-At` |
-| `429 cookie rotation rate limited` during account import | The account was not saved. Wait for Google's `Retry-After` if supplied before trying **Add Account → Launch** again. Do not repeatedly re-import or rotate cookies. |
-| `429 model_substitution` | Gemini served a different model and downgrade rejection is enabled; retry after checking quota or explicitly select an available model |
-| `429 session_busy` | Per-account concurrency or queue is saturated; raise `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` / `BRIDGE_MAX_QUEUE` or add accounts |
-| Tool-call validation error | Check the tool schema and `tool_choice`; the generated call must match the requested contract. Schema coercion repairs stringified scalars, but not missing required fields |
-| Stream appears stalled or fails | Check daemon logs, upstream connectivity/proxy, client buffering, and client/reverse-proxy timeouts. Raise `BRIDGE_STALL_TIMEOUT_MS` or `BRIDGE_STREAM_TIMEOUT_MS` if the model legitimately thinks longer |
-| Reasoning appears in normal chat output | Check the client's reasoning-field support; model-authored inline reasoning may not be extracted |
-| UI shows `403 remote_web_ui_locked` | Set `BRIDGE_ADMIN_KEY` or a non-public `BRIDGE_API_KEY`, or use an SSH tunnel |
-| UI shows `401` after a restart | The key is stored in `sessionStorage`; re-enter it in the Access Key dialog |
-| Media URL returns `404` | The in-memory entry was evicted or the daemon restarted; regenerate the media |
-| `503` from `/readyz?strict=1` | No account has fresh models and no auth error; run `gsb --accounts --accounts-live` |
+| `./gsb --login <name>` | Isolated browser login (recommended) |
+| `./gsb --probe` | Verify saved sessions, models, and live quota |
+| `./gsb --accounts --accounts-live` | Print account status table (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `disabled`) |
+| `./gsb --rotate` | Rotate rotating cookies offline (use Web UI while daemon is running) |
+| `./gsb --unquarantine <id>` | Clear quarantine state in an account file |
+| `./gsb --models-json` | Print canonical `/v1/models` payload |
 
-### 15.4 Streaming errors
-
-SSE requests can emit an error after HTTP headers have been sent. Clients must inspect stream events, not only the HTTP status. Chat errors are sent as `data: {"error":{...}}`; Responses errors use the same envelope within the event stream.
-
-### 15.5 Logs
-
-With `BRIDGE_LOG_REQUESTS=1`, `gsb` logs one JSON line per request containing endpoint, model, account, effort, prompt byte breakdown, TTFT, total time, status, error code, cache hit, attempts, upload time, identity time, and account switches. Cookie values and prompt bodies are not logged.
+Common fixes:
+- **`401 upstream_auth_error` / `code 1016`**: Google session expired — run `./gsb --login <name>` and `./gsb --probe` (`--rotate` cannot restore an expired sign-in).
+- **`403 account_banned` / `quarantined`**: Account restricted upstream (`TOS_VIOLATION` / region / terms check) — sign in manually on `gemini.google.com` or stop retrying that account.
+- **`429 rate_limit_error` vs `session_busy`**: `rate_limit_error` is upstream quota (check `/v1/quota` or pool key usage); `session_busy` is local queue saturation (`BRIDGE_MAX_CONCURRENT_PER_ACCOUNT`).
+- **`404 model_not_found`**: Query `GET /v1/models` with the same key; catalogues vary by account tier.
 
 ---
 
-## 16. How it works
-
-```mermaid
-flowchart LR
-    C[OpenAI-compatible client] -->|Chat Completions or Responses| B[gsb API bridge]
-    B -->|Authenticated web requests| G[Gemini Web]
-    G -->|Generation frames| B
-    B -->|JSON or SSE| C
-```
-
-The request path has four parts:
-
-1. **Resolve scope and model.** Authenticate the caller, choose the eligible account set (pool, group, or single account), resolve the requested model and thinking effort, and check the tool contract and known quota.
-2. **Normalize the conversation.** Flatten messages, images, thinking effort, and tools into the Gemini Web prompt. Reuse cached continuation metadata where possible; upload older history as text attachments when necessary.
-3. **Send upstream.** Use a per-account uTLS/HTTP2 transport with ordered browser headers. The default `Chrome_150_PSK` profile replaces a headless browser process; it does not emulate every property of a real browser.
-4. **Parse and format.** Parse Gemini's generation frames, separate reasoning and tool calls, validate the result, and emit the selected OpenAI-compatible response format.
-
-Background workers:
-
-- refresh model and quota state every `BRIDGE_MODEL_REFRESH_MS`,
-- rotate rotating cookies every `BRIDGE_ROTATE_COOKIES_MS`,
-- reap idle transport sessions every 60 seconds,
-- persist updated cookies to account files,
-- persist continuation metadata to `session-cache.json`.
-
-Retries and failover happen before client-visible output is committed. Once text or tool deltas have been sent, the answer is committed and a retry would duplicate or contradict it, so only in-stream-retryable failures are retried at that point.
-
----
-
-## 17. Development
-
-### 17.1 Build and test
+## Development
 
 ```sh
-go build -o gsb ./cmd/gsb
 go vet ./...
-go test ./...
-go test -race ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go build -o gsb ./cmd/gsb          # or -tags nowebui to exclude /ui
 ```
 
-Build without the embedded Web UI:
-
-```sh
-go build -tags nowebui -o gsb ./cmd/gsb
-```
-
-`-tags nowebui` makes `GET /ui` return `404` with `webui_compiled_out`.
-
-### 17.2 CLI reference
-
-| Flag | Purpose |
-|---|---|
-| `--login <name>` | Interactive isolated-browser sign-in; saves `accounts/<name>.json` |
-| `--login-helper` | Run the local desktop login helper on `127.0.0.1:20134` for remote VPS use |
-| `--desktop-ui` | Run the desktop control plane on `127.0.0.1:20133` using the private SSH socket from §6.4 |
-| `--import-chrome <name>` | Import cookies from a local browser profile or cookie database |
-| `--import-cookie <name>` | Import a raw `Cookie` header or Cookie-Editor JSON |
-| `--chrome-profile <name\|dir\|db>` | Browser profile name, directory, or Cookies SQLite path |
-| `--cookie-db <path>` | Explicit cookie database or profile directory; takes precedence over `--chrome-profile` |
-| `--cookie-value <payload>` | Inline cookie payload (avoid; leaks into shell history) |
-| `--cookie-file <path>` | File containing a raw cookie header or JSON export |
-| `--probe` | Bootstrap all accounts, verify models/quota, print details, exit |
-| `--rotate` | Run cookie rotation on all accounts and exit |
-| `--accounts` | Print a status table for every loaded account and exit |
-| `--accounts-live` | With `--accounts`, query upstream for fresh models/quota first. Used alone, it also prints the table with live data |
-| `--unquarantine <id>` | Clear quarantine state in the account file and exit |
-| `--models-json` | Print the canonical `/v1/models` JSON payload and exit |
-| `--capture-reference` | Write a reference browser fingerprint JSON to `$BRIDGE_HOME` |
-| `--check-config` | Validate environment configuration and exit |
-| `--healthcheck` | Probe local `/health` and exit 0/1 (container healthcheck) |
-| `--web` | Enable `/ui` and `/v1/admin/*` |
-| `--version` | Print build version, OS/arch, and Go version |
-
-### 17.3 Scripts
-
-| Script | Purpose |
-|---|---|
-| `scripts/check-router-metadata.sh <base-url> [key]` | Verify that `/v1/models` carries context limits, output limits, and thinking metadata |
-| `scripts/check-router-metadata.sh --compare <bridge> <router> [bridge-key] [router-key]` | Report exactly which metadata fields the router dropped |
-| `scripts/diff-fingerprint.sh <dump.json> <reference.json>` | Compare a live request dump against the reference fingerprint; reports missing/extra headers, order mismatches, and value diffs |
-| `scripts/omp-gsb-progress.ts` | Optional OMP extension displaying elapsed wait time for `gsb/` models until the first reasoning, text, or tool frame arrives |
-| `start.sh` | Build if needed (including Web UI changes), export `BRIDGE_HOME`, enable the UI, and start the daemon |
-
-### 17.4 Repository map
-
-| Path | Responsibility |
-|---|---|
-| [`cmd/gsb`](./cmd/gsb) | CLI, imports/login, daemon startup and shutdown |
-| [`internal/server`](./internal/server) | API routing, authentication, account selection, response formatting, continuation cache, media registry, MCP, admin API |
-| [`internal/gemini`](./internal/gemini) | Gemini Web authentication, model/quota discovery, uploads, generation and frame parsing, grounding |
-| [`internal/prompt`](./internal/prompt) | History normalization, text offloading, image handling, usage estimation |
-| [`internal/toolbridge`](./internal/toolbridge) | Prompt-based function-call contract, JSON Schema validation/coercion, call parsing, streaming, media tool |
-| [`internal/cookies`](./internal/cookies) | Cookie import/decryption, persistence, authentication headers, rotation, isolated browser login |
-| [`internal/transport`](./internal/transport) | uTLS/HTTP2 client, account sessions, queues, proxies, timeouts |
-| [`internal/config`](./internal/config) | Environment configuration, `config.env` persistence, browser header profiles |
-| [`internal/webui`](./internal/webui) | Embedded single-file Web Control Plane, with `-tags nowebui` stub |
-| [`docs/assets`](./docs/assets) | Documentation images |
-| [`.github/workflows/release.yml`](./.github/workflows/release.yml) | Tests, six-target binary release, GHCR image publish |
-
-[`AGENTS.md`](./AGENTS.md) is a complete operations manual for AI coding agents. Its main rule: connect an account with `gsb --login`, and treat cookie import as a fallback for browser profiles that are already signed in.
-
-When reporting a bug, include the endpoint, model ID, HTTP/error code, OS, Go version, and redacted daemon logs. Remove cookies, API keys, email addresses, prompts, and tool outputs containing private data.
+See [`AGENTS.md`](./AGENTS.md) for architecture details and agent operating conventions.
 
 ---
 
-## 18. License
+## Acknowledgments
 
-[MIT](./LICENSE).
+Special thanks to **[@PramaAditya](https://github.com/PramaAditya)** for identifying and fixing the missing `OSID` / `__Secure-OSID` session cookies on multi-account Chrome profiles in [Issue #11](https://github.com/azrinaldi/gemini-stealth-bridge/issues/11) and [PR #12](https://github.com/azrinaldi/gemini-stealth-bridge/pull/12)! 🙏
+
+---
+
+## License
+
+[MIT](./LICENSE)
