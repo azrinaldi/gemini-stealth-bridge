@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -693,7 +694,7 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 	candidate := &AccountState{ID: acctID, FilePath: stagePath, Client: ac, AccountGroup: acctGroup, ProxyURL: proxyURL, CapturedAt: now}
 	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	err = s.probeSingleAccount(probeCtx, candidate)
-	if err != nil && probeCtx.Err() == nil {
+	if err != nil && probeCtx.Err() == nil && isTransientImportProbeError(err) {
 		// Freshly captured browser cookies can hit a brief propagation delay on
 		// the first /app bootstrap or model listing; retry once before failing.
 		select {
@@ -776,6 +777,18 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 		"status":  "ok",
 		"account": s.accountStatusMap(acct, s.now()),
 	}, nil)
+}
+
+func isTransientImportProbeError(err error) bool {
+	var ue *transport.UpstreamError
+	if !errors.As(err, &ue) || ue == nil {
+		return false
+	}
+	switch ue.Code {
+	case "auth_redirect", "upstream_auth_error", "upstream_transient", "upstream_degraded", "model_discovery_error":
+		return true
+	}
+	return ue.StatusCode >= 500
 }
 
 func (s *Server) probeSingleAccount(ctx context.Context, a *AccountState) error {

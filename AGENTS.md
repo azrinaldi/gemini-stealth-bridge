@@ -133,7 +133,7 @@ gsb --login <name>
 gsb --probe
 ```
 
-`--login` launches a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, opens `https://gemini.google.com/app`, waits for Google sign-in (including 2FA), captures cookies via CDP, verifies the session against Gemini Web, and deletes the temporary profile.
+`--login` launches a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, opens `https://gemini.google.com/app`, waits for Google sign-in and Gemini's `OSID` session cookie to settle, captures cookies via CDP (`Storage.getCookies`), verifies the session against Gemini Web before committing atomically, and deletes the temporary profile.
 
 Why this is the recommended path: the disposable profile is destroyed after capture, so no background browser process competes with `gsb` for `__Secure-1PSIDTS` cookie rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so Google never binds the session to a browser-held key that `gsb` cannot present; the captured cookies stay renewable by the daemon.
 
@@ -440,7 +440,7 @@ Supported tool shapes: flat `{type:"function", name, description, parameters}`, 
 
 Output item types: `reasoning`, `message` with `output_text`, `function_call`, `custom_tool_call`.
 
-Streaming events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.custom_tool_call_input.delta`, `response.custom_tool_call_input.done`, `response.output_item.done`, `response.completed`.
+Streaming events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, `response.reasoning_summary_part.done`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.custom_tool_call_input.delta`, `response.custom_tool_call_input.done`, `response.output_item.done`, `response.completed`.
 
 There is **no** `[DONE]` marker. The stream ends with `response.completed`, `response.incomplete` after `max_output_tokens`, or a named `error` event if the request failed after headers were sent.
 
@@ -514,7 +514,7 @@ Coercion only applies when the raw value fails validation and the coerced value 
   - A structural rule (`zeroQuotaRefusal`) that catches wordings the phrase list missed. It fires when one sentence contains a standalone zero **and** a tool word **and** an availability word. This exists because enumerating phrases did not converge: the same question produced `0 tool calls tersisa`, then `calls remaining: **0**`, then `There are **0** built-in tool and search calls remaining`, and each new wording shipped a refusal as the final answer.
   - Prose that merely reports a zero result (`returned 0 matches`, `0 errors were found`) has no availability word in that sentence and stays a plain answer.
   - `TestRefusalPatternNamesHaveCoverage` fails if a phrase pattern is added without a sample that fires, so no entry can be dead code.
-- Keeps raw JSON envelopes out of plain answer text.
+- Keeps raw JSON envelopes out of plain answer text, including multi-line fenced `tool_calls` blocks with trailing close-fence chatter (e.g. ```` ```Groq ````) or glued openings (`... block.```json`), and deduplicates identical adjacent tool-call blocks.
 - Does not mark an account `degraded` for client/schema `tool_call_error`.
 
 ### 10.4 `tool_choice`
@@ -832,7 +832,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Deadline for upstream HTTP response headers |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames (keepalive envelopes do not count as a frame) |
-| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Per-stream liveness deadline until candidate completion (`Done`/`StreamEnd`); resets on new text, reasoning, media, or changed activity; fires `upstream_stalled` and fails over. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Whole request |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Rotation interval (60s–3600s) |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh |

@@ -6,7 +6,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=0.4.4
+ARG VERSION=0.4.5
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags="-s -w -X github.com/azrinaldi/gemini-stealth-bridge/internal/config.Version=${VERSION}" \
     -o /out/gsb ./cmd/gsb

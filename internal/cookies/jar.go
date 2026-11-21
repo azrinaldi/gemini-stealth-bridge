@@ -21,8 +21,7 @@ var EssentialNames = []string{
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 	"__Secure-1PSIDTS", "__Secure-3PSIDTS",
 	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "NID", "AEC",
-	"OSID", "__Secure-OSID", "LSID",
-	"__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS",
+	"LSID", "__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS",
 	"ACCOUNT_CHOOSER",
 }
 

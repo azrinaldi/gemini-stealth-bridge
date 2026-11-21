@@ -33,4 +33,7 @@ func TestCanonicalHeaderOSIDOrder(t *testing.T) {
 	if osid < sid || secureOSID < sid {
 		t.Fatalf("OSID cookies must follow the SID family, got: %s", got)
 	}
+	if strings.Count(got, "OSID=o1") != 1 || strings.Count(got, "__Secure-OSID=o2") != 1 {
+		t.Fatalf("duplicate OSID entries in canonical header: %s", got)
+	}
 }

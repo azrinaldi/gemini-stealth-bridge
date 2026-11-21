@@ -1998,7 +1998,7 @@
           </span>
           <h1 class="brand-title">gsb</h1>
           <span class="brand-sep" aria-hidden="true"></span>
-          <span id="hdr-meta" class="brand-meta mono">v0.4.4 · connecting…</span>
+          <span id="hdr-meta" class="brand-meta mono">v0.4.5 · connecting…</span>
         </div>
 
         <div class="view-tabs" role="tablist" aria-label="Control plane views">
@@ -3314,7 +3314,7 @@
         if (pinningNoteEl) {
           pinningNoteEl.hidden = !aliasesEnabled;
         }
-        hdrMeta.textContent = 'v' + (adm.version || '0.4.4') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
+        hdrMeta.textContent = 'v' + (adm.version || '0.4.5') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
         document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
         document.getElementById('conn-base-url').textContent = clientOrigin + '/v1';
         document.getElementById('conn-pool-key').textContent = adm.poolKey || 'gsb-pool';

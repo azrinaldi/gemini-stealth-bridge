@@ -73,6 +73,24 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.5
+- **Complete session cookies & isolated login hardening** (incorporating PR #12 / Fixes #11): `EssentialNames` now retains `OSID`, `__Secure-OSID`, `LSID`, `__Host-1PLSID`, `__Host-3PLSID`, `__Host-GAPS`, and `ACCOUNT_CHOOSER` with per-domain scoring (`gemini.google.com` preferred for `OSID`, `accounts.google.com` for `LSID`/`__Host-*`, `.google.com` for `SID`/`SAPISID`). Isolated browser login (`--login`, `--login-helper`, `--desktop-ui`) now reads browser-level cookies via CDP `Storage.getCookies`, waits for `OSID` to settle before closing the disposable browser, and retries once on transient post-login cookie propagation delays. CLI imports (`--login`, `--import-cookie`, `--import-chrome`) stage credentials to a temporary file and commit atomically only after `Bootstrap` succeeds.
+- **Safe cookie rotation & zero-race persistence**: non-200 rotation responses (`401`/`403`/`429`) never absorb cookie deletions or mark the session as rotated; `reloadGen` is separated from `cookieGen` so concurrent `GetQuota`/`AvailableModels` `Set-Cookie` headers no longer discard freshly rotated `__Secure-1PSIDTS`; `ReloadFromDiskIfNewer` never overwrites fresher in-memory cookies with stale disk state; and replaced/deleted account clients retire their writers and clean up pool/rotator/upload-cache state.
+- **Streaming stability, full-lifetime frame watchdog, & smart stall recovery**:
+  - `frameWatch` now stays armed across the entire stream until `Done`/`StreamEnd`, resetting on any text, reasoning, media, or activity change (`trimThoughts != lastThoughts` / `trimText != lastText`) so long reasoning turns never trip false stalls while mid-stream hangs are caught cleanly.
+  - Adaptive default no-frame deadlines (`30s` for `low`-effort fast tiers `hydrogen`/`flash`/`lite`/`adapts`/`auto`, `45s` for other `low`-effort models, `75s` for `medium`/`high` unless `BRIDGE_NO_FRAME_TIMEOUT_MS` is explicitly configured).
+  - Stalled or timed-out continuation caches are evicted automatically, and cross-account stall rollbacks prevent a single stuck prompt from poisoning healthy pool accounts.
+  - Pool failover now covers `incomplete_upstream_response`, `upstream_transport_error`, `upstream_http_error`, `upstream_parse_error`, `upstream_upload_error`, `account_disabled`, and `prepareGeneration` candidate exhaustion while preserving `429` precedence over `404`.
+  - Fixed a goroutine leak in `StealthClient.Do` on context cancellation, guarded `stallTimer` against races, skipped `lineBuf` tail flush after early `ErrStopStreaming`, and followed safe same-origin `gemini.google.com` redirects during bootstrap while reserving `auth_redirect` for actual Google sign-in redirects.
+- **Tool-calling anti-leak & schema fidelity**:
+  - Multi-line fenced `tool_calls` blocks are no longer leaked as plain text when a model glues trailing chatter onto the closing fence (e.g. ```` ```Groq ````) or glues an opening ```` ```json ```` block after a sentence period; duplicate adjacent tool-call blocks are automatically deduplicated.
+  - Fixed `LiveToolCallStreamer` partial-argument slicing (`partialArgs[:argsEnd]`), forced-function enforcement across all call indices, `nullable`/`"null"` unions, `"[]"` coercion, object-valued `additionalProperties` preservation during schema compaction, and non-RE2 `pattern` safety.
+- **Desktop one-port VPS UI (`--desktop-ui`), Control Plane polish, & Responses parity**:
+  - `gsb --desktop-ui` proxies both the daemon Web UI and API over a private SSH Unix socket on `127.0.0.1:20133` with local isolated-browser sign-in, strict `Origin`/`Sec-Fetch-Site` enforcement, full API/MCP header forwarding, and no artificial proxy header timeout on long streams.
+  - Web Control Plane supports account priority reordering, single-flight browser login with pre-validation, accurate `runtime` config source badges, `aliasesEnabled` visibility, and clear inline + banner error reporting.
+  - Responses API now emits `response.reasoning_summary_part.done`, handles `stop` at index `0` and `max_tokens` with tools, and preserves attachment parts across server-side media continuation rounds.
+  - Fixed three Windows-only unit tests in `internal/cookies` (`HOME`/`USERPROFILE` lookup and POSIX `0600` mode check).
+
 ### What's new in v0.4.4
 - **The SSE grace timer actually runs in a default deployment**: `BRIDGE_EARLY_SSE_GRACE_MS` was gated on downgrade rejection being disabled, and that guard is on by default, so the timer never fired where it was needed. A thinking-heavy tier therefore held its response headers for minutes and a reverse proxy abandoned the request with "timeout awaiting response headers" while the bridge was still working. The grace flush now applies whenever buffering would otherwise outlast it; the downgrade guard keeps running on the stream body, which stops a mismatch just as the status line did.
 ### What's new in v0.4.3
@@ -170,7 +188,7 @@ Sign in through `gsb` so the session is captured in an isolated disposable brows
 ./gsb --probe
 ```
 
-`--login` opens a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, waits for Google sign-in, captures the cookies through CDP, verifies the session against Gemini Web, and deletes the temporary profile. No background browser process is left competing with `gsb` for `__Secure-1PSIDTS` rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so the captured session is not bound to a device key that `gsb` cannot present and stays renewable by the daemon.
+`--login` opens a temporary Chrome/Chromium/Brave/Edge window with a disposable `--user-data-dir`, waits for Google sign-in and Gemini's `OSID` session cookie to settle, captures the full cookie set through CDP (`Storage.getCookies`), verifies the session against Gemini Web before committing atomically, and deletes the temporary profile. No background browser process is left competing with `gsb` for `__Secure-1PSIDTS` rotation. The browser is launched with `--disable-features=DeviceBoundSessionCredentials`, so the captured session is not bound to a device key that `gsb` cannot present and stays renewable by the daemon.
 
 `--probe` prints the account's models and 5-hour/weekly quota. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
 
@@ -729,7 +747,7 @@ Non-streaming errors use HTTP status codes with the envelope above. Streaming re
 | `model_discovery_error` | 502 | Upstream model registry was malformed or unavailable |
 | `upstream_connect_timeout` | 504 | First-byte timeout |
 | `upstream_timeout` | 504 | Overall upstream timeout |
-| `upstream_stalled` | 504 | No upstream data within `BRIDGE_STALL_TIMEOUT_MS`, or no candidate content, final status, or new activity within `BRIDGE_NO_FRAME_TIMEOUT_MS` during the initial response |
+| `upstream_stalled` | 504 | No upstream data within `BRIDGE_STALL_TIMEOUT_MS`, or no new text, reasoning, media, final status, or changed activity within `BRIDGE_NO_FRAME_TIMEOUT_MS` before the candidate completes |
 | `upstream_degraded` | 502 | Gemini Web failed the turn or temporarily restricted the account (code 1185 / 1014); retrying on another account usually succeeds |
 | `upstream_transient` | 503 | Gemini reported a temporary model error (code 1013); retried automatically |
 | `upstream_upload_error` | 502 | Attachment upload failed |
@@ -946,7 +964,8 @@ Function calling is prompt-based, not native Gemini function calling. `gsb` rend
 
 Validation covers `type` (including unions), `enum`, `const`, local `$ref`, string length/pattern, numeric bounds and `multipleOf`, array bounds and `uniqueItems`, object `required`/`additionalProperties`, and `allOf`/`anyOf`/`oneOf`/`not`/`nullable`.
 
-Before validation, `gsb` coerces common model mistakes into the declared types (`"42"` → `42`, `"true"` → `true`, JSON-encoded objects/arrays in strings, scalar → single-element array). It also strips stray closing braces/brackets, removes trailing commas, quotes bare identifier keys, repairs string escapes, and retries truncated envelopes or invented refusals.
+- **Anti-leak tool parsing**: multi-line fenced `tool_calls` blocks remain recognized even when a model glues trailing chatter onto the closing fence (e.g. ```` ```Groq ````) or glues an opening ```` ```json ```` block after a sentence period, while duplicate adjacent tool blocks are deduplicated automatically.
+- Before validation, `gsb` coerces common model mistakes into the declared types (`"42"` → `42`, `"true"` → `true`, JSON-encoded objects/arrays in strings including `"[]"`, scalar → single-element array). It also strips stray closing braces/brackets, removes trailing commas, quotes bare identifier keys, repairs string escapes, and retries truncated envelopes or invented refusals.
 
 An invented refusal is detected from the **opening** of the reply (first 2000 bytes), not the whole reply. The shape this catches is the one the model actually produces when it gives up on tools: a one-line claim that the tool budget is spent, followed by step-by-step manual instructions. That reply is a `tool_call_error` and is retried with a correction note, so it never reaches the client as a final answer. A long genuine answer that only mentions a tool budget further down stays an answer. Refusals are also dropped from assistant history, so a fabricated budget claim cannot poison the next turn.
 
@@ -1007,6 +1026,7 @@ Events include:
 - `response.reasoning_summary_part.added`
 - `response.reasoning_summary_text.delta`
 - `response.reasoning_summary_text.done`
+- `response.reasoning_summary_part.done`
 - `response.function_call_arguments.delta`
 - `response.function_call_arguments.done`
 - `response.custom_tool_call_input.delta`
@@ -1036,9 +1056,9 @@ Fields:
 | `response_format` | `url` (default) or `b64_json` |
 | `size` | Parsed as `WxH` and snapped to the nearest supported ratio (e.g. `1280x720` → `16:9`); `auto` is accepted and ignored |
 | `aspect_ratio` | `1:1`, `16:9`, `9:16`, `4:3`, `3:4` (also `square`, `landscape`, `portrait`, or any `W:H`, snapped to the nearest supported ratio) |
+| `format` / `output_format` | `png` (lossless `=s0-rp`), `jpeg` (original `=s0-d`), or `gif` |
 
 `size` and `aspect_ratio` must agree when both are sent; a conflict or a malformed value returns `400 invalid_request_error`. The generator decides the final dimensions, so the response reports the *produced* `width`, `height`, `size`, and the ratio they resolve to rather than echoing the request.
-| `format` / `output_format` | `png` (lossless `=s0-rp`), `jpeg` (original `=s0-d`), or `gif` |
 
 Response:
 
@@ -1348,7 +1368,7 @@ Models with documented limits always use the documented value; `capabilities.lim
 |---|---|---|
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Upstream HTTP response-header deadline; stops when headers arrive |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
-| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Deadline after HTTP 200 headers for the first candidate with content or final status. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models (`medium`/`high` and explicit values use the full deadline). Changed activity can extend it; unchanged activity, empty candidates, and keepalives cannot |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | Per-stream liveness deadline after HTTP 200 headers until the candidate completes (`Done`/`StreamEnd`). Resets on any new text, reasoning, media, or changed activity; unchanged activity, empty candidates, and keepalives do not extend it. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models (`medium`/`high` and explicit values use the full deadline) |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval, clamped to 60 s–3600 s. Idle accounts rotate at half frequency |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh interval |
@@ -1390,7 +1410,7 @@ $BRIDGE_HOME/                     # default ~/.gemini-stealth-bridge
 
 Account file fields include:
 
-`kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
+`kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `authUser`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
 
 Account files and `session-cache.json` contain credentials or sensitive continuation metadata. They are written with mode `0600` on POSIX systems. Protect the whole data directory with OS permissions and exclude it from version control and shared backups. On Windows, use filesystem ACLs rather than relying on POSIX mode bits.
 
@@ -1683,7 +1703,8 @@ go build -tags nowebui -o gsb ./cmd/gsb
 | `scripts/check-router-metadata.sh <base-url> [key]` | Verify that `/v1/models` carries context limits, output limits, and thinking metadata |
 | `scripts/check-router-metadata.sh --compare <bridge> <router> [bridge-key] [router-key]` | Report exactly which metadata fields the router dropped |
 | `scripts/diff-fingerprint.sh <dump.json> <reference.json>` | Compare a live request dump against the reference fingerprint; reports missing/extra headers, order mismatches, and value diffs |
-| `start.sh` | Build if needed, export `BRIDGE_HOME`, enable the UI, and start the daemon |
+| `scripts/omp-gsb-progress.ts` | Optional OMP extension displaying elapsed wait time for `gsb/` models until the first reasoning, text, or tool frame arrives |
+| `start.sh` | Build if needed (including Web UI changes), export `BRIDGE_HOME`, enable the UI, and start the daemon |
 
 ### 17.4 Repository map
 
