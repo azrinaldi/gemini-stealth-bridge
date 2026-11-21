@@ -1435,6 +1435,7 @@
     .priority-item:active { cursor: grabbing; }
     .priority-item.is-dragged { opacity: 0.45; }
     .priority-grip { color: var(--text-muted); letter-spacing: -2px; user-select: none; }
+    .priority-rank { min-width: 18px; font-size: 0.75rem; color: var(--text-muted); text-align: right; user-select: none; }
     .priority-id { flex: 1; overflow: hidden; text-overflow: ellipsis; }
     .priority-controls { display: flex; gap: 3px; }
 
@@ -3350,9 +3351,44 @@
           wrap.appendChild(chip);
         });
       }
+      function mergePriorityIDs(priorityIds, accounts) {
+        const seen = new Set();
+        const merged = [];
+        (Array.isArray(priorityIds) ? priorityIds : []).forEach(function (raw) {
+          const id = String(raw || '').trim();
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            merged.push(id);
+          }
+        });
+        (Array.isArray(accounts) ? accounts : []).forEach(function (acct) {
+          const id = String((acct && acct.id) || '').trim();
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            merged.push(id);
+          }
+        });
+        return merged;
+      }
+
       function getPriorityList() {
         return Array.from(document.querySelectorAll('#cfg-priority-list [data-account-id]')).map(function (el) {
           return el.getAttribute('data-account-id');
+        });
+      }
+
+      function syncPriorityListUI(list) {
+        if (!list) return;
+        const rows = Array.from(list.querySelectorAll(':scope > [data-account-id]'));
+        rows.forEach(function (row, idx) {
+          const id = row.getAttribute('data-account-id') || '';
+          row.setAttribute('aria-label', id + ', priority ' + (idx + 1));
+          const rank = row.querySelector('.priority-rank');
+          if (rank) rank.textContent = String(idx + 1);
+          const up = row.querySelector('[data-dir="-1"]');
+          const down = row.querySelector('[data-dir="1"]');
+          if (up) up.disabled = idx === 0;
+          if (down) down.disabled = idx === rows.length - 1;
         });
       }
 
@@ -3360,25 +3396,79 @@
         const list = document.getElementById('cfg-priority-list');
         if (!list) return;
         list.textContent = '';
-        (Array.isArray(ids) ? ids : []).forEach(function (id, index, all) {
+        if (!list._priorityDragBound) {
+          list._priorityDragBound = true;
+          list.addEventListener('dragover', function (ev) {
+            if (!list._dragged) return;
+            ev.preventDefault();
+            if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+            const targetRow = ev.target && ev.target.closest ? ev.target.closest('.priority-item') : null;
+            if (!targetRow) {
+              const rows = Array.from(list.querySelectorAll(':scope > .priority-item'));
+              const last = rows[rows.length - 1];
+              if (last && last !== list._dragged && ev.clientY > last.getBoundingClientRect().bottom) {
+                list.appendChild(list._dragged);
+                syncPriorityListUI(list);
+              }
+            }
+          });
+          list.addEventListener('drop', function (ev) {
+            if (!list._dragged) return;
+            ev.preventDefault();
+            syncPriorityListUI(list);
+            updateConfigDirtyState();
+          });
+        }
+        const items = Array.isArray(ids) ? ids : [];
+        if (!items.length) {
+          const empty = document.createElement('span');
+          empty.className = 'helper';
+          empty.textContent = 'No accounts loaded yet.';
+          list.appendChild(empty);
+          return;
+        }
+        items.forEach(function (id) {
           const row = document.createElement('div');
           row.className = 'priority-item';
           row.draggable = true;
           row.setAttribute('role', 'option');
           row.setAttribute('data-account-id', id);
-          row.setAttribute('aria-label', id + ', priority ' + (index + 1));
-          row.addEventListener('dragstart', function () { list._dragged = row; row.classList.add('is-dragged'); });
-          row.addEventListener('dragend', function () { row.classList.remove('is-dragged'); list._dragged = null; });
+          row.addEventListener('dragstart', function (ev) {
+            list._dragged = row;
+            row.classList.add('is-dragged');
+            if (ev.dataTransfer) {
+              ev.dataTransfer.effectAllowed = 'move';
+              ev.dataTransfer.setData('text/plain', id);
+            }
+          });
+          row.addEventListener('dragend', function () {
+            row.classList.remove('is-dragged');
+            list._dragged = null;
+            syncPriorityListUI(list);
+            updateConfigDirtyState();
+          });
           row.addEventListener('dragover', function (ev) {
-            ev.preventDefault();
             const dragged = list._dragged;
-            if (dragged && dragged !== row) list.insertBefore(dragged, row);
+            if (!dragged) return;
+            ev.preventDefault();
+            if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+            if (dragged === row) return;
+            const rect = row.getBoundingClientRect();
+            const placeAfter = ev.clientY > rect.top + rect.height / 2;
+            const refNode = placeAfter ? row.nextSibling : row;
+            if (dragged !== refNode && dragged.nextSibling !== refNode) {
+              list.insertBefore(dragged, refNode);
+              syncPriorityListUI(list);
+            }
           });
           const grip = document.createElement('span');
           grip.className = 'priority-grip';
           grip.textContent = '⋮⋮';
           grip.setAttribute('aria-hidden', 'true');
           row.appendChild(grip);
+          const rank = document.createElement('span');
+          rank.className = 'priority-rank mono';
+          row.appendChild(rank);
           const label = document.createElement('span');
           label.className = 'priority-id mono';
           label.textContent = id;
@@ -3392,17 +3482,23 @@
             button.textContent = entry[0];
             button.title = entry[2] + ' ' + id;
             button.setAttribute('aria-label', entry[2] + ' ' + id);
-            button.disabled = index + entry[1] < 0 || index + entry[1] >= all.length;
+            button.setAttribute('data-dir', String(entry[1]));
             button.addEventListener('click', function () {
-              const target = list.children[index + entry[1]];
-              if (target) list.insertBefore(row, entry[1] < 0 ? target : target.nextSibling);
+              const rows = Array.from(list.querySelectorAll(':scope > [data-account-id]'));
+              const cur = rows.indexOf(row);
+              const target = rows[cur + entry[1]];
+              if (!target) return;
+              list.insertBefore(row, entry[1] < 0 ? target : target.nextSibling);
+              syncPriorityListUI(list);
               updateConfigDirtyState();
+              if (!button.disabled) button.focus();
             });
             controls.appendChild(button);
           });
           row.appendChild(controls);
           list.appendChild(row);
         });
+        syncPriorityListUI(list);
       }
 
 
@@ -3462,7 +3558,7 @@
         document.getElementById('cfg-thinking').value = cfg.defaultThinking || 'low';
         document.getElementById('cfg-strategy').value = cfg.accountStrategy || 'rotate';
         document.getElementById('cfg-preflight').value = cfg.quotaPreflight || 'strict';
-        renderPriorityList(Array.isArray(cfg.accountPriority) ? cfg.accountPriority : []);
+        renderPriorityList(mergePriorityIDs(cfg.accountPriority, allAccountsCache));
         document.getElementById('cfg-max-rpm').value = cfg.maxRpmPerAccount != null ? cfg.maxRpmPerAccount : 24;
         document.getElementById('cfg-max-conc').value = cfg.maxConcurrentPerAccount != null ? cfg.maxConcurrentPerAccount : 2;
 
@@ -3495,10 +3591,12 @@
             lblRefreshLive.textContent = 'Refreshing…';
             iconRefresh.classList.add('is-spinning');
           }
-          const adm = await apiRequest('/v1/admin/config');
-          populateConfigForm(adm);
-          const acctsResp = await apiRequest('/v1/accounts' + (live ? '?live=1' : ''));
+          const [adm, acctsResp] = await Promise.all([
+            apiRequest('/v1/admin/config'),
+            apiRequest('/v1/accounts' + (live ? '?live=1' : ''))
+          ]);
           allAccountsCache = acctsResp.accounts || [];
+          populateConfigForm(adm);
           renderAccounts(allAccountsCache);
           if (live) {
             showBanner('ok', 'Live upstream quota refreshed for ' + allAccountsCache.length + ' account(s).');
