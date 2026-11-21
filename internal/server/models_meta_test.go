@@ -114,6 +114,9 @@ func TestModelsPayloadFallsBackToConfiguredLimits(t *testing.T) {
 }
 
 func TestCheckRouterMetadataScript(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not installed")
+	}
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not installed")
 	}
@@ -133,7 +136,7 @@ func TestCheckRouterMetadataScript(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	cmd := exec.Command("../../scripts/check-router-metadata.sh", ts.URL, "public")
+	cmd := exec.Command("sh", "../../scripts/check-router-metadata.sh", ts.URL, "public")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("check-router-metadata.sh failed: %v\n%s", err, string(out))
