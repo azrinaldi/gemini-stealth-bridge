@@ -329,15 +329,12 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 		return nil
 	}
 	pos := arrStart
-	for idx := 0; ; idx++ {
+	visibleIdx := 0
+	for {
+		idx := visibleIdx
 		pos = skipJSONWSAndCommas(text, pos)
 		if pos >= len(text) || text[pos] == ']' {
-			for j := idx; j < len(s.states); j++ {
-				if s.states[j].emittedAny() {
-					return s.revision(j, &s.states[j], "was removed after it was streamed")
-				}
-			}
-			return nil
+			return s.checkRemovedCalls(idx)
 		}
 		if text[pos] != '{' {
 			return s.abortOrRevision(idx, "regressed to a malformed tool-call object")
@@ -363,10 +360,11 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 			}
 			call := normCalls[0]
 			if call.Name == BuiltinMediaToolName {
-				// Server-side intercepted tool: hold back from client SSE stream.
+				// Intercepted media does not occupy a client call slot.
 				pos = objEnd
 				continue
 			}
+			visibleIdx++
 			if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && call.Name != s.contract.ForcedFunction {
 				return s.abortOrRevision(idx, "changed to a function that is not forced")
 			}
@@ -433,7 +431,7 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 			return nil
 		}
 		if name == BuiltinMediaToolName {
-			return nil
+			return s.checkRemovedCalls(idx)
 		}
 		if _, allowed := s.allow[name]; !allowed {
 			if idx < len(s.states) && s.states[idx].emittedAny() {
@@ -500,26 +498,13 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 	}
 }
 
-func rawArgsForCallIndex(text string, target int) string {
-	arrStart := findToolCallsArrayStart(text)
-	if arrStart < 0 {
-		return ""
+func (s *LiveToolCallStreamer) checkRemovedCalls(firstMissing int) error {
+	for idx := firstMissing; idx < len(s.states); idx++ {
+		if st := &s.states[idx]; st.emittedAny() {
+			return s.revision(idx, st, "was removed after it was streamed")
+		}
 	}
-	pos := arrStart
-	for idx := 0; ; idx++ {
-		pos = skipJSONWSAndCommas(text, pos)
-		if pos >= len(text) || text[pos] == ']' || text[pos] != '{' {
-			return ""
-		}
-		objEnd := findSingleBalancedObjectEnd(text, pos)
-		if objEnd <= pos {
-			return ""
-		}
-		if idx == target {
-			return extractRawArgumentsObject(text[pos:objEnd])
-		}
-		pos = objEnd
-	}
+	return nil
 }
 
 func (s *LiveToolCallStreamer) authoritativeToolCalls(calls []Call) []OpenAIToolCall {
@@ -558,9 +543,9 @@ func (s *LiveToolCallStreamer) Finalize(calls []Call, fullText string) []OpenAIT
 }
 
 // FinalizeError is Finalize with terminal revision errors reported to the caller.
-// Completed calls are authoritative: a streamed call whose name or parsed arguments
-// changed after any part was emitted yields an upstream_revision error instead of stale
-// argument bytes.
+// The caller supplies validated calls in client-visible order, excluding intercepted
+// server-side calls. Changes to an emitted call yield an upstream_revision error
+// instead of returning stale argument bytes.
 func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]OpenAIToolCall, error) {
 	if s != nil {
 		if fullText != "" {
@@ -621,21 +606,16 @@ func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]O
 					st.headerSent = true
 					emitToolCallHeader(s.emit, idx, callID, c.Name)
 				}
-				if st.sentArgs != "" {
-					completed, ok := completeStreamedArgs(st, rawArgsForCallIndex(fullText, idx), argsStr, c.Arguments)
-					if !ok {
-						return nil, s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
-					}
-					if tail := completed[len(st.sentArgs):]; tail != "" {
-						emitArgumentStringChunks(s.emit, idx, tail)
-					}
-					st.sentArgs = completed
-					st.finalArgs = completed
-				} else {
-					emitArgumentStringChunks(s.emit, idx, argsStr)
-					st.sentArgs = argsStr
-					st.finalArgs = argsStr
+				// PushError already finished every complete raw call. Any pending
+				// prefix must match the authoritative encoding before we append it.
+				if !strings.HasPrefix(argsStr, st.sentArgs) {
+					return nil, s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
 				}
+				if tail := argsStr[len(st.sentArgs):]; tail != "" {
+					emitArgumentStringChunks(s.emit, idx, tail)
+				}
+				st.sentArgs = argsStr
+				st.finalArgs = argsStr
 				st.doneArgs = c.Arguments
 				st.done = true
 			}

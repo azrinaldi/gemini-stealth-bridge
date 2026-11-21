@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -342,6 +343,57 @@ func TestLiveToolCallStreamerIncrementalAndMultiCall(t *testing.T) {
 	}
 }
 
+func TestLiveToolCallStreamerSkipsInterceptedMediaIndices(t *testing.T) {
+	tools := AugmentToolsWithMediaGenerator(sampleTools(), "auto")
+	const media = `{"name":"generate_media","arguments":{"media_type":"image","prompt":"a landscape"}}`
+	const first = `{"name":"read_file","arguments":{"path":"notes.txt"}}`
+	// The second client call starts with a noncanonical argument prefix.
+	partial := `{"tool_calls":[` + media + `,` + first + `,` + media +
+		`,{"name":"read_file","arguments":{"path": "` + strings.Repeat("a", 160)
+	full := partial + `.txt","lines":2}},` + media + `]}`
+	var deltas []map[string]any
+	s := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) { deltas = append(deltas, d) })
+	if err := s.PushError(partial); err != nil {
+		t.Fatal(err)
+	}
+	if got := reconstructStreamedArguments(deltas, 1); got == "" {
+		t.Fatal("second client call did not stream partial arguments at index 1")
+	}
+	res, err := InterpretReply(full, tools, "auto")
+	if err != nil || res == nil || len(res.Calls) != 5 {
+		t.Fatalf("InterpretReply = %+v, %v; want five calls", res, err)
+	}
+	final, err := s.FinalizeError([]Call{res.Calls[1], res.Calls[3]}, full)
+	if err != nil || len(final) != 2 {
+		t.Fatalf("FinalizeError = %+v, %v; want two client calls", final, err)
+	}
+	headers := make([]int, len(final))
+	for _, delta := range deltas {
+		for _, call := range delta["tool_calls"].([]map[string]any) {
+			idx := call["index"].(int)
+			if idx < 0 || idx >= len(final) {
+				t.Fatalf("unexpected streamed index %d: %+v", idx, call)
+			}
+			if id, ok := call["id"].(string); ok {
+				headers[idx]++
+				name := call["function"].(map[string]any)["name"]
+				if id != final[idx].ID || name != final[idx].Function.Name {
+					t.Fatalf("streamed header at index %d = %+v; final call = %+v", idx, call, final[idx])
+				}
+			}
+		}
+	}
+	for idx, call := range final {
+		if got := reconstructStreamedArguments(deltas, idx); headers[idx] != 1 || got != call.Function.Arguments {
+			t.Fatalf("index %d: %d headers and streamed args %q; want one header and %q", idx, headers[idx], got, call.Function.Arguments)
+		}
+	}
+	var revision *transport.UpstreamError
+	if err := s.PushError(`{"tool_calls":[` + media + `,` + first + `,` + media + `]}`); !errors.As(err, &revision) || revision.Code != "upstream_revision" {
+		t.Fatalf("removed client call should yield upstream_revision, got %v", err)
+	}
+}
+
 func TestLiveToolCallStreamerCompletedCallRevision(t *testing.T) {
 	tools := sampleTools()
 	complete := `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/a"}}]}`
@@ -617,6 +669,37 @@ func reconstructStreamedArguments(deltas []map[string]any, target int) string {
 	return out.String()
 }
 
+func TestCompactSchemaMapPreservesNamesAndLiterals(t *testing.T) {
+	literal := map[string]any{
+		"title":       "literal title",
+		"description": "long literal description",
+		"properties":  map[string]any{"$comment": "literal comment"},
+	}
+	schema := map[string]any{
+		"title":                "schema title",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"examples":   map[string]any{"type": "string", "description": "日本語の長い説明"},
+			"properties": map[string]any{"title": "nested schema title", "const": literal},
+		},
+		"patternProperties": map[string]any{"title": map[string]any{"default": literal}},
+		"$defs":             map[string]any{"$id": map[string]any{"enum": []any{literal}}},
+		"definitions":       map[string]any{"$comment": false},
+	}
+	want := map[string]any{
+		"properties": map[string]any{
+			"examples":   map[string]any{"type": "string", "description": "日本語..."},
+			"properties": map[string]any{"const": literal},
+		},
+		"patternProperties": map[string]any{"title": map[string]any{"default": literal}},
+		"$defs":             map[string]any{"$id": map[string]any{"enum": []any{literal}}},
+		"definitions":       map[string]any{"$comment": false},
+	}
+	if got := CompactSchemaMap(schema, 6); !reflect.DeepEqual(got, want) {
+		t.Fatalf("CompactSchemaMap = %#v; want %#v", got, want)
+	}
+}
+
 func TestToolSchemaCompactionParity(t *testing.T) {
 	defer SetCompactOptions(true, 400)
 
@@ -682,6 +765,16 @@ func TestToolSchemaCompactionParity(t *testing.T) {
 	res, err := InterpretReply(`{"tool_calls":[{"name":"tool_00","arguments":{"query":"ok"}}]}`, tools, "auto")
 	if err != nil || res == nil || len(res.Calls) != 1 {
 		t.Fatalf("expected valid call to pass validation, got res=%+v err=%v", res, err)
+	}
+
+	augTools := AugmentToolsWithMediaGenerator(tools, "auto")
+	_, err = InterpretReply(`{"tool_calls":[{"name":"generate_media","arguments":{"media_type":"audio","prompt":"draw a cat"}}]}`, augTools, "auto")
+	if err == nil || !strings.Contains(err.Error(), "not one of the allowed values") {
+		t.Fatalf("expected typed []string enum on generate_media to reject invalid media_type, got err=%v", err)
+	}
+	_, err = InterpretReply(`{"tool_calls":[{"name":"generate_media","arguments":{"media_type":"video","prompt":"a cat","duration":99}}]}`, augTools, "auto")
+	if err == nil || !strings.Contains(err.Error(), "not one of the allowed values") {
+		t.Fatalf("expected typed []int enum on generate_media to reject invalid duration, got err=%v", err)
 	}
 }
 

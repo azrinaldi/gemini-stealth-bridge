@@ -27,14 +27,15 @@ type persistedSessionEntry struct {
 }
 
 func (s *Server) sessionCacheDiskPath() string {
-	if s.Cfg.HomeDir == "" {
+	homeDir := s.cfgSnapshot().HomeDir
+	if homeDir == "" {
 		return ""
 	}
-	st, err := os.Stat(s.Cfg.HomeDir)
+	st, err := os.Stat(homeDir)
 	if err != nil || !st.IsDir() {
 		return ""
 	}
-	return filepath.Join(s.Cfg.HomeDir, "session-cache.json")
+	return filepath.Join(homeDir, "session-cache.json")
 }
 
 func (s *Server) loadSessionCacheFromDisk() {
@@ -262,7 +263,7 @@ func (s *Server) saveSessionContinuation(
 	oaCalls []toolbridge.OpenAIToolCall,
 	cid, rid, rcid, contextToken string,
 ) {
-	if !s.Cfg.SessionCache || cid == "" || rid == "" || rcid == "" {
+	if !s.cfgSnapshot().SessionCache || cid == "" || rid == "" || rcid == "" {
 		return
 	}
 	var replyMsg map[string]any

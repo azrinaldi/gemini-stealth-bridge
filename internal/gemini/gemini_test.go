@@ -3,12 +3,18 @@ package gemini
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 	"unicode/utf8"
 )
 
@@ -411,36 +417,68 @@ func TestMultilingualThinkingExtraction(t *testing.T) {
 }
 
 func TestBootstrapRotation429NotAuthError(t *testing.T) {
-	doer := &stubGeminiDoer{
-		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
-			u := req.URL.String()
-			switch {
-			case strings.HasSuffix(u, "/app"):
-				return &fhttp.Response{
-					StatusCode: 200,
-					Header:     fhttp.Header{},
-					Body:       io.NopCloser(strings.NewReader(`<html>no token</html>`)),
-				}, nil
-			case strings.Contains(u, "RotateCookies"):
-				return &fhttp.Response{
-					StatusCode: 429,
-					Header:     fhttp.Header{"Retry-After": []string{"60"}},
-					Body:       io.NopCloser(strings.NewReader(`rate limited`)),
-				}, nil
-			default:
-				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+	for _, tc := range []struct {
+		name        string
+		appLimited  bool
+		wantMessage string
+	}{
+		{"app", true, "upstream rate limited"},
+		{"rotation", false, "cookie rotation rate limited (HTTP 429)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var appCalls, rotationCalls int
+			doer := &stubGeminiDoer{fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				switch {
+				case strings.HasSuffix(req.URL.Path, "/app"):
+					appCalls++
+					if tc.appLimited {
+						return &fhttp.Response{
+							StatusCode: 429,
+							Header:     fhttp.Header{"Retry-After": {"120"}},
+							Body:       io.NopCloser(strings.NewReader("rate limited")),
+						}, nil
+					}
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{"Retry-After": {"2"}},
+						Body:       io.NopCloser(strings.NewReader("<html>no token</html>")),
+					}, nil
+				case req.URL.Path == "/RotateCookies":
+					rotationCalls++
+					return &fhttp.Response{
+						StatusCode: 429,
+						Header: fhttp.Header{
+							"Retry-After": {"120"},
+							"Set-Cookie":  {"__Secure-1PSIDTS=fixture-new; Path=/; Secure"},
+						},
+						Body: io.NopCloser(strings.NewReader("rate limited")),
+					}, nil
+				default:
+					t.Fatalf("unexpected request to %s", req.URL.Path)
+					return nil, nil
+				}
+			}}
+			pool := transport.NewPool(transport.PoolOptions{
+				ClientConfig: transport.ClientConfig{CustomDoer: doer},
+				MaxSessions:  2,
+			})
+			ac := NewAccountClient("acct_429", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", pool, cookies.NewRotator())
+			err := ac.Bootstrap(context.Background())
+			var ue *transport.UpstreamError
+			if !errors.As(err, &ue) || ue.StatusCode != 429 || ue.Code != "rate_limit_error" || !strings.Contains(err.Error(), tc.wantMessage) {
+				t.Fatalf("expected 429 rate_limit_error with %q, got %v", tc.wantMessage, err)
 			}
-		},
-	}
-	pool := transport.NewPool(transport.PoolOptions{
-		ClientConfig: transport.ClientConfig{CustomDoer: doer},
-		MaxSessions:  2,
-	})
-	ac := NewAccountClient("acct_429", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", pool, cookies.NewRotator())
-	err := ac.Bootstrap(context.Background())
-	var ue *transport.UpstreamError
-	if !errors.As(err, &ue) || ue.StatusCode != 429 || ue.Code != "rate_limit_error" {
-		t.Fatalf("expected 429 rate_limit_error on rotation 429 during bootstrap, got %+v (%v)", ue, err)
+			if got := ue.Headers["retry-after"]; got != "120" {
+				t.Errorf("retry-after = %q, want 120 from the throttled request", got)
+			}
+			wantRotations := 1
+			if tc.appLimited {
+				wantRotations = 0
+			}
+			if appCalls != 1 || rotationCalls != wantRotations {
+				t.Errorf("got %d page requests and %d rotations, want 1 and %d", appCalls, rotationCalls, wantRotations)
+			}
+		})
 	}
 }
 
@@ -718,4 +756,1715 @@ func TestCardContentKeepsLinkWhenBodyMissing(t *testing.T) {
 	if !strings.Contains(got, "card_content") {
 		t.Errorf("card link was stripped even though field 22 was empty: %q", got)
 	}
+}
+
+type scriptedChunkReader struct {
+	chunks []scriptedChunk
+	idx    int
+	off    int
+}
+
+type scriptedChunk struct {
+	waitCtx bool
+	delay   time.Duration
+	data    string
+	err     error
+}
+
+func (r *scriptedChunkReader) Read(p []byte) (int, error) {
+	return 0, errors.New("unexpected Read without ctx")
+}
+
+type ctxScriptedReadCloser struct {
+	ctx    context.Context
+	chunks []scriptedChunk
+	idx    int
+	off    int
+}
+
+func (r *ctxScriptedReadCloser) Read(p []byte) (int, error) {
+	for r.idx < len(r.chunks) {
+		cur := &r.chunks[r.idx]
+		if cur.delay > 0 {
+			time.Sleep(cur.delay)
+			cur.delay = 0
+		}
+		if cur.waitCtx {
+			cur.waitCtx = false
+			<-r.ctx.Done()
+		}
+		if r.off < len(cur.data) {
+			n := copy(p, cur.data[r.off:])
+			r.off += n
+			return n, nil
+		}
+		err := cur.err
+		r.idx++
+		r.off = 0
+		if err != nil {
+			return 0, err
+		}
+	}
+	return 0, io.EOF
+}
+
+func (r *ctxScriptedReadCloser) Close() error { return nil }
+
+func TestStreamGenerateNoFalseStallWhenFrameArrivesAtWatchdogExpiry(t *testing.T) {
+	inner := `[null,["c_1","r_1"],null,null,[["rc_1",["valid answer"],null,null,null,null,null,null,[2]]],{"26":"ctx1","40":"95a4c0abcba24364","43":"4 Argon"}]`
+	esc, _ := marshalJSONString(inner)
+	frameLine := ")]}'\n\n" + `[["wrb.fr",null,` + esc + `]]` + "\n"
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{},
+				Body: &ctxScriptedReadCloser{
+					ctx: req.Context(),
+					chunks: []scriptedChunk{
+						{waitCtx: true, data: frameLine, err: io.EOF},
+					},
+				},
+			}, nil
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+	})
+	ac := NewAccountClient("acct1", "SAPISID=sap1", "", pool, nil)
+	ac.SetTokens("at_tok", "bl_tok", "fsid_1")
+
+	var gotFrames int
+	res, err := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{
+		Model:          &ModelInfo{ModelID: "95a4c0abcba24364", ModelName: "gemini-argon", Capacity: 2, ModelNumber: 4},
+		ThinkingLevel:  1,
+		NoFrameTimeout: 10 * time.Millisecond,
+	}, func(update *LineParseResult) error {
+		gotFrames += len(update.Frames)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil error when valid frame delivered after watchdog expiry, got %v", err)
+	}
+	if res == nil || res.Status != 200 || res.Empty || gotFrames == 0 {
+		t.Fatalf("unexpected response: res=%+v gotFrames=%d", res, gotFrames)
+	}
+}
+
+func TestStreamGeneratePartialFrameAtWatchdogExpiryNotClientCancelled(t *testing.T) {
+	inner := `[null,["c_1","r_1"],null,null,[["rc_1",["partial"],null,null,null,null,null,null,[1]]],{"40":"95a4c0abcba24364"}]`
+	esc, _ := marshalJSONString(inner)
+	partialLine := ")]}'\n\n" + `[["wrb.fr",null,` + esc + `]]` + "\n"
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{},
+				Body: &ctxScriptedReadCloser{
+					ctx: req.Context(),
+					chunks: []scriptedChunk{
+						{waitCtx: true, data: partialLine},
+						{err: context.Canceled},
+					},
+				},
+			}, nil
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+	})
+	ac := NewAccountClient("acct1", "SAPISID=sap1", "", pool, nil)
+	ac.SetTokens("at_tok", "bl_tok", "fsid_1")
+
+	_, err := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{
+		Model:          &ModelInfo{ModelID: "95a4c0abcba24364", ModelName: "gemini-argon", Capacity: 2, ModelNumber: 4},
+		ThinkingLevel:  1,
+		NoFrameTimeout: 10 * time.Millisecond,
+	}, nil)
+	var ue *transport.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected UpstreamError, got %v", err)
+	}
+	if ue.Code == "client_cancelled" || ue.Code == "upstream_stalled" {
+		t.Fatalf("expected partial frame at watchdog expiry NOT to return client_cancelled or upstream_stalled, got %d %s", ue.StatusCode, ue.Code)
+	}
+	if ue.StatusCode != 502 || ue.Code != "incomplete_upstream_response" {
+		t.Fatalf("expected 502 incomplete_upstream_response, got %d %s", ue.StatusCode, ue.Code)
+	}
+}
+
+func TestStreamGenerateKeepaliveOnlyReturnsUpstreamStalled(t *testing.T) {
+	keepalive := ")]}'\n\n" + `[["wrb.fr",null,null,null,null,[3]]]` + "\n"
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{},
+				Body: &ctxScriptedReadCloser{
+					ctx: req.Context(),
+					chunks: []scriptedChunk{
+						{data: keepalive},
+						{waitCtx: true, err: context.Canceled},
+					},
+				},
+			}, nil
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+	})
+	ac := NewAccountClient("acct1", "SAPISID=sap1", "", pool, nil)
+	ac.SetTokens("at_tok", "bl_tok", "fsid_1")
+
+	_, err := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{
+		Model:          &ModelInfo{ModelID: "95a4c0abcba24364", ModelName: "gemini-argon", Capacity: 2, ModelNumber: 4},
+		ThinkingLevel:  1,
+		NoFrameTimeout: 10 * time.Millisecond,
+	}, nil)
+	var ue *transport.UpstreamError
+	if !errors.As(err, &ue) || ue.StatusCode != 504 || ue.Code != "upstream_stalled" {
+		t.Fatalf("expected 504 upstream_stalled for keepalive-only stream, got %v", err)
+	}
+}
+
+func TestStreamGenerateWatchdogRequiresMeaningfulCandidate(t *testing.T) {
+	const timeout = 10 * time.Second
+	line := func(payload string) string {
+		esc, _ := marshalJSONString(payload)
+		return `[["wrb.fr",null,` + esc + `]]` + "\n"
+	}
+	empty := line(`[null,null,null,null,[["rc_1",[""],null,null,null,null,null,null,[1]]]]`)
+	activity := line(`[null,null,null,null,null,null,["Searching the web"]]`)
+	done := line(`[null,null,null,null,[["rc_1",["answer"],null,null,null,null,null,null,[2]]],{"26":"ctx1"}]`)
+	for _, tc := range []struct {
+		name      string
+		chunks    []scriptedChunk
+		wantStall bool
+	}{
+		{"empty candidate", []scriptedChunk{{data: empty}, {waitCtx: true, err: context.Canceled}}, true},
+		{"repeated activity", []scriptedChunk{{data: activity}, {delay: 6 * time.Second, data: activity}, {waitCtx: true, err: context.Canceled}}, true},
+		{"new activity extends deadline", []scriptedChunk{{delay: 6 * time.Second, data: activity}, {delay: 6 * time.Second, data: done}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				doer := &stubGeminiDoer{fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					return &fhttp.Response{StatusCode: 200, Body: &ctxScriptedReadCloser{ctx: req.Context(), chunks: tc.chunks}}, nil
+				}}
+				pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}})
+				ac := NewAccountClient("fixture", "SAPISID=fixture", "", pool, nil)
+				ac.SetTokens("at", "bl", "fsid")
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				start := time.Now()
+				var answer string
+				_, err := ac.StreamGenerateLive(ctx, "hello", StreamOptions{NoFrameTimeout: timeout}, func(update *LineParseResult) error {
+					for _, f := range update.Frames {
+						if f.Done {
+							answer = f.Text
+						}
+					}
+					return nil
+				})
+				if tc.wantStall {
+					var ue *transport.UpstreamError
+					if !errors.As(err, &ue) || ue.StatusCode != 504 || ue.Code != "upstream_stalled" || time.Since(start) != timeout {
+						t.Fatalf("expected upstream_stalled at %s, got %v after %s", timeout, err, time.Since(start))
+					}
+				} else if err != nil || answer != "answer" {
+					t.Fatalf("expected completed answer after new activity, got %q, %v", answer, err)
+				}
+			})
+		})
+	}
+}
+
+func fhttpHeader(req *fhttp.Request, key string) string {
+	if vals := req.Header[strings.ToLower(key)]; len(vals) > 0 {
+		return vals[0]
+	}
+	return req.Header.Get(key)
+}
+
+func TestStreamGenerateUsesPostBootstrapSelfHealedCookie(t *testing.T) {
+	var streamCookie string
+	rotated := false
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.HasSuffix(u, "/app"):
+				if !rotated {
+					return &fhttp.Response{StatusCode: 200, Header: fhttp.Header{}, Body: io.NopCloser(strings.NewReader(`<html>expired</html>`))}, nil
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_healed","cfb2h":"boq_1","FdrFJe":"111"}`)),
+				}, nil
+			case strings.Contains(u, "RotateCookies"):
+				rotated = true
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=healed_ts; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			case strings.Contains(u, "StreamGenerate"):
+				streamCookie = fhttpHeader(req, "cookie")
+				inner := `[null,["c_1","r_1"],null,null,[["rc_1",["ok"],null,null,null,null,null,null,[2]]],{"40":"95a4c0abcba24364","43":"4 Argon"}]`
+				esc, _ := marshalJSONString(inner)
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(")]}'\n\n" + `[["wrb.fr",null,` + esc + `]]` + "\n")),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+	defer pool.Reset()
+
+	// Pre-populate session in pool with the stale cookie before StreamGenerateLive runs.
+	staleCookie := "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=stale_ts"
+	if _, err := pool.AcquireWithProxyWithGen(context.Background(), "acct_heal", staleCookie, "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	ac := NewAccountClient("acct_heal", staleCookie, "", pool, cookies.NewRotator())
+	_, err := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{
+		Model:         &ModelInfo{ModelID: "95a4c0abcba24364", ModelName: "gemini-argon"},
+		ThinkingLevel: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("StreamGenerateLive failed: %v", err)
+	}
+	if !strings.Contains(streamCookie, "__Secure-1PSIDTS=healed_ts") {
+		t.Fatalf("expected StreamGenerate to send post-bootstrap healed cookie, got %q", streamCookie)
+	}
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=healed_ts") {
+		t.Fatalf("expected AccountClient to retain healed cookie, got %q", ac.CookieHeader())
+	}
+}
+
+func TestUploadFileDoesNotClobberConcurrentRotation(t *testing.T) {
+	leaseEntered := make(chan struct{})
+	releaseLease := make(chan struct{})
+	uploadStarted := make(chan struct{})
+	releaseUpload := make(chan struct{})
+	var uploadReqCookie string
+	var rotCalls int
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.Contains(u, "content-push.googleapis.com"):
+				uploadReqCookie = fhttpHeader(req, "cookie")
+				close(uploadStarted)
+				<-releaseUpload
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=stale_upload_ts; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("/contrib_service/ok.png")),
+				}, nil
+			case strings.Contains(u, "RotateCookies"):
+				rotCalls++
+				ts := "rotated_while_queued"
+				if rotCalls > 1 {
+					ts = "rotated_while_upload_inflight"
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=" + ts + "; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2, MaxQueue: 4})
+	defer pool.Reset()
+
+	ac := NewAccountClient("acct_up", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=init_ts", "", pool, cookies.NewRotator())
+	sess, err := ac.acquireSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the session lease first so UploadFile blocks waiting in sess.Lease.
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- sess.Lease(context.Background(), func(_ string) error {
+			close(leaseEntered)
+			<-releaseLease
+			return nil
+		})
+	}()
+	<-leaseEntered
+
+	upDone := make(chan error, 1)
+	go func() {
+		_, uErr := ac.UploadFile(context.Background(), []byte("pngdata"), "a.png", "image/png")
+		upDone <- uErr
+	}()
+
+	// Rotate cookies while UploadFile is queued in Lease, then release holder.
+	time.Sleep(25 * time.Millisecond)
+	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
+		t.Fatalf("RotateCookies #1 failed: res=%+v err=%v", rotRes, err)
+	}
+	close(releaseLease)
+	if err := <-holderDone; err != nil {
+		t.Fatal(err)
+	}
+	<-uploadStarted
+	if !strings.Contains(uploadReqCookie, "__Secure-1PSIDTS=rotated_while_queued") {
+		t.Fatalf("expected UploadFile to send latest rotated cookie instead of stale leasedCookie, got %q", uploadReqCookie)
+	}
+
+	// Rotate cookies AGAIN while upload HTTP call is in flight (before Set-Cookie absorption).
+	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
+		t.Fatalf("RotateCookies #2 failed: res=%+v err=%v", rotRes, err)
+	}
+	close(releaseUpload)
+	if err := <-upDone; err != nil {
+		t.Fatalf("UploadFile failed: %v", err)
+	}
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=rotated_while_upload_inflight") {
+		t.Fatalf("UploadFile Set-Cookie clobbered in-flight rotation: %q", ac.CookieHeader())
+	}
+}
+
+func TestUploadFileFallbackPreservesConcurrentRotation(t *testing.T) {
+	initEntered := make(chan struct{})
+	releaseInit := make(chan struct{})
+	putEntered := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putCookie string
+	var rotCalls int
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.Contains(u, "content-push.googleapis.com"):
+				return &fhttp.Response{StatusCode: 500, Header: fhttp.Header{}, Body: io.NopCloser(strings.NewReader("fail"))}, nil
+			case strings.Contains(u, "push.clients6.google.com/upload/") && fhttpHeader(req, "x-goog-upload-command") == "start":
+				close(initEntered)
+				<-releaseInit
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header: fhttp.Header{
+						"X-Goog-Upload-Url": []string{"https://push.clients6.google.com/upload/put1"},
+						"Set-Cookie":        []string{"__Secure-1PSIDTS=stale_init_ts; Path=/; Secure"},
+					},
+					Body: io.NopCloser(strings.NewReader("")),
+				}, nil
+			case strings.Contains(u, "push.clients6.google.com/upload/put1"):
+				putCookie = fhttpHeader(req, "cookie")
+				close(putEntered)
+				<-releasePut
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=stale_put_ts; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("/contrib_service/fallback.png")),
+				}, nil
+			case strings.Contains(u, "RotateCookies"):
+				rotCalls++
+				ts := "rot_during_init"
+				if rotCalls > 1 {
+					ts = "rot_during_put"
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=" + ts + "; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2, MaxQueue: 4})
+	defer pool.Reset()
+	ac := NewAccountClient("acct_up_fb", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=init_ts", "", pool, cookies.NewRotator())
+
+	upDone := make(chan error, 1)
+	go func() {
+		_, err := ac.UploadFile(context.Background(), []byte("pngdata"), "b.png", "image/png")
+		upDone <- err
+	}()
+	<-initEntered
+	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
+		t.Fatalf("RotateCookies #1 failed: res=%+v err=%v", rotRes, err)
+	}
+	close(releaseInit)
+
+	<-putEntered
+	if rotRes, err := ac.RotateCookies(context.Background()); err != nil || !rotRes.Rotated {
+		t.Fatalf("RotateCookies #2 failed: res=%+v err=%v", rotRes, err)
+	}
+	close(releasePut)
+
+	if err := <-upDone; err != nil {
+		t.Fatalf("UploadFile fallback failed: %v", err)
+	}
+	if !strings.Contains(putCookie, "__Secure-1PSIDTS=rot_during_init") {
+		t.Fatalf("expected PUT step to read latest rotated cookie, got %q", putCookie)
+	}
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=rot_during_put") {
+		t.Fatalf("fallback upload Set-Cookie clobbered rotated cookie: %q", ac.CookieHeader())
+	}
+}
+
+func TestPersistStateSerializedNoStaleOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "acct.json")
+	ac := NewAccountClient("acct_persist", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts0", path, nil, nil)
+	ac.persistState()
+
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if idx%2 == 0 {
+				ac.SetDisabled(idx%4 == 0)
+			} else {
+				ac.SetSurfaceStatus("geminiWeb", "ok")
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Final rotated cookie write followed by concurrent status updates must preserve latest cookie on disk.
+	ac.absorbAndPersistCookies([]string{"__Secure-1PSIDTS=final_ts; Path=/; Secure"})
+	var wg2 sync.WaitGroup
+	for range 10 {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			ac.SetDisabled(false)
+		}()
+	}
+	wg2.Wait()
+
+	rec, _, err := cookies.LoadAccountFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Cookies, "__Secure-1PSIDTS=final_ts") {
+		t.Fatalf("disk lost final cookie during concurrent persistState: %q", rec.Cookies)
+	}
+}
+
+func TestReloadFromDiskIfNewerAllFieldsAndMtimeRecheck(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reload.json")
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Name:         "reload",
+		Email:        "user@example.com",
+		Cookies:      "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1",
+		AT:           "at1",
+		AuthUser:     1,
+		Disabled:     false,
+		AccountGroup: "team-a",
+		ProxyURL:     "http://127.0.0.1:8001",
+		Surfaces:     map[string]string{"geminiWeb": "ok"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: &stubGeminiDoer{}}, MaxSessions: 2})
+	defer pool.Reset()
+	ac, err := LoadAccountFromFile(path, pool, cookies.NewRotator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac.mu.Lock()
+	ac.modelsCache = &AvailableModelsResult{Status: 200}
+	ac.mu.Unlock()
+
+	// Unchanged mtime returns false and preserves modelsCache.
+	if reloaded := ac.ReloadFromDiskIfNewer(); reloaded {
+		t.Fatal("expected ReloadFromDiskIfNewer=false when mtime unchanged")
+	}
+	ac.mu.RLock()
+	hasCache := ac.modelsCache != nil
+	ac.mu.RUnlock()
+	if !hasCache {
+		t.Fatal("expected modelsCache preserved on unchanged mtime")
+	}
+
+	// Update file with newer mtime and changed metadata + cookies.
+	time.Sleep(15 * time.Millisecond)
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Name:         "reload",
+		Email:        "user@example.com",
+		Cookies:      "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts2",
+		AT:           "at2",
+		AuthUser:     2,
+		Disabled:     true,
+		AccountGroup: "team-b",
+		ProxyURL:     "http://127.0.0.1:8002",
+		Surfaces:     map[string]string{"geminiWeb": "blocked"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure mtime strictly advances even on coarse filesystems.
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(path, future, future)
+
+	if reloaded := ac.ReloadFromDiskIfNewer(); !reloaded {
+		t.Fatal("expected ReloadFromDiskIfNewer=true when file updated")
+	}
+	ac.mu.RLock()
+	gotDisabled := ac.disabled
+	gotGroup := ac.accountGroup
+	gotProxy := ac.proxyURL
+	gotSurf := ac.surfaces["geminiWeb"]
+	gotAuthUser := ac.authUser
+	gotAT := ac.at
+	gotCache := ac.modelsCache
+	ac.mu.RUnlock()
+	if !gotDisabled || gotGroup != "team-b" || gotProxy != "http://127.0.0.1:8002" || gotSurf != "blocked" || gotAuthUser != 2 || gotAT != "at2" || gotCache != nil {
+		t.Fatalf("reload mismatch: disabled=%v group=%q proxy=%q surf=%q authUser=%d at=%q cache=%v",
+			gotDisabled, gotGroup, gotProxy, gotSurf, gotAuthUser, gotAT, gotCache)
+	}
+
+	// Re-clearing Disabled=false on disk must clear ac.disabled in memory.
+	time.Sleep(15 * time.Millisecond)
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Name:     "reload",
+		Email:    "user@example.com",
+		Cookies:  "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts2",
+		AuthUser: 2,
+		Disabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	future2 := time.Now().Add(4 * time.Second)
+	_ = os.Chtimes(path, future2, future2)
+	if !ac.ReloadFromDiskIfNewer() {
+		t.Fatal("expected ReloadFromDiskIfNewer=true on Disabled=false update")
+	}
+	ac.mu.RLock()
+	stillDisabled := ac.disabled
+	ac.mu.RUnlock()
+	if stillDisabled {
+		t.Fatal("expected Disabled=false on disk to clear ac.disabled")
+	}
+
+	// Concurrent ReloadFromDiskIfNewer + persistState race check.
+	var wg sync.WaitGroup
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				ac.ReloadFromDiskIfNewer()
+				ac.persistState()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRotateOnClientInFlightRejectsStaleOverwriteOnDiskReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rot_reload.json")
+	initCookie := "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_init"
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Name:    "rot_reload",
+		Email:   "u@example.com",
+		Cookies: initCookie,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rotStarted := make(chan struct{})
+	releaseRot := make(chan struct{})
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			close(rotStarted)
+			<-releaseRot
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=ts_from_inflight_rot; Path=/; Secure"}},
+				Body:       io.NopCloser(strings.NewReader("[]")),
+			}, nil
+		},
+	}
+	sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+	ac, err := LoadAccountFromFile(path, nil, cookies.NewRotator())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotCh := make(chan *cookies.RotateResult, 1)
+	go func() {
+		r, _ := ac.rotateOnClient(context.Background(), sc)
+		rotCh <- r
+	}()
+	<-rotStarted
+
+	// External disk reload advances cookieGen while rotateOnClient is in flight.
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Name:    "rot_reload",
+		Email:   "u@example.com",
+		Cookies: "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_relogin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(path, future, future)
+	if !ac.ReloadFromDiskIfNewer() {
+		t.Fatal("expected ReloadFromDiskIfNewer to pick up new disk cookie")
+	}
+
+	close(releaseRot)
+	res := <-rotCh
+	if res == nil || res.Rotated {
+		t.Fatalf("expected stale in-flight rotateOnClient to return Rotated=false, got %+v", res)
+	}
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=ts_disk_relogin") {
+		t.Fatalf("expected disk relogin cookie preserved, got %q", ac.CookieHeader())
+	}
+}
+
+func TestRotateOnClientConcurrentWithStreamAbsorption(t *testing.T) {
+	rotStarted := make(chan struct{})
+	releaseRot := make(chan struct{})
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			if strings.Contains(req.URL.String(), "RotateCookies") {
+				close(rotStarted)
+				<-releaseRot
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=rot_ts; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			}
+			return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
+		},
+	}
+	sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+	ac := NewAccountClient("acct_conc", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=init_ts", "", nil, cookies.NewRotator())
+
+	rotCh := make(chan *cookies.RotateResult, 1)
+	go func() {
+		r, _ := ac.rotateOnClient(context.Background(), sc)
+		rotCh <- r
+	}()
+	<-rotStarted
+
+	// Stream response Set-Cookie absorbed while rotateOnClient is in flight.
+	if !ac.absorbAndPersistCookiesWithGen([]string{"__Secure-1PSIDTS=stream_newer_ts; Path=/; Secure"}, ac.cookieGen.Load(), true) {
+		t.Fatal("expected stream Set-Cookie absorption to succeed")
+	}
+	close(releaseRot)
+	res := <-rotCh
+	if res == nil || res.Rotated {
+		t.Fatalf("expected concurrent rotateOnClient not to clobber stream absorption (Rotated=false), got %+v", res)
+	}
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=stream_newer_ts") {
+		t.Fatalf("expected stream_newer_ts preserved, got %q", ac.CookieHeader())
+	}
+}
+
+func TestBootstrapFollowsSafeSameOriginRedirects(t *testing.T) {
+	t.Run("safe_locale_and_relative_redirects_succeed", func(t *testing.T) {
+		var hops int
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				hops++
+				switch u {
+				case "https://gemini.google.com/app":
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/app?hl=id"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				case "https://gemini.google.com/app?hl=id":
+					return &fhttp.Response{
+						StatusCode: 307,
+						Header:     fhttp.Header{"Location": []string{"/app?gl=ID"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				case "https://gemini.google.com/app?gl=ID":
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_redirect_ok","cfb2h":"boq_r","FdrFJe":"777"}`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+			},
+		}
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac := NewAccountClient("acct_redir", "SAPISID=sap1; __Secure-1PSID=p1", "", pool, cookies.NewRotator())
+		if err := ac.Bootstrap(context.Background()); err != nil {
+			t.Fatalf("expected safe same-origin redirects to succeed, got %v", err)
+		}
+		if hops != 3 {
+			t.Fatalf("expected 3 hops, got %d", hops)
+		}
+	})
+
+	t.Run("signin_redirect_strips_query_secret", func(t *testing.T) {
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				if strings.Contains(req.URL.String(), "RotateCookies") {
+					return &fhttp.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader("unauth"))}, nil
+				}
+				return &fhttp.Response{
+					StatusCode: 302,
+					Header:     fhttp.Header{"Location": []string{"https://accounts.google.com/ServiceLogin?continue=x&secret=MY_SECRET"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			},
+		}
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac := NewAccountClient("acct_signin", "SAPISID=sap1; __Secure-1PSID=p1", "", pool, cookies.NewRotator())
+		err := ac.Bootstrap(context.Background())
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != 401 || ue.Code != "auth_redirect" {
+			t.Fatalf("expected 401 auth_redirect, got %v", err)
+		}
+		if !strings.Contains(ue.Message, "accounts.google.com/ServiceLogin") || strings.Contains(ue.Message, "MY_SECRET") {
+			t.Fatalf("unexpected error message (must sanitize secret): %q", ue.Message)
+		}
+	})
+
+	t.Run("consent_redirect_not_auth_redirect_and_loop_bounded", func(t *testing.T) {
+		var loopCalls int
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				if strings.Contains(u, "RotateCookies") {
+					return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("[]"))}, nil
+				}
+				if strings.Contains(u, "consent") {
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://consent.google.com/ml?continue=https://accounts.google.com/ServiceLogin"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				}
+				loopCalls++
+				return &fhttp.Response{
+					StatusCode: 302,
+					Header:     fhttp.Header{"Location": []string{fmt.Sprintf("https://gemini.google.com/app?hop=%d", loopCalls)}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			},
+		}
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac := NewAccountClient("acct_loop", "SAPISID=sap1; __Secure-1PSID=p1", "", pool, cookies.NewRotator())
+		err := ac.Bootstrap(context.Background())
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.Code == "auth_redirect" {
+			t.Fatalf("expected bounded loop error != auth_redirect, got %v", err)
+		}
+		if loopCalls > 6 {
+			t.Fatalf("expected bounded redirect loop <= 6 hops, got %d", loopCalls)
+		}
+	})
+}
+
+func TestAvailableModelsRetryChecksNon200Status(t *testing.T) {
+	for _, retryStatus := range []struct {
+		httpStatus int
+		wantCode   string
+	}{
+		{429, "rate_limit_error"},
+		{503, "model_discovery_error"},
+	} {
+		t.Run(fmt.Sprintf("retry_%d", retryStatus.httpStatus), func(t *testing.T) {
+			var batchCalls int
+			doer := &stubGeminiDoer{
+				fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					u := req.URL.String()
+					if strings.HasSuffix(u, "/app") {
+						return &fhttp.Response{
+							StatusCode: 200,
+							Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_ok","cfb2h":"boq_1","FdrFJe":"111"}`)),
+						}, nil
+					}
+					if strings.Contains(u, "batchexecute") {
+						batchCalls++
+						if batchCalls == 1 {
+							inner := `[null,null,null,null,null,null,null,null,null,null,null,null,null,null,1016]`
+							esc, _ := marshalJSONString(inner)
+							return &fhttp.Response{
+								StatusCode: 200,
+								Body:       io.NopCloser(strings.NewReader(")]}'\n\n" + `[["wrb.fr","otAQ7b",` + esc + `]]`)),
+							}, nil
+						}
+						return &fhttp.Response{
+							StatusCode: retryStatus.httpStatus,
+							Body:       io.NopCloser(strings.NewReader("retry failed")),
+						}, nil
+					}
+					return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+				},
+			}
+			pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+			defer pool.Reset()
+			ac := NewAccountClient("acct_retry", "SAPISID=sap1; __Secure-1PSID=p1", "", pool, cookies.NewRotator())
+			ac.SetTokens("at_init", "boq_1", "111")
+
+			_, err := ac.AvailableModels(context.Background(), true)
+			var ue *transport.UpstreamError
+			if !errors.As(err, &ue) || ue.StatusCode != retryStatus.httpStatus || ue.Code != retryStatus.wantCode {
+				t.Fatalf("expected HTTP %d code=%q, got %v", retryStatus.httpStatus, retryStatus.wantCode, err)
+			}
+			if strings.Contains(ue.Message, "malformed upstream model registry") {
+				t.Fatalf("unexpected malformed registry error on HTTP %d: %q", retryStatus.httpStatus, ue.Message)
+			}
+		})
+	}
+}
+
+func TestAuthUserSecondaryAccountIsolation(t *testing.T) {
+	t.Run("rotates_before_u0_fallback_and_passes_authuser_everywhere", func(t *testing.T) {
+		rotated := false
+		var sawU0 bool
+		var graphqlAuthUser string
+		var pollSourcePath, pollAuthUser string
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				switch {
+				case req.URL.Path == "/u/2/app":
+					if !rotated {
+						// Stale __Secure-1PSIDTS on /u/2/app bounces to /app; must rotate BEFORE falling back.
+						return &fhttp.Response{
+							StatusCode: 302,
+							Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/app"}},
+							Body:       io.NopCloser(strings.NewReader("")),
+						}, nil
+					}
+					if req.URL.Query().Get("hl") == "" {
+						return &fhttp.Response{
+							StatusCode: 302,
+							Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/u/2/app?hl=id"}},
+							Body:       io.NopCloser(strings.NewReader("")),
+						}, nil
+					}
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_u2","cfb2h":"boq_u2","FdrFJe":"222"}`)),
+					}, nil
+				case req.URL.Path == "/app":
+					sawU0 = true
+					return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"SNlM0e":"at_u0"}`))}, nil
+				case strings.Contains(u, "RotateCookies"):
+					rotated = true
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=u2_fresh; Path=/; Secure"}},
+						Body:       io.NopCloser(strings.NewReader("[]")),
+					}, nil
+				case strings.Contains(u, "GEMINI_WEB_GRAPHQL"):
+					graphqlAuthUser = req.URL.Query().Get("authuser")
+					return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`[{"data":{"viewer":{"rpcs":{"getUsageInfo":{"pools":[{"poolType":"GXU_FIVE_HOURLY","percentageUsed":0.1}]}}}}}]`))}, nil
+				case strings.Contains(u, "rpcids=hNvQHb"):
+					pollSourcePath = req.URL.Query().Get("source-path")
+					pollAuthUser = req.URL.Query().Get("authuser")
+					inner := `[[[["c_vid123","r_1"],null,null,[[["rc_v",["video ready"],null,null,null,null,null,null,[2]]]]]]]`
+					esc, _ := marshalJSONString(inner)
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(")]}'\n\n" + `[["wrb.fr","hNvQHb",` + esc + `]]`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("[]"))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac := NewAccountClient("acct_u2", "SAPISID=sap2; __Secure-1PSID=p2; __Secure-1PSIDTS=stale", "", pool, cookies.NewRotator())
+		ac.SetAuthUser(2)
+		if err := ac.Bootstrap(context.Background()); err != nil {
+			t.Fatalf("Bootstrap failed: %v", err)
+		}
+		if sawU0 {
+			t.Fatal("secondary account hijacked to /app before rotation")
+		}
+		if ac.AuthUser() != 2 {
+			t.Fatalf("expected AuthUser=2, got %d", ac.AuthUser())
+		}
+
+		buckets := ac.GetQuota(context.Background())
+		if len(buckets) == 0 || graphqlAuthUser != "2" {
+			t.Fatalf("expected GraphQL quota with authuser=2, got buckets=%d authuser=%q", len(buckets), graphqlAuthUser)
+		}
+
+		// Exercise pollAsyncVideoGenerationLocked directly with short context/wait.
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		sess, _ := ac.acquireSession(ctx)
+		polled, err := ac.pollAsyncVideoGenerationLocked(ctx, sess.Client, ac.CookieHeader(), "at_u2", "boq_u2", "222", "en", "c_vid123")
+		if err != nil || polled == nil || len(polled.Frames) == 0 {
+			t.Fatalf("pollAsyncVideoGenerationLocked failed: polled=%+v err=%v", polled, err)
+		}
+		if pollSourcePath != "/u/2/app/vid123" || pollAuthUser != "2" {
+			t.Fatalf("expected source-path=/u/2/app/vid123 and authuser=2, got source-path=%q authuser=%q", pollSourcePath, pollAuthUser)
+		}
+	})
+
+	t.Run("rejects_unresolved_secondary_slot_after_rotation", func(t *testing.T) {
+		var sawRotate, sawU0 bool
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				switch {
+				case req.URL.Path == "/u/2/app":
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/app"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				case req.URL.Path == "/app":
+					sawU0 = true
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_fallback_u0","cfb2h":"boq_0","FdrFJe":"000"}`)),
+					}, nil
+				case strings.Contains(req.URL.String(), "RotateCookies"):
+					sawRotate = true
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=fresh; Path=/; Secure"}},
+						Body:       io.NopCloser(strings.NewReader("[]")),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+			},
+		}
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac := NewAccountClient("acct_u2_fb", "SAPISID=sap2; __Secure-1PSID=p2; __Secure-1PSIDTS=old", "", pool, cookies.NewRotator())
+		ac.SetAuthUser(2)
+		if err := ac.Bootstrap(context.Background()); err == nil {
+			t.Fatal("expected bootstrap to reject the unresolved secondary slot")
+		}
+		if !sawRotate || sawU0 || ac.AuthUser() != 2 || ac.at != "" {
+			t.Fatalf("expected rotation without primary bootstrap: rotated=%v primary=%v authUser=%d", sawRotate, sawU0, ac.AuthUser())
+		}
+	})
+}
+
+func TestBootstrapRaceWithReloadFromDiskIfNewerNeverPairsStaleAT(t *testing.T) {
+	writeNewerCred := func(t *testing.T, path, cookie, at string, bump time.Duration) {
+		t.Helper()
+		if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+			Kind:    "gemini-web",
+			Name:    "acct_boot_race",
+			Cookies: cookie,
+			AT:      at,
+			BL:      "boq_disk",
+			FSid:    "333",
+		}); err != nil {
+			t.Fatalf("SaveCredentialFile: %v", err)
+		}
+		future := time.Now().Add(bump)
+		if err := os.Chtimes(path, future, future); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+	}
+
+	t.Run("re_fetches_app_when_reload_occurs_during_initial_fetch", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct.json")
+		if _, err := cookies.SaveCredentialFile(credPath, cookies.CredentialFile{
+			Kind:    "gemini-web",
+			Name:    "acct_boot_race",
+			Cookies: "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_old",
+		}); err != nil {
+			t.Fatalf("initial SaveCredentialFile: %v", err)
+		}
+
+		firstAppStarted := make(chan struct{})
+		releaseFirstApp := make(chan struct{})
+		var mu sync.Mutex
+		var seenCookies []string
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				cookie := fhttpHeader(req, "cookie")
+				mu.Lock()
+				seenCookies = append(seenCookies, cookie)
+				mu.Unlock()
+				if strings.Contains(cookie, "ts_old") {
+					close(firstAppStarted)
+					<-releaseFirstApp
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_old_cookie","cfb2h":"boq_old","FdrFJe":"111"}`)),
+					}, nil
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_new_cookie","cfb2h":"boq_new","FdrFJe":"222"}`)),
+				}, nil
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootErr := make(chan error, 1)
+		go func() {
+			bootErr <- ac.Bootstrap(context.Background())
+		}()
+
+		<-firstAppStarted
+		writeNewerCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_new_disk", "at_new_disk", 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected ReloadFromDiskIfNewer to reload newer credential")
+		}
+		close(releaseFirstApp)
+
+		if err := <-bootErr; err != nil {
+			t.Fatalf("Bootstrap failed: %v", err)
+		}
+
+		ac.mu.RLock()
+		gotCookie := ac.cookieHeader
+		gotAT := ac.at
+		gotBootAt := ac.bootstrappedAt
+		ac.mu.RUnlock()
+
+		if !strings.Contains(gotCookie, "ts_new_disk") {
+			t.Fatalf("expected cookieHeader to hold ts_new_disk, got %q", gotCookie)
+		}
+		if gotAT == "at_from_old_cookie" || gotAT != "at_from_new_cookie" {
+			t.Fatalf("expected AT from new cookie (never at_from_old_cookie), got %q", gotAT)
+		}
+		if gotBootAt.IsZero() {
+			t.Fatal("expected bootstrappedAt to be set after consistent retry fetch")
+		}
+		if len(seenCookies) != 2 {
+			t.Fatalf("expected 2 /app fetches (initial + consistent retry), got %d", len(seenCookies))
+		}
+	})
+
+	t.Run("skips_commit_if_reload_also_races_with_retry_fetch", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct2.json")
+		if _, err := cookies.SaveCredentialFile(credPath, cookies.CredentialFile{
+			Kind:    "gemini-web",
+			Name:    "acct_boot_race2",
+			Cookies: "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_old",
+		}); err != nil {
+			t.Fatalf("initial SaveCredentialFile: %v", err)
+		}
+
+		firstStarted := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		secondStarted := make(chan struct{})
+		releaseSecond := make(chan struct{})
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				cookie := fhttpHeader(req, "cookie")
+				switch {
+				case strings.Contains(cookie, "ts_old"):
+					close(firstStarted)
+					<-releaseFirst
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_old_cookie","cfb2h":"boq_old","FdrFJe":"111"}`)),
+					}, nil
+				case strings.Contains(cookie, "ts_disk_1"):
+					close(secondStarted)
+					<-releaseSecond
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_disk_1","cfb2h":"boq_1","FdrFJe":"111"}`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected"))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootErr := make(chan error, 1)
+		go func() {
+			bootErr <- ac.Bootstrap(context.Background())
+		}()
+
+		<-firstStarted
+		writeNewerCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_1", "at_disk_1", 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected first ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseFirst)
+
+		<-secondStarted
+		writeNewerCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_2", "at_disk_2", 4*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected second ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseSecond)
+
+		if err := <-bootErr; err != nil {
+			t.Fatalf("Bootstrap failed: %v", err)
+		}
+
+		ac.mu.RLock()
+		gotCookie := ac.cookieHeader
+		gotAT := ac.at
+		gotBootAt := ac.bootstrappedAt
+		ac.mu.RUnlock()
+
+		if !strings.Contains(gotCookie, "ts_disk_2") {
+			t.Fatalf("expected cookieHeader to preserve ts_disk_2, got %q", gotCookie)
+		}
+		if gotAT != "at_disk_2" {
+			t.Fatalf("expected AT to stay at_disk_2 (never overwritten by stale /app), got %q", gotAT)
+		}
+		if !gotBootAt.IsZero() {
+			t.Fatalf("expected bootstrappedAt to remain zero when retry raced, got %v", gotBootAt)
+		}
+	})
+}
+
+func TestBootstrapMidRedirectReloadAbortsStaleChain(t *testing.T) {
+	writeCred := func(t *testing.T, path, cookie, at string, authUser int, bump time.Duration) {
+		t.Helper()
+		if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+			Kind:     "gemini-web",
+			Name:     "acct_redir_race",
+			Cookies:  cookie,
+			AT:       at,
+			AuthUser: authUser,
+			BL:       "boq_disk",
+			FSid:     "333",
+		}); err != nil {
+			t.Fatalf("SaveCredentialFile: %v", err)
+		}
+		if bump > 0 {
+			future := time.Now().Add(bump)
+			if err := os.Chtimes(path, future, future); err != nil {
+				t.Fatalf("Chtimes: %v", err)
+			}
+		}
+	}
+
+	t.Run("authUser_and_cookies_updated_during_hop0_redirect", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct_u2.json")
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", 2, 0)
+
+		hop0Started := make(chan struct{})
+		releaseHop0 := make(chan struct{})
+		var mu sync.Mutex
+		var fetchedURLs []string
+		var sawStaleU2Redir bool
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				mu.Lock()
+				fetchedURLs = append(fetchedURLs, u)
+				mu.Unlock()
+
+				switch u {
+				case "https://gemini.google.com/u/2/app":
+					close(hop0Started)
+					<-releaseHop0
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header: fhttp.Header{
+							"Location":   []string{"https://gemini.google.com/u/2/app?hl=en"},
+							"Set-Cookie": []string{"__Secure-1PSIDTS=stale_hop0; Path=/; Secure"},
+						},
+						Body: io.NopCloser(strings.NewReader("")),
+					}, nil
+				case "https://gemini.google.com/u/2/app?hl=en":
+					mu.Lock()
+					sawStaleU2Redir = true
+					mu.Unlock()
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_u2","cfb2h":"boq_u2","FdrFJe":"222"}`)),
+					}, nil
+				case "https://gemini.google.com/u/3/app":
+					cookie := fhttpHeader(req, "cookie")
+					if !strings.Contains(cookie, "ts2") {
+						t.Errorf("expected /u/3/app to use ts2, got %q", cookie)
+					}
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_u3","cfb2h":"boq_u3","FdrFJe":"333"}`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootCh := make(chan error, 1)
+		go func() {
+			bootCh <- ac.Bootstrap(context.Background())
+		}()
+
+		<-hop0Started
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts2", "", 3, 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseHop0)
+
+		if err := <-bootCh; err != nil {
+			t.Fatalf("Bootstrap failed: %v", err)
+		}
+		mu.Lock()
+		staleHit := sawStaleU2Redir
+		urlsCopy := append([]string(nil), fetchedURLs...)
+		mu.Unlock()
+		if staleHit {
+			t.Fatalf("stale redirect hop /u/2/app?hl=en should not have been followed; urls=%v", urlsCopy)
+		}
+
+		ac.mu.RLock()
+		gotAT := ac.at
+		gotAU := ac.authUser
+		gotCookie := ac.cookieHeader
+		ac.mu.RUnlock()
+		if gotAT != "at_from_u3" || gotAU != 3 || !strings.Contains(gotCookie, "ts2") {
+			t.Fatalf("unexpected final state: at=%q authUser=%d cookie=%q urls=%v", gotAT, gotAU, gotCookie, urlsCopy)
+		}
+	})
+
+	t.Run("same_authUser_mid_redirect_reload_retries_clean_app", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct_u0.json")
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", 0, 0)
+
+		hop0Started := make(chan struct{})
+		releaseHop0 := make(chan struct{})
+		var mu sync.Mutex
+		var sawStaleRedir bool
+		var cleanTs2Fetches int
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				cookie := fhttpHeader(req, "cookie")
+				switch u {
+				case "https://gemini.google.com/app":
+					if strings.Contains(cookie, "ts1") {
+						close(hop0Started)
+						<-releaseHop0
+						return &fhttp.Response{
+							StatusCode: 302,
+							Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/app?stale_ts1_redir=1"}},
+							Body:       io.NopCloser(strings.NewReader("")),
+						}, nil
+					}
+					if strings.Contains(cookie, "ts2") {
+						mu.Lock()
+						cleanTs2Fetches++
+						mu.Unlock()
+						return &fhttp.Response{
+							StatusCode: 200,
+							Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_clean_ts2","cfb2h":"boq_ts2","FdrFJe":"444"}`)),
+						}, nil
+					}
+				case "https://gemini.google.com/app?stale_ts1_redir=1":
+					mu.Lock()
+					sawStaleRedir = true
+					mu.Unlock()
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader("<html>no SNlM0e here</html>")),
+					}, nil
+				}
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootCh := make(chan error, 1)
+		go func() {
+			bootCh <- ac.Bootstrap(context.Background())
+		}()
+
+		<-hop0Started
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts2", "", 0, 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseHop0)
+
+		if err := <-bootCh; err != nil {
+			t.Fatalf("Bootstrap failed: %v", err)
+		}
+		mu.Lock()
+		staleHit := sawStaleRedir
+		cleanHits := cleanTs2Fetches
+		mu.Unlock()
+		if staleHit {
+			t.Fatal("stale redirect /app?stale_ts1_redir=1 must not be followed after ReloadFromDiskIfNewer")
+		}
+		if cleanHits != 1 {
+			t.Fatalf("expected 1 clean /app fetch with ts2, got %d", cleanHits)
+		}
+		ac.mu.RLock()
+		gotAT := ac.at
+		ac.mu.RUnlock()
+		if gotAT != "at_clean_ts2" {
+			t.Fatalf("expected at_clean_ts2, got %q", gotAT)
+		}
+	})
+
+	t.Run("double_race_mid_redirect_on_retry_returns_503_not_stale_302", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct_dbl_redir.json")
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", 2, 0)
+
+		u2Started := make(chan struct{})
+		releaseU2 := make(chan struct{})
+		u3Started := make(chan struct{})
+		releaseU3 := make(chan struct{})
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				switch req.URL.String() {
+				case "https://gemini.google.com/u/2/app":
+					close(u2Started)
+					<-releaseU2
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/u/2/app?hl=en"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				case "https://gemini.google.com/u/3/app":
+					close(u3Started)
+					<-releaseU3
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://gemini.google.com/u/3/app?hl=en"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected redirect hop"))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootCh := make(chan error, 1)
+		go func() {
+			bootCh <- ac.Bootstrap(context.Background())
+		}()
+
+		<-u2Started
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts2", "", 3, 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected first ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseU2)
+
+		<-u3Started
+		writeCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts3", "", 4, 4*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected second ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseU3)
+
+		err = <-bootCh
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != 503 || ue.Code != "upstream_transient" {
+			t.Fatalf("expected 503 upstream_transient (not stale 302), got %v", err)
+		}
+	})
+}
+
+func TestBootstrapPostRotationRetryErrorPropagated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var appCalls int
+	var rotated bool
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.Contains(u, "RotateCookies"):
+				rotated = true
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=rot_fresh; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			case strings.HasSuffix(u, "/app"):
+				appCalls++
+				if appCalls == 1 {
+					return &fhttp.Response{
+						StatusCode: 302,
+						Header:     fhttp.Header{"Location": []string{"https://accounts.google.com/ServiceLogin?continue=https://gemini.google.com/app"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				}
+				cancel()
+				return nil, transport.NewUpstreamError("request cancelled", 499, "client_cancelled", nil, context.Canceled)
+			default:
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+	defer pool.Reset()
+	ac := NewAccountClient("acct_post_rot_err", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=old", "", pool, cookies.NewRotator())
+
+	err := ac.Bootstrap(ctx)
+	var ue *transport.UpstreamError
+	if !errors.As(err, &ue) || ue.StatusCode != 499 || ue.Code != "client_cancelled" {
+		t.Fatalf("expected 499 client_cancelled (never 401 auth_redirect), got %v", err)
+	}
+	if !rotated || appCalls != 2 {
+		t.Fatalf("expected rotation + 2 /app attempts, got rotated=%v appCalls=%d", rotated, appCalls)
+	}
+}
+
+func TestBootstrapDoubleRaceWithCookieOnlyDiskReload(t *testing.T) {
+	writeCookieOnlyCred := func(t *testing.T, path, cookie string, bump time.Duration) {
+		t.Helper()
+		if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+			Kind:    "gemini-web",
+			Name:    "acct_cookie_only",
+			Cookies: cookie,
+			AT:      "",
+			BL:      "boq_disk",
+			FSid:    "333",
+		}); err != nil {
+			t.Fatalf("SaveCredentialFile: %v", err)
+		}
+		if bump > 0 {
+			future := time.Now().Add(bump)
+			if err := os.Chtimes(path, future, future); err != nil {
+				t.Fatalf("Chtimes: %v", err)
+			}
+		}
+	}
+
+	t.Run("empty_AT_double_race_returns_503_upstream_transient", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct_empty_at.json")
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_old", 0)
+
+		firstStarted := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		secondStarted := make(chan struct{})
+		releaseSecond := make(chan struct{})
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				cookie := fhttpHeader(req, "cookie")
+				switch {
+				case strings.Contains(cookie, "ts_old"):
+					close(firstStarted)
+					<-releaseFirst
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_old","cfb2h":"boq_old","FdrFJe":"111"}`)),
+					}, nil
+				case strings.Contains(cookie, "ts_disk_1"):
+					close(secondStarted)
+					<-releaseSecond
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_disk1","cfb2h":"boq_1","FdrFJe":"111"}`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected"))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+
+		bootCh := make(chan error, 1)
+		go func() {
+			bootCh <- ac.Bootstrap(context.Background())
+		}()
+
+		<-firstStarted
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_1", 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected first ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseFirst)
+
+		<-secondStarted
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_2", 4*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected second ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseSecond)
+
+		err = <-bootCh
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.StatusCode != 503 || ue.Code != "upstream_transient" {
+			t.Fatalf("expected 503 upstream_transient (never nil with empty AT), got %v", err)
+		}
+
+		ac.mu.RLock()
+		gotAT := ac.at
+		gotBootAt := ac.bootstrappedAt
+		gotCookie := ac.cookieHeader
+		ac.mu.RUnlock()
+		if gotAT != "" || !gotBootAt.IsZero() || !strings.Contains(gotCookie, "ts_disk_2") {
+			t.Fatalf("unexpected state after double race: at=%q bootAt=%v cookie=%q", gotAT, gotBootAt, gotCookie)
+		}
+	})
+
+	t.Run("stale_prior_AT_cleared_and_StreamGenerateLive_aborts_before_dispatch", func(t *testing.T) {
+		credPath := filepath.Join(t.TempDir(), "acct_stale_at.json")
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_old", 0)
+
+		firstStarted := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		secondStarted := make(chan struct{})
+		releaseSecond := make(chan struct{})
+		var mu sync.Mutex
+		var streamDispatched bool
+
+		doer := &stubGeminiDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				u := req.URL.String()
+				if strings.Contains(u, "StreamGenerate") {
+					mu.Lock()
+					streamDispatched = true
+					mu.Unlock()
+					return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(")]}'\n"))}, nil
+				}
+				cookie := fhttpHeader(req, "cookie")
+				switch {
+				case strings.Contains(cookie, "ts_old"):
+					close(firstStarted)
+					<-releaseFirst
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_old","cfb2h":"boq_old","FdrFJe":"111"}`)),
+					}, nil
+				case strings.Contains(cookie, "ts_disk_1"):
+					close(secondStarted)
+					<-releaseSecond
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`{"SNlM0e":"at_from_disk1","cfb2h":"boq_1","FdrFJe":"111"}`)),
+					}, nil
+				default:
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected"))}, nil
+				}
+			},
+		}
+
+		pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+		defer pool.Reset()
+		ac, err := LoadAccountFromFile(credPath, pool, cookies.NewRotator())
+		if err != nil {
+			t.Fatalf("LoadAccountFromFile: %v", err)
+		}
+		// Simulate an earlier in-memory stale AT (even with fromDiskAT=true and empty BL so ensureBootstrapped calls bootstrapOnClient).
+		ac.mu.Lock()
+		ac.at = "at_very_old"
+		ac.fromDiskAT = true
+		ac.bl = ""
+		ac.fSid = ""
+		ac.mu.Unlock()
+
+		streamCh := make(chan error, 1)
+		go func() {
+			_, sErr := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{}, nil)
+			streamCh <- sErr
+		}()
+
+		<-firstStarted
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_1", 2*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected first ReloadFromDiskIfNewer to succeed")
+		}
+		ac.mu.RLock()
+		midAT := ac.at
+		midFromDisk := ac.fromDiskAT
+		ac.mu.RUnlock()
+		if midAT != "" || midFromDisk {
+			t.Fatalf("expected ReloadFromDiskIfNewer with cookiesChanged && AT==\"\" to clear stale AT, got at=%q fromDiskAT=%v", midAT, midFromDisk)
+		}
+		close(releaseFirst)
+
+		<-secondStarted
+		writeCookieOnlyCred(t, credPath, "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts_disk_2", 4*time.Second)
+		if !ac.ReloadFromDiskIfNewer() {
+			t.Fatal("expected second ReloadFromDiskIfNewer to succeed")
+		}
+		close(releaseSecond)
+
+		sErr := <-streamCh
+		var ue *transport.UpstreamError
+		if !errors.As(sErr, &ue) || ue.StatusCode != 503 || ue.Code != "upstream_transient" {
+			t.Fatalf("expected StreamGenerateLive to return 503 upstream_transient, got %v", sErr)
+		}
+		mu.Lock()
+		dispatched := streamDispatched
+		mu.Unlock()
+		if dispatched {
+			t.Fatal("StreamGenerate must not be dispatched with empty/stale AT after double-race")
+		}
+	})
 }

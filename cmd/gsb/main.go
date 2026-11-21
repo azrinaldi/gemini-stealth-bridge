@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,8 +45,8 @@ func init() {
 		fmt.Fprint(out, "  gsb --web                           start daemon + Web Control Plane at http://127.0.0.1:20133/ui\n")
 		fmt.Fprint(out, "  ./start.sh                          build (if needed) and start daemon with Web UI enabled\n\n")
 		fmt.Fprint(out, "Remote VPS / Headless login:\n")
-		fmt.Fprint(out, "  On laptop: ssh -L 20133:127.0.0.1:20133 user@vps  (and optionally `gsb --login-helper`)\n")
-		fmt.Fprint(out, "  Open http://127.0.0.1:20133/ui -> '+ Add Account' -> paste Incognito cookies or launch isolated browser.\n\n")
+		fmt.Fprint(out, "  On desktop: ssh -L 20133:127.0.0.1:20133 user@vps\n")
+		fmt.Fprint(out, "  Desktop UI setup: see Remote VPS and headless servers in README.md.\n\n")
 		fmt.Fprint(out, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -67,14 +70,21 @@ func main() {
 		captureRef       = flag.Bool("capture-reference", false, "Capture reference headers from local Chrome login profile via CDP or dump instructions")
 		listAccounts     = flag.Bool("accounts", false, "Print a status table for every loaded account and exit")
 		accountsLive     = flag.Bool("accounts-live", false, "With --accounts, query upstream for fresh models and quota before printing")
-		enableWebUI      = flag.Bool("web", false, "Enable the opt-in web configuration UI at /ui and /v1/admin/* (or set BRIDGE_WEB_UI=1)")
+		enableWebUI      = flag.Bool("web", false, "Enable the opt-in Web Control Plane at /ui and /v1/admin/* (or set BRIDGE_WEB_UI=1)")
 		runHealthcheck   = flag.Bool("healthcheck", false, "Probe local /health endpoint and exit 0 if healthy (for container healthchecks)")
 		loginHelper      = flag.Bool("login-helper", false, "Run local desktop isolated-browser login helper on 127.0.0.1:20134 for remote VPS Web UI")
+		desktopUI        = flag.Bool("desktop-ui", false, "Serve desktop control plane and local API proxy on 127.0.0.1:20133 using a private SSH socket at $XDG_RUNTIME_DIR/gsb-desktop/bridge.sock")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("gsb %s (%s/%s, %s)\n", config.Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return
+	}
+	if *desktopUI {
+		if err := runDesktopUI(); err != nil {
+			log.Fatalf("[desktop-ui] %v", err)
+		}
 		return
 	}
 
@@ -258,14 +268,6 @@ func main() {
 				log.Printf("  WARNING:   remote access to /ui and /v1/admin/* is locked until BRIDGE_ADMIN_KEY or a non-public BRIDGE_API_KEY is configured")
 			}
 		}
-		if loaded > 0 {
-			poolDesc := cfg.APIKey
-			if cfg.APIKey == "public" {
-				poolDesc = "public (no auth)"
-			}
-			log.Printf("  keys:      pool=%s across %d account(s), strategy=%s", poolDesc, loaded, cfg.AccountStrategy)
-			log.Printf("             account keys gsb-<name> pin a single account")
-		}
 		if loaded == 0 {
 			if cfg.WebUI {
 				log.Printf("  onboarding: no accounts yet — open http://%s/ui and click '+ Add Account', or run `gsb --login <name>`", addr)
@@ -283,6 +285,7 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	srv.FlushSessionCacheNow()
 	srv.Pool.Reset()
 }
 
@@ -338,6 +341,9 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
+	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
+		ac.SetAuthUser(prev.AuthUser)
+	}
 	ac.SetProvenance(dbPath, explicitDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -377,6 +383,9 @@ func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
+	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
+		ac.SetAuthUser(prev.AuthUser)
+	}
 	ac.SetProvenance(filePath, "cookie-export")
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -427,31 +436,118 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	return runImportChrome(cfg, acctName, explicitDB)
 }
 
-func runLocalLoginHelper() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/browser-login", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+const (
+	loginHelperAddr     = "127.0.0.1:20134"
+	loginHelperHeader   = "X-GSB-Helper-Token"
+	loginHelperDeadline = 4 * time.Minute
+)
+
+func loopbackHelperHost(host string) bool {
+	switch host {
+	case "127.0.0.1:20134", "localhost:20134", "[::1]:20134":
+		return true
+	}
+	return false
+}
+
+func allowedHelperOrigin(origin string) bool {
+	switch origin {
+	case "http://127.0.0.1:20133", "http://localhost:20133", "http://[::1]:20133":
+		return true
+	}
+	return false
+}
+
+func validHelperPreflight(r *http.Request) bool {
+	methods := r.Header.Values("Access-Control-Request-Method")
+	if len(methods) != 1 || methods[0] != http.MethodPost {
+		return false
+	}
+	for _, value := range r.Header.Values("Access-Control-Request-Headers") {
+		for _, header := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(header)) {
+			case "content-type", "x-gsb-helper-token":
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func helperToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate helper token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func displayHelperToken(token string) error {
+	name := "/dev/tty"
+	if runtime.GOOS == "windows" {
+		name = "CONOUT$"
+	}
+	tty, err := os.OpenFile(name, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("login helper requires interactive terminal for token display: %w", err)
+	}
+	defer tty.Close()
+	_, err = fmt.Fprintf(tty, "gsb login-helper token (enter in local Web UI; do not share): %s\n", token)
+	if err != nil {
+		return fmt.Errorf("display login helper token: %w", err)
+	}
+	return nil
+}
+
+func loginHelperHandler(token string, login func(context.Context) (*cookies.IsolatedLoginResult, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+		if r.URL.Path != "/browser-login" || r.URL.RawQuery != "" || r.URL.ForceQuery {
+			http.NotFound(w, r)
+			return
+		}
+		peer, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(peer).IsLoopback() || !loopbackHelperHost(r.Host) {
+			http.Error(w, "loopback connection required", http.StatusForbidden)
+			return
+		}
+		origins := r.Header.Values("Origin")
+		if len(origins) != 1 || !allowedHelperOrigin(origins[0]) {
+			http.Error(w, "browser origin not allowed", http.StatusForbidden)
+			return
 		}
 		if r.Method == http.MethodOptions {
+			if !validHelperPreflight(r) {
+				http.Error(w, "preflight not allowed", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origins[0])
+			w.Header().Set("Access-Control-Allow-Methods", "POST")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, "+loginHelperHeader)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		w.Header().Set("Access-Control-Allow-Origin", origins[0])
 		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST, OPTIONS")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		tokens := r.Header.Values(loginHelperHeader)
+		if len(tokens) != 1 || subtle.ConstantTimeCompare([]byte(tokens[0]), []byte(token)) != 1 {
+			http.Error(w, "helper authentication required", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), loginHelperDeadline)
 		defer cancel()
-		res, err := cookies.RunIsolatedBrowserLogin(ctx, "")
+		res, err := login(ctx)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": map[string]any{"message": err.Error()},
+				"error": map[string]any{"message": "Local browser sign-in failed. Check that a supported desktop browser and GUI are available, then retry."},
 			})
 			return
 		}
@@ -460,8 +556,53 @@ func runLocalLoginHelper() error {
 			"userAgent": res.UserAgent,
 		})
 	})
-	log.Printf("[login-helper] listening on http://127.0.0.1:20134 for isolated desktop browser login")
-	return http.ListenAndServe("127.0.0.1:20134", mux)
+}
+
+func runLocalLoginHelper() error {
+	return serveLocalLoginHelper(displayHelperToken, func(ctx context.Context) (*cookies.IsolatedLoginResult, error) {
+		return cookies.RunIsolatedBrowserLogin(ctx, "")
+	})
+}
+
+func serveLocalLoginHelper(display func(string) error, login func(context.Context) (*cookies.IsolatedLoginResult, error)) error {
+	token, err := helperToken()
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", loginHelperAddr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	if err := display(token); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	httpSrv := &http.Server{
+		Handler:           loginHelperHandler(token, login),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      loginHelperDeadline + 15*time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+	log.Printf("[login-helper] listening on http://%s for isolated desktop browser login", loginHelperAddr)
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpSrv.Serve(ln) }()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			_ = httpSrv.Close()
+			return err
+		}
+		return nil
+	}
 }
 
 // findBrowserBinary delegates to cookies.FindBrowserBinary.
@@ -516,15 +657,8 @@ func openBrowserURL(url, browser, profileDir string) {
 }
 
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
-	fmt.Printf("  base url    : http://%s:%d/v1\n", cfg.Host, cfg.Port)
-	fmt.Printf("  pool key    : %s", cfg.APIKey)
-	if cfg.APIKey == "public" {
-		fmt.Print("  (default; no auth, routes across every loaded account)")
-	} else {
-		fmt.Print("  (routes across every loaded account)")
-	}
-	fmt.Println()
-	fmt.Printf("  account key : gsb-%s (or %s)  (pins this account only, no failover)\n", acctName, acctName)
+	fmt.Printf("  base url    : http://%s/v1\n", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
+	fmt.Println("  API keys    : not printed; use your configured key or authorized Web UI")
 	fmt.Println("  note        : this session was captured from an already-signed-in browser.")
 	fmt.Println("                If Gemini later rejects it, run `gsb --login " + acctName + "` to sign in again")
 	fmt.Println("                instead of copying cookies from a browser that was never signed in.")

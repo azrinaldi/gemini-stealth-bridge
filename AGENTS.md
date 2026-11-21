@@ -84,7 +84,7 @@ Default listener: `127.0.0.1:20133`. Default pool key: `public` (unauthenticated
 |---|---|---|---|
 | **Pool key** | `BRIDGE_API_KEY` (default `public`) | Every loaded account | Yes, across the pool |
 | **Group key** | `BRIDGE_GROUP_TOKENS` entry (`token:group`) | The accounts in one group | Yes, inside the group only |
-| **Account key** | `gsb-<name>` or `<name>` | Exactly one account | No |
+| **Account key** | A `BRIDGE_ACCOUNT_TOKENS` entry or a public-mode alias | Exactly one account | No |
 
 Default to the pool key in every example and client configuration.
 
@@ -96,8 +96,8 @@ When a user reports that a request failed while another account had quota, **che
 
 - `BRIDGE_API_KEY=public` accepts requests with **no** key, the literal `public`, or the derived `gsb-pool-<hash>` token shown in the Web UI.
 - With exactly one loaded account, the pool key resolves to that account's scope.
-- Account aliases (`gsb-<name>` and `<name>`) are registered automatically for every loaded account file. They are predictable from filenames and are not secrets.
-- `BRIDGE_ACCOUNT_TOKENS="token:account_id"` adds custom aliases without removing the automatic ones. It also disables the on-demand hot reload of newly added account files for unknown `gsb-*` tokens.
+- Filename aliases (`gsb-<name>` and `<name>`) work only when `BRIDGE_API_KEY=public` and `BRIDGE_ACCOUNT_TOKENS` is unset. They are routing aliases, not secrets.
+- `BRIDGE_ACCOUNT_TOKENS="token:account_id"` configures explicit account keys. Use it for account pinning with a private pool key.
 - `BRIDGE_ADMIN_KEY` grants the admin scope: all accounts, plus `/v1/admin/*`.
 - Accepted headers: `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`, `?key=`. Prefer `Authorization`.
 
@@ -141,7 +141,7 @@ If no local browser or display is available, `--login` falls back to a terminal 
 
 ### 4.2 Remote VPS / headless
 
-Two supported paths:
+Three supported paths:
 
 1. **Incognito cookie paste (works everywhere)**
    - Open a **New Incognito Window** (`Ctrl+Shift+N`).
@@ -150,12 +150,17 @@ Two supported paths:
    - **Immediately close the Incognito window without signing out.**
    - Paste into the Web UI's **+ Add Account** or pipe it to `gsb --import-cookie <name>`.
 
-2. **One-click isolated browser with a local helper**
+2. **Manual desktop helper for the VPS Web UI**
    - On the laptop: `gsb --login-helper` (listens on `127.0.0.1:20134`).
-   - Forward both ports: `ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps`.
-   - In the VPS Web UI: **+ Add Account → Isolated browser window → Launch**.
+   - Tunnel the daemon only: `ssh -L 20133:127.0.0.1:20133 user@vps`. Leave port `20134` on the laptop.
+   - In the VPS Web UI: **+ Add Account → Isolated browser window**. Paste the token from the laptop helper terminal into **Desktop helper token**, then select **Launch**.
    - The page calls the VPS first; if the VPS has no browser/GUI, it falls back to the local helper and posts the captured cookie to the VPS import endpoint.
    - Account name, proxy, and group are collapsed under **Optional settings** in that dialog; leave them closed for a normal single-key setup.
+
+3. **Desktop browser login on VPS — one daemon UI, one local port**
+   - Set up private SSH socket and `gsb --desktop-ui` as shown in README §6.4.
+   - Open `http://127.0.0.1:20133/ui`; this serves daemon Web UI through local proxy. No Connect desktop pairing and no second UI.
+   - Select **Add Account → Launch**. Desktop process captures browser session locally and posts it to daemon import endpoint. API clients use same `http://127.0.0.1:20133/v1`.
 
 ### 4.3 Cookie import is acceptable only when the profile is already signed in
 
@@ -176,7 +181,7 @@ Supported: Chrome, Chromium, Brave, Edge, Vivaldi, Arc, Firefox.
 - Linux keyring-backed cookies may require `secret-tool` and an unlocked keyring.
 - Windows DPAPI requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export.
 
-**Multi-account Chrome profiles:** a profile signed in to several Google accounts always imports the profile's *primary* account, because Chromium stores one cookie set per domain. To target a secondary account, set `"authUser": <N>` in the account JSON after import (the index from Google's `/u/N/app` surface). Bootstrap fetches `/u/N/app` and falls back to `/app` if the index no longer resolves. There is no auto-detection: Chrome's `account_info` order does not reliably map to `/u/N`, so guessing could attribute the session to the wrong account.
+**Multi-account Chrome profiles:** imports use the profile's primary account. A credential with `authUser: N` bootstraps only through `/u/N/app`. If Google no longer resolves that slot, relink the intended account. The daemon does not guess a slot or fall back to the primary account.
 
 Cookie export is the fallback when browser decryption is unavailable:
 
@@ -437,7 +442,7 @@ Output item types: `reasoning`, `message` with `output_text`, `function_call`, `
 
 Streaming events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.custom_tool_call_input.delta`, `response.custom_tool_call_input.done`, `response.output_item.done`, `response.completed`.
 
-There is **no** `[DONE]` marker; the stream ends with `response.completed`.
+There is **no** `[DONE]` marker. The stream ends with `response.completed`, `response.incomplete` after `max_output_tokens`, or a named `error` event if the request failed after headers were sent.
 
 For multi-turn calls, resend history in `input`. `previous_response_id` is not supported.
 
@@ -574,7 +579,7 @@ MIME type is detected from magic bytes, not trusted from the URL.
 
 ### 11.3 Media URLs
 
-Generated media is served at `GET /v1/media/<id>`. The proxy URL is built from the request's `Host` (or `X-Forwarded-Host`) and scheme (or `X-Forwarded-Proto`), so a client connecting through a reverse proxy receives a URL it can reach. The endpoint is unauthenticated because upstream URLs require Google cookies. Media is cached in memory (max 96 entries), so URLs die on restart or eviction.
+Generated media is served at `GET /v1/media/<id>` from a bounded, in-memory cache. URLs use the request's `Host` and connection scheme, not untrusted forwarding headers. The endpoint is unauthenticated; share media URLs only with intended recipients.
 
 Full-resolution images use `=s0-d`; lossless PNG uses `=s0-rp`. Both HTTP redirects and application-level `text/plain` URL redirects are followed. `revised_prompt` comes from Gemini Web's internal `modelDescription` when available.
 
@@ -825,7 +830,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | First byte |
+| `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Deadline for upstream HTTP response headers |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames (keepalive envelopes do not count as a frame) |
 | `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Whole request |
@@ -841,6 +846,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|
 | `--login <name>` | Isolated browser sign-in |
 | `--login-helper` | Local desktop helper on `127.0.0.1:20134` |
+| `--desktop-ui` | Desktop control plane on `127.0.0.1:20135` using the private SSH socket from README §6.4 |
 | `--import-chrome <name>` | Import from browser profile |
 | `--import-cookie <name>` | Import raw cookie payload |
 | `--chrome-profile <v>` | Profile name/dir/DB |
@@ -912,10 +918,12 @@ Only one daemon may hold a `BRIDGE_HOME` lock. `--probe` proceeds without it; `-
 ### 18.2 Remote VPS with SSH tunnel
 
 ```sh
-ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps
+ssh -L 20133:127.0.0.1:20133 user@vps
 gsb --web
 gsb --login-helper   # on the laptop, optional
 ```
+
+For desktop browser sign-in without a manual helper token, follow README §6.4 and open `http://127.0.0.1:20135/ui`.
 
 ### 18.3 Docker
 
@@ -1082,6 +1090,6 @@ Cutting it short still spends the quota.
 ### 20.7 "Image generation returns 404 later"
 
 ```text
-Media is cached in memory (max 96 entries) and is not persisted.
-A restart or eviction invalidates the URL; regenerate the media.
+Media lives in memory for up to 24 hours (96 entries, 128 MiB total).
+A restart, expiry, or eviction invalidates the URL; regenerate the media.
 ```

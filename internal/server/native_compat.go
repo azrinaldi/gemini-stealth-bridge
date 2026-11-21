@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
 )
@@ -31,7 +32,7 @@ type answerLimits struct {
 // parseAnswerLimits reads the request controls gsb enforces locally.
 func parseAnswerLimits(body map[string]any) answerLimits {
 	var lim answerLimits
-	for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		if v, ok := body[k].(float64); ok && v > 0 {
 			lim.maxTokens = int(v)
 			break
@@ -47,6 +48,12 @@ func parseAnswerLimits(body map[string]any) answerLimits {
 			if s, ok := item.(string); ok && s != "" {
 				lim.stopSeqs = append(lim.stopSeqs, s)
 			}
+		}
+	}
+	if text, ok := body["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok {
+			typ, _ := format["type"].(string)
+			lim.wantJSON = strings.EqualFold(typ, "json_object") || strings.EqualFold(typ, "json_schema")
 		}
 	}
 	if rf, ok := body["response_format"].(map[string]any); ok {
@@ -81,7 +88,22 @@ func (l answerLimits) visible(text string) (string, string) {
 	if !l.enabled() {
 		return text, ""
 	}
-	return l.apply(text)
+	visible, finish := l.apply(text)
+	if finish != "" {
+		return visible, finish
+	}
+	// A later frame can complete a stop sequence that starts in this frame.
+	// Retain the longest suffix that could be its prefix until then.
+	hold := 0
+	for _, stop := range l.stopSeqs {
+		for n := min(len(stop)-1, len(visible)); n > hold; n-- {
+			if utf8.RuneStart(visible[len(visible)-n]) && strings.HasSuffix(visible, stop[:n]) {
+				hold = n
+				break
+			}
+		}
+	}
+	return visible[:len(visible)-hold], ""
 }
 
 // apply cuts the answer at the first stop sequence and at the token budget.
@@ -134,6 +156,9 @@ func truncateToTokens(text string, budget int) (string, bool) {
 		}
 	}
 	cut := lo
+	for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
 	if cut > 0 && cut < len(text) {
 		// Do not end mid-word: step back to the last space in the final 20% of
 		// the kept prefix, but never past the budget.
@@ -165,44 +190,53 @@ func jsonObjectText(text string) string {
 	return text
 }
 
-// jsonObjectSpan returns the offset range of the first balanced JSON object in
-// s, or (-1, -1). String literals are skipped so braces inside them do not
-// affect the depth count.
+// jsonObjectSpan returns the offset range of the first valid balanced JSON
+// object in s, or (-1, -1). String literals are skipped so braces inside them
+// do not affect the depth count; if an earlier brace pair in prose is not valid
+// JSON, scanning continues from the next opening brace.
 func jsonObjectSpan(s string) (int, int) {
-	start := strings.IndexByte(s, '{')
-	if start < 0 {
-		return -1, -1
-	}
-	depth := 0
-	inString := false
-	escaped := false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inString {
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == '"':
-				inString = false
-			}
-			continue
+	for searchFrom := 0; searchFrom < len(s); {
+		rel := strings.IndexByte(s[searchFrom:], '{')
+		if rel < 0 {
+			return -1, -1
 		}
-		switch c {
-		case '"':
-			inString = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				if json.Valid([]byte(s[start : i+1])) {
-					return start, i
+		start := searchFrom + rel
+		depth := 0
+		inString := false
+		escaped := false
+		closed := false
+		for i := start; i < len(s); i++ {
+			c := s[i]
+			if inString {
+				switch {
+				case escaped:
+					escaped = false
+				case c == '\\':
+					escaped = true
+				case c == '"':
+					inString = false
 				}
-				return -1, -1
+				continue
+			}
+			switch c {
+			case '"':
+				inString = true
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					if json.Valid([]byte(s[start : i+1])) {
+						return start, i
+					}
+					closed = true
+				}
+			}
+			if closed {
+				break
 			}
 		}
+		searchFrom = start + 1
 	}
 	return -1, -1
 }

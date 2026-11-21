@@ -83,11 +83,14 @@ func mcpCallInfoFrom(ctx context.Context) *mcpCallInfo {
 // GET answers 405 and notifications (messages without an id) answer 202 with an
 // empty body, per the Streamable HTTP specification.
 func (s *Server) HandleMCP(w http.ResponseWriter, r *http.Request) {
+	if isCrossSiteRequest(r) || s.cfgSnapshot().APIKey == "public" && r.Method == http.MethodPost && hasNonJSONContentType(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(mcpResponse{JSONRPC: "2.0", Error: &mcpError{Code: 403, Message: "cross-site browser requests are forbidden"}})
+		return
+	}
 	switch r.Method {
 	case http.MethodOptions:
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, MCP-Protocol-Version")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
@@ -142,7 +145,6 @@ func (s *Server) HandleMCP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-GSB-Sources", strconv.Itoa(info.Sources))
 		}
 	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -245,7 +247,7 @@ func (s *Server) mcpSearchTimeout(requested int) time.Duration {
 		minTimeout = 10 * time.Second
 		maxTimeout = 600 * time.Second
 	)
-	def := s.Cfg.SearchTimeout
+	def := s.cfgSnapshot().SearchTimeout
 	if def <= 0 {
 		def = 180 * time.Second
 	}
@@ -336,6 +338,10 @@ func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, reque
 
 	var lastErr error
 	for _, acct := range ordered {
+		if err := accountBlockedError(acct); err != nil {
+			lastErr = err
+			continue
+		}
 		model := resolveSearchModel(acct, requestedModel)
 		if model == nil {
 			lastErr = transport.NewUpstreamError(
@@ -470,6 +476,11 @@ func (s *Server) runSearchOnAccount(ctx context.Context, acct *AccountState, mod
 		sources     []gemini.GroundingSource
 		candidateID string
 	)
+	finish, err := s.beginAuxStream(prep.account)
+	if err != nil {
+		return "", nil, err
+	}
+	defer finish()
 	client := s.clientFor(prep.account)
 	upstream, streamErr := client.StreamGenerateLive(ctx, query, opts, func(update *gemini.LineParseResult) error {
 		sources = gemini.MergeGroundingSources(sources, update.GroundingSources)
@@ -486,20 +497,20 @@ func (s *Server) runSearchOnAccount(ctx context.Context, acct *AccountState, mod
 		}
 		return nil
 	})
-	if streamErr != nil {
-		return "", nil, streamErr
+	if streamErr == nil && upstream != nil && upstream.Status != http.StatusOK {
+		streamErr = transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d during web search", upstream.Status), 502, "upstream_http_error", upstream.Headers, nil)
 	}
-	if upstream != nil && upstream.Status != 200 {
-		return "", nil, transport.NewUpstreamError(
-			fmt.Sprintf("upstream HTTP %d during web search", upstream.Status),
-			502, "upstream_http_error", upstream.Headers, nil,
-		)
+	if streamErr != nil {
+		s.recordAuxStreamError(ctx, prep.account, client, streamErr)
+		return "", nil, streamErr
 	}
 	if upstream != nil {
 		sources = gemini.MergeGroundingSources(sources, upstream.GroundingSources)
 	}
 	if strings.TrimSpace(text) == "" {
-		return "", nil, transport.NewUpstreamError("upstream returned no content for the search", 502, "empty_upstream_response", nil, nil)
+		err := transport.NewUpstreamError("upstream returned no content for the search", 502, "empty_upstream_response", nil, nil)
+		s.recordAuxStreamError(ctx, prep.account, client, err)
+		return "", nil, err
 	}
 	// Gemini Web answers a blocked request with a canned apology and HTTP 200.
 	// Treating that as a result would hand the caller a useless answer instead
@@ -510,6 +521,7 @@ func (s *Server) runSearchOnAccount(ctx context.Context, acct *AccountState, mod
 			502, "upstream_error_reply", upstreamHeaders(upstream), nil,
 		)
 	}
+	s.recordAuxStreamSuccess(prep.account, client)
 	return text, sources, nil
 }
 

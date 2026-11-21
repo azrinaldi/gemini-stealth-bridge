@@ -77,3 +77,19 @@ func TestFrameWatchdogIgnoresCallerContext(t *testing.T) {
 		t.Fatalf("caller cancellation was reported as a watchdog expiry")
 	}
 }
+
+func TestFrameWatchdogDisarmPreventsLateExpiry(t *testing.T) {
+	for i := range 100 {
+		ctx, watch := newFrameWatchdog(context.Background(), time.Millisecond)
+		if i%2 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		watch.Disarm()
+		time.Sleep(3 * time.Millisecond)
+		if !watch.Expired() && ctx.Err() != nil {
+			watch.Release()
+			t.Fatalf("iter %d: Expired()=false yet derived ctx was cancelled: %v", i, ctx.Err())
+		}
+		watch.Release()
+	}
+}

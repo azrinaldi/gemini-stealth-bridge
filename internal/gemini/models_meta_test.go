@@ -162,6 +162,18 @@ func TestDocumentedModelKey(t *testing.T) {
 	}
 }
 
+func TestDocumentedModelKeysNormalizePrefixedCandidates(t *testing.T) {
+	model := ModelInfo{
+		Description: "  GeMiNi-4 Hydrogen  ",
+		DisplayName: "Gemini 4 HYDROGEN",
+		ModelName:   "GEMINI-HYDROGEN",
+	}
+	keys := DocumentedModelKeys(model)
+	if len(keys) != 2 || keys[0] != "gemini-4-hydrogen" || keys[1] != "gemini-hydrogen" {
+		t.Fatalf("unexpected documented model keys: %q", keys)
+	}
+}
+
 // The everyday tier was renamed from Flash to Hydrogen on 2026-11-13. A name
 // missing from the reasoning tables silently forces thinking level low, so a
 // registry that carries no thinking policy would strip the new tier's thinking.

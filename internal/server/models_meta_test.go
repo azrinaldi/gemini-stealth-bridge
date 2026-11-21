@@ -1,7 +1,11 @@
 package server
 
 import (
+	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -9,7 +13,8 @@ import (
 
 func payloadFor(t *testing.T, cfg config.Config, model gemini.ModelInfo) map[string]any {
 	t.Helper()
-	s := &Server{Cfg: cfg}
+	s := &Server{}
+	s.SetCfg(cfg)
 	payload := s.BuildModelsPayload([]gemini.ModelInfo{model})
 	data, ok := payload["data"].([]map[string]any)
 	if !ok || len(data) != 1 {
@@ -105,5 +110,35 @@ func TestModelsPayloadFallsBackToConfiguredLimits(t *testing.T) {
 	}
 	if got := capsOf(t, entry)["limitsSource"]; got != "config" {
 		t.Fatalf("limitsSource = %v, want config", got)
+	}
+}
+
+func TestCheckRouterMetadataScript(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not installed")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not installed")
+	}
+	srv, acct := newTestHarness(false, false)
+	acct.Models = []gemini.ModelInfo{
+		{ModelName: "gemini-4-carbon", DisplayName: "Most complex work", Description: "4 Carbon", ModelID: "95a4c0abcba24364", ThinkingLevels: []string{"low", "medium", "high"}, ThinkingPolicyKnown: true},
+		{ModelName: "gemini-4-argon", DisplayName: "Complex work", Description: "4 Argon", ModelID: "e051ce1aa80aa576", ThinkingLevels: []string{"low", "medium", "high"}, ThinkingPolicyKnown: true},
+		{ModelName: "gemini-4-hydrogen", DisplayName: "Everyday help", Description: "4 Hydrogen", ModelID: "56fbf19f3d169e52", ThinkingLevels: []string{"low", "medium", "high"}, ThinkingPolicyKnown: true},
+		{ModelName: "gemini-3.5-flash-lite", DisplayName: "Fastest answers", Description: "3.5 Flash-Lite", ModelID: "421f99a1e3032c5d", ThinkingPolicyKnown: true},
+	}
+	acct.ModelsAt = time.Now()
+	srv.SetAccounts([]*AccountState{acct})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	cmd := exec.Command("../../scripts/check-router-metadata.sh", ts.URL, "public")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("check-router-metadata.sh failed: %v\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "OK: endpoint:") {
+		t.Fatalf("unexpected check-router-metadata.sh output:\n%s", string(out))
 	}
 }

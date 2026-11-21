@@ -710,14 +710,14 @@ func TestBufferedStreamRevisionLiveThoughtsAndCrossModelQuota(t *testing.T) {
 	}
 
 	// 2. LiveThoughts=false must suppress reasoning_content in chat responses
-	srv.Cfg.LiveThoughts = false
+	srv.UpdateCfg(func(c *config.Config) { c.LiveThoughts = false })
 	noThinkRec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
 		makeFrame("visible reply", "secret reasoning", true, testModel.ModelID),
 	}), nil)
 	if noThinkRec.Code != 200 || strings.Contains(noThinkRec.Body.String(), "secret reasoning") {
 		t.Fatalf("expected reasoning suppressed when LiveThoughts=false, got %d: %s", noThinkRec.Code, noThinkRec.Body.String())
 	}
-	srv.Cfg.LiveThoughts = true
+	srv.UpdateCfg(func(c *config.Config) { c.LiveThoughts = true })
 
 	// 3. Exhausted Flash quota bucket must not block Pro model requests
 	acct.mu.Lock()
@@ -1349,7 +1349,7 @@ func TestContinuationCachedTokens(t *testing.T) {
 
 func TestEarlySSEFirstByteInRelaxedMode(t *testing.T) {
 	srv, acct := newTestHarness(true, false)
-	srv.Cfg.EarlySSE = true
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSE = true })
 
 	firstPingAt := make(chan time.Duration, 1)
 	startAt := time.Now()
@@ -1392,7 +1392,7 @@ func TestEarlySSEFirstByteInRelaxedMode(t *testing.T) {
 func TestSessionBusyRetryAndFallback(t *testing.T) {
 	// 1. Account-scoped token gets 429 session_busy on attempt 1 -> sleeps ~1s and succeeds on attempt 2 on SAME account
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) { c.MaxAttempts = 3 })
 	calls := 0
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -1492,7 +1492,7 @@ func TestSyntheticQuotaBackoffAndClear(t *testing.T) {
 	}
 
 	// Successful request in advisory mode clears the synthetic bucket
-	srv.Cfg.QuotaPreflight = "advisory"
+	srv.UpdateCfg(func(c *config.Config) { c.QuotaPreflight = "advisory" })
 	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
 		makeFrame("ok", "", true, testModel.ModelID),
 	}), nil)
@@ -1740,7 +1740,7 @@ func TestAccountsEndpointPostureAndIdleRotationBackoff(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
 	baseNow := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
 	srv.clock = func() time.Time { return baseNow }
-	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	srv.UpdateCfg(func(c *config.Config) { c.RotateCookiesEvery = 9 * time.Minute })
 	acct.ImportedFrom = "chrome"
 	acct.ProfileID = "Default"
 	acct.ProxyURL = "socks5://127.0.0.1:1080"
@@ -2061,7 +2061,7 @@ func TestRotateFallbackAdvancesAndWraps(t *testing.T) {
 // downgrade guard keeps working on the stream body.
 func TestGraceFlushesStrictHeadersBeforeIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 20 * time.Millisecond })
 
 	frameSent := make(chan time.Time, 1)
 	client := &mockUpstream{
@@ -2115,7 +2115,7 @@ func TestGraceFlushesStrictHeadersBeforeIdentity(t *testing.T) {
 // body check is what replaces the status-line check once headers are gone.
 func TestGraceFlushStillStopsOnDowngrade(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 20 * time.Millisecond })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2151,7 +2151,7 @@ func TestGraceFlushStillStopsOnDowngrade(t *testing.T) {
 
 func TestGraceDisabledKeepsHeadersBuffered(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 0
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 0 })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2183,7 +2183,7 @@ func TestGraceDisabledKeepsHeadersBuffered(t *testing.T) {
 
 func TestHeadersFlushOnVerifiedIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 5 * time.Second
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 5 * time.Second })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2229,7 +2229,7 @@ func TestHeadersFlushOnVerifiedIdentity(t *testing.T) {
 
 func TestDowngradeStillReturnsHTTPError(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 5 * time.Second
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 5 * time.Second })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2365,7 +2365,7 @@ func TestRetrySelectiveBootstrapAndFreshSocket(t *testing.T) {
 
 	// Same-account transport error retry MUST set FreshSocket=true and call Bootstrap
 	srvSame, acctSame := newTestHarness(false, false)
-	srvSame.Cfg.MaxAttempts = 2
+	srvSame.UpdateCfg(func(c *config.Config) { c.MaxAttempts = 2 })
 	var sameBoot atomic.Int32
 	var sameFreshOnRetry atomic.Bool
 	sameCalls := 0
@@ -2418,8 +2418,10 @@ func TestStrictIdentityUnknownDoesNotEmitReasoning(t *testing.T) {
 
 func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
-	srv.Cfg.MaxUpstreamAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) {
+		c.MaxAttempts = 3
+		c.MaxUpstreamAttempts = 3
+	})
 	var calls atomic.Int32
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2473,8 +2475,10 @@ func TestResponsesCanonicalizesAssistantFunctionCallTurn(t *testing.T) {
 
 func TestStreamingToolCallErrorRetriesInStreamAndAppendsCorrection(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
-	srv.Cfg.MaxUpstreamAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) {
+		c.MaxAttempts = 3
+		c.MaxUpstreamAttempts = 3
+	})
 
 	var calls atomic.Int32
 	var secondPrompt string
@@ -2538,7 +2542,7 @@ func TestStreamingToolCallErrorRetriesInStreamAndAppendsCorrection(t *testing.T)
 
 func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.KeepToolPreamble = true
+	srv.UpdateCfg(func(c *config.Config) { c.KeepToolPreamble = true })
 	longPreamble := " " + strings.Repeat("Analyzing transit headway and corridor speed bottlenecks. ", 8)
 	toolBlock := "\n\n```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/data.db\"}}]}\n```"
 
@@ -2652,7 +2656,8 @@ func TestRefreshAccountClearsTransientFailure(t *testing.T) {
 // long after it recovered - the reason the operator was pressing Refresh by hand.
 func TestFailedAccountRechecksSooner(t *testing.T) {
 	now := time.Now()
-	s := &Server{Cfg: config.Config{ModelRefreshEvery: 30 * time.Minute}}
+	s := &Server{}
+	s.SetCfg(config.Config{ModelRefreshEvery: 30 * time.Minute})
 
 	healthy := &AccountState{ID: "healthy"}
 	now2, healthyNext := s.nextRefreshAt(now, healthy)
@@ -2672,6 +2677,21 @@ func TestFailedAccountRechecksSooner(t *testing.T) {
 	}
 	if !failedNext.Before(healthyNext) {
 		t.Errorf("failed recheck %v must come before healthy %v", failedNext.Sub(now), healthyNext.Sub(now))
+	}
+}
+
+func TestSchedulerSchedulesRecoveryForDegradedAccountWithoutDeadline(t *testing.T) {
+	now := time.Now()
+	srv := &Server{clock: func() time.Time { return now }}
+	srv.SetCfg(config.Config{ModelRefreshEvery: 30 * time.Minute})
+	acct := &AccountState{ID: "degraded", Fails: 1, LastError: "upstream_stalled"}
+	srv.SetAccounts([]*AccountState{acct})
+	srv.RunSchedulerStep(context.Background(), now)
+	acct.mu.RLock()
+	due := acct.NextModelRefAt
+	acct.mu.RUnlock()
+	if due.IsZero() || due.After(now.Add(30*time.Second)) {
+		t.Fatalf("degraded account without deadline got recovery probe at %v", due.Sub(now))
 	}
 }
 
@@ -2726,7 +2746,7 @@ func TestMarkAccountFailureNeverDelaysRecheck(t *testing.T) {
 func TestSchedulerMarksExpiredWhenRotationRejected(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	now := time.Now()
-	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	srv.UpdateCfg(func(c *config.Config) { c.RotateCookiesEvery = 9 * time.Minute })
 	acct.mu.Lock()
 	acct.NextRotateAt = now.Add(-time.Second)
 	acct.NextModelRefAt = now.Add(time.Hour)

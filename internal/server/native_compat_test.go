@@ -73,6 +73,12 @@ func TestAnswerLimitsStopSequence(t *testing.T) {
 	if got, finish := lim.apply("nothing to cut"); got != "nothing to cut" || finish != "" {
 		t.Errorf("absent stop changed answer: %q finish=%q", got, finish)
 	}
+	if got, finish := lim.visible("alpha STOP"); got != "alpha " || finish != "" {
+		t.Errorf("partial stop prefix flushed: %q finish=%q", got, finish)
+	}
+	if got, finish := lim.visible("alpha STOPHERE beta"); got != "alpha " || finish != "stop" {
+		t.Errorf("completed stop sequence: %q finish=%q", got, finish)
+	}
 }
 
 // max_tokens must cap the answer and report finish_reason "length". The usage
@@ -129,6 +135,7 @@ func TestJSONObjectText(t *testing.T) {
 		// Braces inside string literals must not close the object early.
 		{"brace_in_string", `{"a": "value } with brace"}`, `{"a": "value } with brace"}`},
 		{"escaped_quote", `{"a": "say \"hi\" }"}`, `{"a": "say \"hi\" }"}`},
+		{"invalid_prose_braces_before_json", "Replace {placeholder} with:\n{\"a\": 1}", `{"a": 1}`},
 	}
 	for _, tc := range cases {
 		if got := jsonObjectText(tc.in); got != tc.want {

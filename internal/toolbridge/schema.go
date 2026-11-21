@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"strings"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -97,9 +97,9 @@ func checkSchemaWithRoot(schema any, root map[string]any, value any, path string
 		}
 	}
 
-	if enumRaw, ok := sMap["enum"].([]any); ok {
+	if enumVals, ok := extractEnumSlice(sMap["enum"]); ok {
 		matched := false
-		for _, e := range enumRaw {
+		for _, e := range enumVals {
 			if jsonEqual(e, value) {
 				matched = true
 				break
@@ -356,6 +356,26 @@ func jsonEqual(a, b any) bool {
 	return string(ba) == string(bb)
 }
 
+func extractEnumSlice(raw any) ([]any, bool) {
+	switch v := raw.(type) {
+	case []any:
+		return v, true
+	case []string:
+		out := make([]any, len(v))
+		for i, s := range v {
+			out[i] = s
+		}
+		return out, true
+	case []int:
+		out := make([]any, len(v))
+		for i, n := range v {
+			out[i] = n
+		}
+		return out, true
+	}
+	return nil, false
+}
+
 var nonFunctionalSchemaKeys = map[string]bool{
 	"$schema":              true,
 	"title":                true,
@@ -387,7 +407,9 @@ func TruncateUTF8(s string, maxRunes int) string {
 
 // CompactSchemaMap recursively copies a JSON Schema map while stripping
 // non-functional metadata keys ($schema, title, additionalProperties, examples, $id, $comment)
-// and truncating "description" strings to maxDescChars runes.
+// and truncating "description" strings to maxDescChars runes. User-controlled
+// names under properties, patternProperties, $defs, and definitions are kept
+// verbatim; literal keyword values are never interpreted as schema maps.
 func CompactSchemaMap(raw map[string]any, maxDescChars int) map[string]any {
 	if raw == nil {
 		return nil
@@ -395,30 +417,63 @@ func CompactSchemaMap(raw map[string]any, maxDescChars int) map[string]any {
 	if maxDescChars <= 0 {
 		maxDescChars = 400
 	}
+	return compactSchemaNode(raw, maxDescChars)
+}
+
+func compactSchemaNode(raw map[string]any, maxDescChars int) map[string]any {
 	out := make(map[string]any, len(raw))
 	for k, v := range raw {
 		if nonFunctionalSchemaKeys[k] {
 			continue
 		}
-		if k == "description" {
+		switch k {
+		case "description":
 			if str, ok := v.(string); ok {
-				out[k] = TruncateUTF8(str, maxDescChars)
+				v = TruncateUTF8(str, maxDescChars)
+			}
+		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies":
+			if entries, ok := v.(map[string]any); ok && entries != nil {
+				names := make(map[string]any, len(entries))
+				for name, schema := range entries {
+					names[name] = copySchemaValue(schema, maxDescChars)
+				}
+				out[k] = names
 				continue
 			}
+		case "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "items", "prefixItems",
+			"additionalItems", "contains", "propertyNames", "unevaluatedItems", "unevaluatedProperties",
+			"contentSchema":
+			out[k] = copySchemaValue(v, maxDescChars)
+			continue
 		}
-		out[k] = compactSchemaValue(v, maxDescChars)
+		// Other keyword values, including const, default, and enum, contain data.
+		out[k] = copySchemaValue(v, 0)
 	}
 	return out
 }
 
-func compactSchemaValue(v any, maxDescChars int) any {
+// A zero limit copies JSON data without interpreting it as a schema.
+func copySchemaValue(v any, maxDescChars int) any {
 	switch val := v.(type) {
 	case map[string]any:
-		return CompactSchemaMap(val, maxDescChars)
+		if val == nil {
+			return val
+		}
+		if maxDescChars > 0 {
+			return compactSchemaNode(val, maxDescChars)
+		}
+		cp := make(map[string]any, len(val))
+		for k, child := range val {
+			cp[k] = copySchemaValue(child, 0)
+		}
+		return cp
 	case []any:
+		if val == nil {
+			return val
+		}
 		cp := make([]any, len(val))
 		for i, item := range val {
-			cp[i] = compactSchemaValue(item, maxDescChars)
+			cp[i] = copySchemaValue(item, maxDescChars)
 		}
 		return cp
 	default:

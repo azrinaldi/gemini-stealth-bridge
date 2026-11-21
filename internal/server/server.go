@@ -11,7 +11,9 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -57,6 +59,7 @@ type AccountState struct {
 	Quarantined      bool
 	QuarantineReason string
 	Disabled         bool
+	retired          bool
 	Surfaces         map[string]string
 	NextRotateAt     time.Time
 	NextModelRefAt   time.Time
@@ -125,14 +128,13 @@ type cachedUpload struct {
 
 // Server is the browserless Gemini Stealth Bridge HTTP daemon.
 type Server struct {
-	Cfg     config.Config
+	cfgPtr  atomic.Pointer[config.Config]
 	Pool    *transport.Pool
 	Rotator *cookies.Rotator
 
 	mu                sync.RWMutex
 	accounts          []*AccountState
 	tokenToAcct       map[string]string
-	tokenToGroup      map[string]string
 	sessionCache      map[string][]any
 	sessionCacheAt    map[string]time.Time
 	sessionOrder      []string
@@ -146,6 +148,7 @@ type Server struct {
 	cacheFlushMu      sync.Mutex
 	cacheFlushPending atomic.Bool
 	cacheFlushWG      sync.WaitGroup
+	modelsRefreshing  atomic.Bool
 	clientFactory     func(a *AccountState) UpstreamClient
 
 	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.
@@ -154,10 +157,12 @@ type Server struct {
 
 	adminAuthMu    sync.Mutex
 	adminAuthFails map[string][]time.Time
+	adminImportMu  sync.Mutex
 
 	mediaMu    sync.RWMutex
 	mediaItems map[string]*mediaEntry
 	mediaOrder []string
+	mediaBytes int
 }
 
 // New constructs a new Server from cfg.
@@ -193,30 +198,56 @@ func New(cfg config.Config) *Server {
 	})
 	rotator := cookies.NewRotator()
 
-	tokMap := make(map[string]string, len(cfg.AccountTokens))
-	for k, v := range cfg.AccountTokens {
-		tokMap[k] = v
-	}
-
-	grpMap := make(map[string]string, len(cfg.GroupTokens))
-	for k, v := range cfg.GroupTokens {
-		grpMap[k] = v
-	}
-
+	cloned := cfg.Clone()
 	s := &Server{
-		Cfg:            cfg,
 		Pool:           pool,
 		Rotator:        rotator,
-		tokenToAcct:    tokMap,
-		tokenToGroup:   grpMap,
+		tokenToAcct:    make(map[string]string),
 		sessionCache:   make(map[string][]any),
 		sessionCacheAt: make(map[string]time.Time),
 		uploadCache:    make(map[string]cachedUpload),
 		startedAt:      time.Now().UTC(),
 		clock:          time.Now,
 	}
+	s.cfgPtr.Store(&cloned)
 	s.loadSessionCacheFromDisk()
 	return s
+}
+
+func (s *Server) cfgSnapshot() config.Config {
+	if s == nil {
+		return config.Config{}
+	}
+	if p := s.cfgPtr.Load(); p != nil {
+		return *p
+	}
+	return config.Config{}
+}
+
+// Config returns a deep-copied snapshot of the current server configuration.
+func (s *Server) Config() config.Config {
+	return s.cfgSnapshot().Clone()
+}
+
+// SetCfg replaces the server configuration with a deep clone of cfg.
+func (s *Server) SetCfg(cfg config.Config) {
+	s.mu.Lock()
+	cloned := cfg.Clone()
+	s.cfgPtr.Store(&cloned)
+	s.mu.Unlock()
+}
+
+// UpdateCfg atomically applies fn to a deep clone of the current configuration.
+func (s *Server) UpdateCfg(fn func(*config.Config)) {
+	if fn == nil {
+		return
+	}
+	s.mu.Lock()
+	cfg := s.cfgSnapshot().Clone()
+	fn(&cfg)
+	cloned := cfg.Clone()
+	s.cfgPtr.Store(&cloned)
+	s.mu.Unlock()
 }
 
 func (s *Server) now() time.Time {
@@ -246,66 +277,79 @@ func extractRequestToken(r *http.Request) string {
 	return ""
 }
 
-// ResolveAuthScope resolves the caller's API key into an AuthScope.
+// ResolveAuthScope resolves request credentials against a single config snapshot.
 func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	token := extractRequestToken(r)
 	if token == "" {
 		token = strings.TrimSpace(r.Header.Get("X-GSB-Admin-Key"))
 	}
+	return s.resolveToken(token, true)
+}
 
-	s.mu.RLock()
-	if s.Cfg.AdminKey != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.Cfg.AdminKey)) == 1 {
-		s.mu.RUnlock()
+func matchesSecret(token, key string) bool {
+	if token == "" || key == "" {
+		return false
+	}
+	a, b := sha256.Sum256([]byte(token)), sha256.Sum256([]byte(key))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}
+
+func (s *Server) resolveToken(token string, allowReload bool) AuthScope {
+	cfg := s.cfgSnapshot()
+	if matchesSecret(token, cfg.AdminKey) {
 		return AuthScope{OK: true, Admin: true}
 	}
-	if acctID, ok := s.tokenToAcct[token]; ok && token != "" {
-		s.mu.RUnlock()
-		return AuthScope{OK: true, AccountID: acctID}
-	}
-	if group, ok := s.tokenToGroup[token]; ok && token != "" {
-		s.mu.RUnlock()
-		return AuthScope{OK: true, Group: group}
-	}
-	explicitTokens := len(s.Cfg.AccountTokens) > 0
-	s.mu.RUnlock()
-
-	defPoolTok := s.defaultPoolToken()
-	isPoolKey := (s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok)) ||
-		(s.Cfg.APIKey != "public" && token == s.Cfg.APIKey)
-	// Hot-load newly added account files on the fly when an unknown account token
-	// arrives and explicit token lock is not enabled, rate-limited to once per 2s
-	// to avoid disk scans on repeated invalid tokens or pool-key requests.
-	if !isPoolKey && token != "" && !explicitTokens && (strings.HasPrefix(token, "gsb-") || reSafeID.MatchString(token)) {
-		s.mu.RLock()
-		canReload := time.Since(s.lastHotLoadAt) >= 2*time.Second
-		s.mu.RUnlock()
-		if canReload {
-			s.mu.Lock()
-			s.lastHotLoadAt = time.Now()
-			s.mu.Unlock()
-			s.LoadCredentials()
-			s.mu.RLock()
-			acctID, ok := s.tokenToAcct[token]
-			s.mu.RUnlock()
-			if ok {
-				return AuthScope{OK: true, AccountID: acctID}
+	if token != "" {
+		for key, id := range cfg.AccountTokens {
+			if matchesSecret(token, key) {
+				return AuthScope{OK: true, AccountID: id}
+			}
+		}
+		for key, group := range cfg.GroupTokens {
+			if matchesSecret(token, key) {
+				return AuthScope{OK: true, Group: group}
 			}
 		}
 	}
+	public := cfg.APIKey == "public"
+	aliases := public && len(cfg.AccountTokens) == 0
+	isPoolKey := matchesSecret(token, cfg.APIKey) || public && (token == "" || token == poolToken(cfg.HomeDir))
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	if isPoolKey {
+		scope := AuthScope{OK: true, Admin: true}
 		if len(s.accounts) == 1 {
-			return AuthScope{OK: true, AccountID: s.accounts[0].ID}
+			scope = AuthScope{OK: true, AccountID: s.accounts[0].ID}
 		}
-		return AuthScope{OK: true, Admin: true}
+		s.mu.RUnlock()
+		return scope
 	}
-	return AuthScope{OK: false}
+	if aliases && token != "" {
+		if id, ok := s.tokenToAcct[token]; ok {
+			s.mu.RUnlock()
+			return AuthScope{OK: true, AccountID: id}
+		}
+	}
+	s.mu.RUnlock()
+	if aliases && allowReload && (reSafeID.MatchString(token) || strings.HasPrefix(token, "gsb-") && reSafeID.MatchString(token[4:])) {
+		s.mu.Lock()
+		now := time.Now()
+		canReload := now.Sub(s.lastHotLoadAt) >= 2*time.Second
+		if canReload {
+			s.lastHotLoadAt = now
+		}
+		s.mu.Unlock()
+		if canReload {
+			s.LoadCredentials()
+			return s.resolveToken(token, false)
+		}
+	}
+	return AuthScope{}
 }
 
-func (s *Server) defaultPoolToken() string {
-	seed := strings.TrimSpace(s.Cfg.HomeDir)
+func (s *Server) defaultPoolToken() string { return poolToken(s.cfgSnapshot().HomeDir) }
+
+func poolToken(homeDir string) string {
+	seed := strings.TrimSpace(homeDir)
 	if seed == "" {
 		seed = "gemini-stealth-bridge"
 	}
@@ -323,6 +367,10 @@ func (s *Server) requireAuthScope(w http.ResponseWriter, r *http.Request) (AuthS
 }
 
 func (s *Server) requireAuthAndJSONBody(w http.ResponseWriter, r *http.Request) (AuthScope, map[string]any, bool) {
+	if s.cfgSnapshot().APIKey == "public" && (isCrossSiteRequest(r) || hasNonJSONContentType(r)) {
+		sendJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{"message": "cross-site browser requests are forbidden", "type": "AuthorizationError", "code": "cross_site_forbidden"}}, nil)
+		return AuthScope{}, nil, false
+	}
 	scope, ok := s.requireAuthScope(w, r)
 	if !ok {
 		return AuthScope{}, nil, false
@@ -334,10 +382,134 @@ func (s *Server) requireAuthAndJSONBody(w http.ResponseWriter, r *http.Request) 
 	return scope, body, true
 }
 
+func hasNonJSONContentType(r *http.Request) bool {
+	for _, raw := range r.Header.Values("Content-Type") {
+		ct, _, _ := strings.Cut(raw, ";")
+		if !strings.EqualFold(strings.TrimSpace(ct), "application/json") {
+			return true
+		}
+	}
+	return false
+}
+
+func isCrossSiteRequest(r *http.Request) bool {
+	for _, site := range r.Header.Values("Sec-Fetch-Site") {
+		if strings.EqualFold(strings.TrimSpace(site), "cross-site") {
+			return true
+		}
+	}
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return false
+	}
+	if len(origins) != 1 {
+		return true
+	}
+	scheme := requestScheme(r)
+	prefix := scheme + "://"
+	origin := origins[0]
+	if !strings.HasPrefix(origin, prefix) {
+		return true
+	}
+	originHost, originPort, originOK := splitRequestAuthority(origin[len(prefix):])
+	host, port, ok := splitRequestAuthority(r.Host)
+	if port == "" {
+		port = "80"
+		if scheme == "https" {
+			port = "443"
+		}
+	}
+	if originPort == "" {
+		originPort = "80"
+		if scheme == "https" {
+			originPort = "443"
+		}
+	}
+	return !ok || !originOK || !strings.EqualFold(originHost, host) || originPort != port
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func splitRequestAuthority(authority string) (host, port string, ok bool) {
+	if authority == "" || strings.ContainsAny(authority, "/\\?#@% \t\r\n") {
+		return "", "", false
+	}
+	u, err := url.Parse("http://" + authority)
+	if err != nil || u.Host != authority || u.User != nil || strings.HasSuffix(authority, ":") {
+		return "", "", false
+	}
+	host, port = u.Hostname(), u.Port()
+	if strings.HasPrefix(authority, "[") {
+		if net.ParseIP(host) == nil || !strings.Contains(host, ":") {
+			return "", "", false
+		}
+	} else if !requestHostname.MatchString(host) {
+		return "", "", false
+	}
+	if port != "" {
+		p, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return "", "", false
+		}
+		port = strconv.FormatUint(p, 10)
+	}
+	return host, port, true
+}
+
+var requestHostname = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+func (s *Server) beginAuxStream(a *AccountState) (func(), error) {
+	maxStreams := s.cfgSnapshot().MaxConcurrentPerAccount
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := accountBlockedErrorLocked(a); err != nil {
+		return nil, err
+	}
+	if maxStreams > 0 && a.activeStreams >= maxStreams {
+		return nil, transport.NewUpstreamError("account concurrent stream limit reached", 429, "rate_limit_error", map[string]string{"retry-after": "2"}, nil)
+	}
+	a.activeStreams++
+	return func() {
+		a.mu.Lock()
+		a.activeStreams--
+		a.mu.Unlock()
+	}, nil
+}
+
+func (s *Server) recordAuxStreamError(ctx context.Context, a *AccountState, client UpstreamClient, err error) {
+	switch mcpErrorCode(err) {
+	case "account_banned":
+		s.markAccountQuarantined(a, err.Error())
+	case "session_busy", "client_cancelled", "upstream_error_reply":
+	default:
+		if ctx.Err() == nil {
+			s.markAccountFailure(a, err.Error())
+			s.refreshQuotaAsync(a, client)
+		}
+	}
+}
+
+func (s *Server) recordAuxStreamSuccess(a *AccountState, client UpstreamClient) {
+	a.mu.Lock()
+	if !a.Quarantined {
+		a.Fails, a.LastError, a.LastFail = 0, "", time.Time{}
+		a.ModelsError = nil
+	}
+	a.LastUsed = s.now()
+	a.mu.Unlock()
+	s.refreshQuotaAsync(a, client)
+}
+
 // ServeHTTP implements http.Handler for all bridge endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfgSnapshot()
 	p := r.URL.Path
-	ctx := withRequestBaseURL(r.Context(), r, s.Cfg.Port)
+	ctx := withRequestBaseURL(r.Context(), r, cfg.Port)
 
 	switch {
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && (strings.HasPrefix(p, "/v1/media/") || strings.HasPrefix(p, "/media/")):
@@ -346,7 +518,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case (p == "/mcp" || p == "/v1/mcp"):
 		s.HandleMCP(w, r)
 		return
-	case s.Cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
+	case cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
 		s.HandleWebUI(w, r)
 		return
 
@@ -357,7 +529,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"status":    "ok",
 			"service":   "gemini-stealth-bridge",
 			"transport": "stealth-utls-h2",
-			"profile":   s.Cfg.ImpersonateProfile,
+			"profile":   cfg.ImpersonateProfile,
 			"accounts":  len(accts),
 			"models":    models,
 			"upstream":  "gemini.google.com",
@@ -369,7 +541,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		acctReports := make([]map[string]any, 0, len(accts))
 		healthyCount := 0
 		quarantinedCount := 0
-		refInterval := s.Cfg.ModelRefreshEvery
+		refInterval := cfg.ModelRefreshEvery
 		if refInterval <= 0 {
 			refInterval = 30 * time.Minute
 		}
@@ -422,7 +594,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		sendJSON(w, 200, map[string]any{
 			"transport":     "stealth-utls-h2",
-			"profile":       s.Cfg.ImpersonateProfile,
+			"profile":       cfg.ImpersonateProfile,
 			"sessions":      s.Pool.Status(),
 			"cache_entries": s.sessionCacheLen(),
 			"cache_hits":    s.cacheHits.Load(),
@@ -494,7 +666,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			list = append(list, map[string]any{
 				"id":      a.ID,
 				"email":   a.Email,
-				"quota":   a.Quota,
+				"quota":   cloneQuotaBuckets(a.Quota),
 				"quotaAt": qAtStr,
 			})
 			a.mu.RUnlock()
@@ -516,7 +688,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		freshReq := r.URL.Query().Get("fresh") == "1"
 		hasWarmModels := false
 		needsBgRefresh := false
-		refEvery := s.Cfg.ModelRefreshEvery
+		refEvery := cfg.ModelRefreshEvery
 		if refEvery <= 0 {
 			refEvery = 30 * time.Minute
 		}
@@ -534,8 +706,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.EnsureModels(ctx, true)
 		} else if !hasWarmModels {
 			s.EnsureModels(ctx, false)
-		} else if needsBgRefresh {
+		} else if needsBgRefresh && s.modelsRefreshing.CompareAndSwap(false, true) {
 			go func() {
+				defer s.modelsRefreshing.Store(false)
 				bgCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 				defer cancel()
 				s.EnsureModels(bgCtx, true)
@@ -624,7 +797,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 
-	case s.Cfg.WebUI && strings.HasPrefix(p, "/v1/admin/"):
+	case cfg.WebUI && strings.HasPrefix(p, "/v1/admin/"):
 		s.HandleAdmin(ctx, w, r)
 		return
 
@@ -672,8 +845,8 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 	for k, v := range a.Surfaces {
 		surfCopy[k] = v
 	}
-	status, statusReason := AccountStatus(a, now)
-	quotaCopy := append([]gemini.QuotaBucket(nil), a.Quota...)
+	status, statusReason := accountStatusLocked(a, now)
+	quotaCopy := cloneQuotaBuckets(a.Quota)
 	var lastFailStr string
 	if !a.LastFail.IsZero() {
 		lastFailStr = a.LastFail.UTC().Format(time.RFC3339)
@@ -702,7 +875,7 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 		"accountGroup":     a.AccountGroup,
 		"importedFrom":     a.ImportedFrom,
 		"profileId":        a.ProfileID,
-		"proxyConfigured":  a.ProxyURL != "" || s.Cfg.ProxyURL != "",
+		"proxyConfigured":  a.ProxyURL != "" || s.cfgSnapshot().ProxyURL != "",
 		"activeStreams":    a.activeStreams,
 		"recentRpm":        recentRPM,
 		"peakRpm":          a.peakRPM,
@@ -757,22 +930,23 @@ func containsString(list []string, want string) bool {
 // BuildModelsPayload constructs the canonical /v1/models response object with
 // OpenAI, OpenRouter, and gsb capability metadata.
 func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
+	cfg := s.cfgSnapshot()
 	createdSec := s.startedAt.Unix()
 	if createdSec <= 0 {
 		createdSec = time.Now().Unix()
 	}
-	ctxWinFallback := s.Cfg.ContextWindow
+	ctxWinFallback := cfg.ContextWindow
 	if ctxWinFallback <= 0 {
 		ctxWinFallback = 1048576
 	}
-	maxOutFallback := s.Cfg.MaxOutputTokens
+	maxOutFallback := cfg.MaxOutputTokens
 	if maxOutFallback <= 0 {
 		maxOutFallback = 65536
 	}
 	// The configured default is what requests without an explicit effort actually
 	// use, so it is what the metadata must advertise. Reporting a hardcoded "high"
 	// here would tell clients the opposite of the daemon's behaviour.
-	configuredDefault := ThinkingLevelName(s.Cfg.DefaultThinking)
+	configuredDefault := ThinkingLevelName(cfg.DefaultThinking)
 
 	data := make([]map[string]any, 0, len(models))
 	for _, x := range models {
@@ -923,7 +1097,7 @@ func quotaWindowInfo(quota []gemini.QuotaBucket, now time.Time) map[string]any {
 // ScheduleAccountTimers initializes staggered per-account rotation and model refresh deadlines.
 func (s *Server) ScheduleAccountTimers(now time.Time) {
 	accts := s.Accounts()
-	baseRotate := cookies.ClampRotateInterval(0, s.Cfg.RotateCookiesEvery)
+	baseRotate := cookies.ClampRotateInterval(0, s.cfgSnapshot().RotateCookiesEvery)
 	for i, a := range accts {
 		a.mu.Lock()
 		if a.NextRotateAt.IsZero() {
@@ -963,7 +1137,7 @@ func (s *Server) decollideRotationTimers() {
 // what clears the evidence; a healthy account keeps the slow cadence. now is
 // returned unchanged so callers can thread one clock value through.
 func (s *Server) nextRefreshAt(now time.Time, a *AccountState) (time.Time, time.Time) {
-	refEvery := s.Cfg.ModelRefreshEvery
+	refEvery := s.cfgSnapshot().ModelRefreshEvery
 	if refEvery <= 0 {
 		refEvery = 30 * time.Minute
 	}
@@ -987,11 +1161,12 @@ const failureRecheckInterval = 2 * time.Minute
 
 // RunSchedulerStep evaluates one tick of the per-account background scheduler at now.
 func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
-	if inQuietHours(now, s.Cfg.QuietHours) {
+	cfg := s.cfgSnapshot()
+	if inQuietHours(now, cfg.QuietHours) {
 		return
 	}
 	accts := s.Accounts()
-	refEvery := s.Cfg.ModelRefreshEvery
+	refEvery := cfg.ModelRefreshEvery
 	if refEvery <= 0 {
 		refEvery = 30 * time.Minute
 	}
@@ -1001,11 +1176,25 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 		nextRot := a.NextRotateAt
 		nextRef := a.NextModelRefAt
 		lastUsed := a.LastUsed
+		failing := a.Fails > 0 || !a.LastFail.IsZero()
 		a.mu.RUnlock()
 		if quarantined {
 			continue
 		}
-		if s.Cfg.RotateCookiesEvery > 0 && !nextRot.IsZero() && !now.Before(nextRot) {
+		// Runtime failure records created by older processes or imported state may
+		// not carry a refresh deadline. Give them the same short recovery probe as
+		// newly recorded failures instead of leaving degraded status sticky.
+		if failing && nextRef.IsZero() {
+			nextRef = now.Add(jitterDuration(5*time.Second, 30*time.Second))
+			a.mu.Lock()
+			if a.NextModelRefAt.IsZero() {
+				a.NextModelRefAt = nextRef
+			} else {
+				nextRef = a.NextModelRefAt
+			}
+			a.mu.Unlock()
+		}
+		if cfg.RotateCookiesEvery > 0 && !nextRot.IsZero() && !now.Before(nextRot) {
 			busy := false
 			if s.Pool != nil {
 				if sess := s.Pool.Existing(a.ID); sess != nil && sess.Busy() {
@@ -1017,12 +1206,12 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 				rCtx, rCancel := context.WithTimeout(ctx, 15*time.Second)
 				res, err := c.RotateCookies(rCtx)
 				rCancel()
-				base := cookies.ClampRotateInterval(0, s.Cfg.RotateCookiesEvery)
+				base := cookies.ClampRotateInterval(0, cfg.RotateCookiesEvery)
 				if res != nil && res.NextInterval > 0 {
-					base = cookies.ClampRotateInterval(res.NextInterval, s.Cfg.RotateCookiesEvery)
+					base = cookies.ClampRotateInterval(res.NextInterval, cfg.RotateCookiesEvery)
 				}
 				if lastUsed.IsZero() || now.Sub(lastUsed) > 2*base {
-					base = cookies.ClampRotateInterval(base*2, s.Cfg.RotateCookiesEvery)
+					base = cookies.ClampRotateInterval(base*2, cfg.RotateCookiesEvery)
 				}
 				nextTime := now.Add(base + randDuration(base/3))
 				a.mu.Lock()
@@ -1034,6 +1223,9 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 						a.LastError = ""
 						a.LastFail = time.Time{}
 						a.Fails = 0
+					}
+					if a.ModelsError != nil && looksLikeAuthFailure(a.ModelsError.Error()) {
+						a.ModelsError = nil
 					}
 				}
 				a.NextRotateAt = nextTime
@@ -1086,13 +1278,17 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				s.mediaMu.Lock()
+				s.trimMediaCacheLocked(s.now(), 0, "")
+				s.mediaMu.Unlock()
 				s.RunSchedulerStep(ctx, s.now())
 			}
 		}
 	}()
 
 	// Reap idle transport sessions every 60 seconds
-	if s.Cfg.IdleSessionTimeout > 0 {
+	idleTimeout := s.cfgSnapshot().IdleSessionTimeout
+	if idleTimeout > 0 {
 		go func() {
 			ticker := time.NewTicker(60 * time.Second)
 			defer ticker.Stop()
@@ -1101,7 +1297,7 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					s.Pool.ReapIdle(s.Cfg.IdleSessionTimeout)
+					s.Pool.ReapIdle(idleTimeout)
 				}
 			}
 		}()
@@ -1157,7 +1353,7 @@ func parseHHMM(s string) (int, bool) {
 }
 
 func (s *Server) logRequestJSON(entry map[string]any) {
-	if !s.Cfg.LogRequests || entry == nil {
+	if !s.cfgSnapshot().LogRequests || entry == nil {
 		return
 	}
 	if _, ok := entry["ts"]; !ok {

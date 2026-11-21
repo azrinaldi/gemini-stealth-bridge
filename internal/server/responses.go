@@ -568,11 +568,16 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	hasher := prep.hasher
 	cacheKey := prep.cacheKey
 	cacheUsed := cacheKey != ""
+	cfg := s.cfgSnapshot()
 	respID := "resp_" + randomHex(8)
 	rsID := "rs_" + randomHex(6)
 	msgID := "msg_" + randomHex(6)
 	created := time.Now().Unix()
-	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
+	eagerStream := strings.EqualFold(cfg.StreamBufferMode, "eager")
+
+	type streamTarget struct{ accountID, modelName string }
+	var activeTarget atomic.Pointer[streamTarget]
+	activeTarget.Store(&streamTarget{account.ID, mid})
 
 	headersSent := false
 	// handlerDone is set before the handler returns. Keepalive and early-SSE
@@ -599,6 +604,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		reasoningAdded bool
 		messageAdded   bool
 	)
+	var streamedReasoning strings.Builder
+	var reasoningIndex, messageIndex, nextOutputIndex int
 	flusher, _ := w.(http.Flusher)
 
 	// markPhase records a phase timestamp once, in milliseconds from request
@@ -614,19 +621,16 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	}
 	// assignAccount counts an account switch only when failover moves the request
 	// to a different account. Same-account retries leave the counter untouched.
-	assignAccount := func(next *AccountState) {
+	assignAccount := func(next *AccountState, nextModel *gemini.ModelInfo) {
 		if next != nil && next != account {
 			accountSwitches.Add(1)
 		}
-		account = next
+		account, model, opts.Model = next, nextModel, nextModel
+		mid = nextModel.ModelName
+		activeTarget.Store(&streamTarget{next.ID, mid})
 	}
 
-	emitSSE := func(eventType string, payload map[string]any) {
-		if ctx.Err() != nil {
-			return
-		}
-		streamMu.Lock()
-		defer streamMu.Unlock()
+	emitSSELocked := func(eventType string, payload map[string]any) {
 		if handlerDone.Load() {
 			return
 		}
@@ -643,20 +647,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			flusher.Flush()
 		}
 	}
-
-	var pinger *streamPinger
-	var pingerMu sync.Mutex
-	stopKeepalive := func() {
-		pingerMu.Lock()
-		p := pinger
-		pinger = nil
-		pingerMu.Unlock()
-		p.Stop()
+	emitSSE := func(eventType string, payload map[string]any) {
+		if ctx.Err() != nil {
+			return
+		}
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		emitSSELocked(eventType, payload)
 	}
-	defer stopKeepalive()
-	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
-	// handlerDone and exits instead of writing after the handler returns.
-	defer handlerDone.Store(true)
 
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
@@ -664,13 +662,39 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	var streamStartedOnce sync.Once
 	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
 
+	var graceWG sync.WaitGroup
+	stopGrace := func() {
+		markStreamStarted()
+		graceWG.Wait()
+	}
+
+	var pinger *streamPinger
+	var pingerMu sync.Mutex
+	keepaliveStopped := false
+	stopKeepalive := func() {
+		pingerMu.Lock()
+		keepaliveStopped = true
+		p := pinger
+		pinger = nil
+		pingerMu.Unlock()
+		p.Stop()
+	}
+	defer func() {
+		streamMu.Lock()
+		handlerDone.Store(true)
+		streamMu.Unlock()
+		stopGrace()
+		stopKeepalive()
+	}()
+
 	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
 		if headersSent || ctx.Err() != nil || handlerDone.Load() {
 			streamMu.Unlock()
 			return
 		}
-		setGSBHeaders(w, false, account.ID, mid, attempt, upstreamStatus, retryReason)
+		target := activeTarget.Load()
+		setGSBHeaders(w, false, target.accountID, target.modelName, attempt, upstreamStatus, retryReason)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -681,28 +705,24 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		// early flush or first meaningful delta.
 		markPhase(&headerMs)
 		_, _ = io.WriteString(w, ": ping\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		streamMu.Unlock()
-
-		pingerMu.Lock()
-		if pinger == nil && !handlerDone.Load() {
-			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, nil)
-		}
-		pingerMu.Unlock()
-
 		baseResp := map[string]any{
 			"id":         respID,
 			"object":     "response",
 			"created_at": created,
-			"model":      mid,
+			"model":      target.modelName,
 			"status":     "in_progress",
 			"output":     []any{},
 			"usage":      nil,
 		}
-		emitSSE("response.created", map[string]any{"response": baseResp})
-		emitSSE("response.in_progress", map[string]any{"response": baseResp})
+		emitSSELocked("response.created", map[string]any{"response": baseResp})
+		emitSSELocked("response.in_progress", map[string]any{"response": baseResp})
+		streamMu.Unlock()
+
+		pingerMu.Lock()
+		if pinger == nil && !keepaliveStopped && !handlerDone.Load() {
+			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, nil)
+		}
+		pingerMu.Unlock()
 	}
 
 	// startStream reads the caller-owned attempt diagnostics, so it must only be
@@ -711,11 +731,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
 	}
 
-	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
+	if stream && cfg.EarlySSE && (eagerStream || !cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 && (eagerStream || !s.Cfg.RejectDowngrade) {
+	} else if stream && buffered && cfg.EarlySSEGrace > 0 {
+		graceDur := cfg.EarlySSEGrace
+		graceWG.Add(1)
 		go func() {
-			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
+			defer graceWG.Done()
+			timer := time.NewTimer(graceDur)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
@@ -736,9 +759,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		markMeaningfulOutput(&firstReasoningMs)
 		startStream(false)
 		if !reasoningAdded {
+			reasoningIndex = nextOutputIndex
+			nextOutputIndex++
 			reasoningAdded = true
 			emitSSE("response.output_item.added", map[string]any{
-				"output_index": 0,
+				"output_index": reasoningIndex,
 				"item": map[string]any{
 					"id":      rsID,
 					"type":    "reasoning",
@@ -747,7 +772,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			})
 			emitSSE("response.reasoning_summary_part.added", map[string]any{
 				"item_id":       rsID,
-				"output_index":  0,
+				"output_index":  reasoningIndex,
 				"summary_index": 0,
 				"part": map[string]any{
 					"type": "summary_text",
@@ -755,28 +780,23 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				},
 			})
 		}
+		streamedReasoning.WriteString(delta)
 		emitSSE("response.reasoning_summary_text.delta", map[string]any{
 			"item_id":       rsID,
-			"output_index":  0,
+			"output_index":  reasoningIndex,
 			"summary_index": 0,
 			"delta":         delta,
 		})
 	}
 
 	emitTextDelta := func(delta string) {
-		if delta == "" {
-			return
-		}
-		markMeaningfulOutput(&firstContentMs)
 		startStream(false)
-		outIdx := 0
-		if reasoningAdded {
-			outIdx = 1
-		}
 		if !messageAdded {
 			messageAdded = true
+			messageIndex = nextOutputIndex
+			nextOutputIndex++
 			emitSSE("response.output_item.added", map[string]any{
-				"output_index": outIdx,
+				"output_index": messageIndex,
 				"item": map[string]any{
 					"id":      msgID,
 					"type":    "message",
@@ -787,7 +807,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			})
 			emitSSE("response.content_part.added", map[string]any{
 				"item_id":       msgID,
-				"output_index":  outIdx,
+				"output_index":  messageIndex,
 				"content_index": 0,
 				"part": map[string]any{
 					"type":        "output_text",
@@ -796,9 +816,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				},
 			})
 		}
+		if delta == "" {
+			return
+		}
+		markMeaningfulOutput(&firstContentMs)
 		emitSSE("response.output_text.delta", map[string]any{
 			"item_id":       msgID,
-			"output_index":  outIdx,
+			"output_index":  messageIndex,
 			"content_index": 0,
 			"delta":         delta,
 		})
@@ -808,18 +832,18 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	originGroup := account.AccountGroup
 	account.mu.RUnlock()
 
-	maxAttempts := s.Cfg.MaxAttempts
+	maxAttempts := cfg.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	maxUpstream := s.Cfg.MaxUpstreamAttempts
+	maxUpstream := cfg.MaxUpstreamAttempts
 	if maxUpstream < 1 {
 		maxUpstream = maxAttempts
 	}
 	upstreamCalls := 0
 	var retryDeadline time.Time
-	if s.Cfg.RetryBudget > 0 {
-		retryDeadline = reqStartedAt.Add(s.Cfg.RetryBudget)
+	if cfg.RetryBudget > 0 {
+		retryDeadline = reqStartedAt.Add(cfg.RetryBudget)
 	}
 
 	triedAccounts := map[string]bool{account.ID: true}
@@ -828,13 +852,26 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	serverMediaRounds := 0
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
+		var limitFinish, limitedText string
 		attemptStartedAt := time.Now()
+		attemptReasoningStarted := false
+		emitAttemptReasoning := func(delta string) {
+			if delta == "" {
+				return
+			}
+			if !attemptReasoningStarted && streamedReasoning.Len() > 0 {
+				delta = "\n\n" + delta
+			}
+			attemptReasoningStarted = true
+			emitReasoningDelta(delta)
+		}
 		var (
 			candidateID           string
 			selected              bool
 			done                  bool
 			text, thoughts        string
 			sentText, sentThought string
+			lastActivity          string
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
@@ -874,13 +911,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 		var upstream *gemini.StreamResponse
 		var streamErr error
+		var releaseStream func()
 		if uploadErr != nil {
 			streamErr = uploadErr
 		} else {
+			releaseStream, streamErr = s.beginAuxStream(account)
+		}
+		if streamErr == nil {
 			upstreamCalls++
-			account.mu.Lock()
-			account.activeStreams++
-			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
@@ -896,11 +934,21 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := shouldAbortForModelRejection(s.Cfg, mediaToolUsed, *model, servedID, servedLabel)
-				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+				earlyMismatch := shouldAbortForModelRejection(cfg, mediaToolUsed, *model, servedID, servedLabel)
+				identityVerifiedNow := canStreamVerified(eagerStream, cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
+				}
+				if stream && cfg.LiveThoughts && ctx.Err() == nil && !identityConflict {
+					if activity := strings.TrimSpace(toolbridge.StripToolGuard(update.Activity)); activity != "" && activity != lastActivity {
+						prefix := ""
+						if sentThought != "" {
+							prefix = "\n\n"
+						}
+						emitAttemptReasoning(prefix + activity + "\n\n")
+						lastActivity = activity
+					}
 				}
 				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
 					startStream(false)
@@ -950,57 +998,68 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							text = frame.Text
 						}
 					}
-					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
+					thoughts = toolbridge.StripToolGuard(mergeStreamedThoughts(thoughts, frame.Thoughts))
 					done = frame.Done
-					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+					frameMismatch := cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
 					if frameMismatch {
 						return transport.ErrStopStreaming
 					}
+					if stream && cfg.LiveThoughts && ctx.Err() == nil && !done && !identityConflict && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+						emitAttemptReasoning(thoughts[len(sentThought):])
+						sentThought = thoughts
+					}
 
-					if stream && !buffered && ctx.Err() == nil {
-						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
+					if stream && !buffered && prep.limits.streamable() && limitFinish == "" && ctx.Err() == nil {
+						if !strings.HasPrefix(text, sentText) || (cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
-						if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) {
-							emitReasoningDelta(thoughts[len(sentThought):])
-							sentThought = thoughts
+						if hasTools && sentText == "" {
+							if toolbridge.IsToolProtocolRefusal(text) {
+								return transport.NewUpstreamError(toolbridge.RefusalErrorText, 502, "tool_call_error", nil, nil)
+							}
+							if len(text) <= toolbridge.RefusalWindowBytes {
+								continue
+							}
 						}
-						if len(text) > len(sentText) {
-							emitTextDelta(text[len(sentText):])
-							sentText = text
+						visible, hit := prep.limits.visible(toolbridge.StripToolGuard(text))
+						if hit != "" {
+							limitFinish, limitedText = hit, visible
 						}
-					} else if stream && buffered && ctx.Err() == nil && !done {
+						if strings.HasPrefix(visible, sentText) && len(visible) > len(sentText) {
+							emitTextDelta(visible[len(sentText):])
+							sentText = visible
+						}
+					} else if stream && buffered && limitFinish == "" && ctx.Err() == nil && !done {
 						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
-						// Thoughts are normalized monotonically via mergeStreamedThoughts.
-						// A matching served-model id proves no downgrade is in progress, so
-						// the headers no longer need to be held for an HTTP error.
-						if canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel) {
-							startStream(false)
-						}
-						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
-						if identityVerified && s.Cfg.LiveThoughts {
-							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" {
+						// Answer text still waits for model verification in strict mode.
+						identityVerified := canStreamVerified(eagerStream, cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+						if identityVerified && cfg.LiveThoughts {
+							if hasTools && !cfg.KeepToolPreamble && sentText == "" {
 								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
 									thoughts = appendPreambleToThoughts(thoughts, pre)
 								}
 							}
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
-								emitReasoningDelta(thoughts[len(sentThought):])
+								emitAttemptReasoning(thoughts[len(sentThought):])
 								sentThought = thoughts
 							} else if servedID != "" && time.Since(attemptStartedAt) >= 5*time.Second {
 								startStream(false)
 							}
 						}
-						canStreamText := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
-						if canStreamText {
-							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								emitTextDelta(text[len(sentText):])
-								sentText = text
-							} else if hasTools && !mediaToolUsed && len(text) > 240 {
-								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
+						if identityVerified && prep.limits.streamable() {
+							clean := toolbridge.StripToolGuard(text)
+							visible, hit := prep.limits.visible(clean)
+							if hit != "" {
+								limitFinish, limitedText = hit, visible
+							}
+							if !hasTools && strings.HasPrefix(visible, sentText) && len(visible) > 240 && len(visible) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
+								emitTextDelta(visible[len(sentText):])
+								sentText = visible
+							} else if hasTools && !mediaToolUsed && len(visible) > 240 && !toolbridge.IsToolProtocolRefusal(text) {
+								if safePrefix := toolbridge.SafeStreamablePrefix(visible); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text) == "" {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
 								}
@@ -1010,11 +1069,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				}
 				return nil
 			})
-			account.mu.Lock()
-			if account.activeStreams > 0 {
-				account.activeStreams--
-			}
-			account.mu.Unlock()
+			releaseStream()
 		}
 		if upstream != nil && upstream.Status > 0 {
 			lastUpstreamStatus = upstream.Status
@@ -1023,8 +1078,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
+		evalText, evalSent := text, sentText
+		if limitFinish != "" {
+			evalText, evalSent = limitedText, limitedText
+		}
 		interpreted, runCheck := s.evaluateAttemptCompletion(
 			ctx,
+			cfg,
 			account,
 			*model,
 			mid,
@@ -1032,8 +1092,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			streamErr,
 			selected,
 			done,
-			text,
-			sentText,
+			evalText,
+			evalSent,
 			servedID,
 			servedLabel,
 			identityConflict,
@@ -1054,7 +1114,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					lastUpstreamStatus = errStatus
 				}
 			}
-			if errCode == "account_banned" {
+			if uploadErr == nil && releaseStream == nil {
+				// A local reservation rejection is not an upstream account failure.
+			} else if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
 			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
@@ -1104,9 +1166,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1135,9 +1195,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1153,9 +1211,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1176,9 +1232,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1187,17 +1241,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 					}
 				}
-				if errCode == "upstream_degraded" {
-					// Gemini Web failed the turn on its side while the account still
-					// has quota. Prefer a different account; if the request is pinned
-					// or the pool is spent, retry once on a fresh socket.
+				if errCode == "upstream_degraded" || errCode == "upstream_transient" {
+					// Prefer another eligible account; a pinned request stays pinned.
 					lastRetryReason = errCode
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1205,8 +1255,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							continue
 						}
 					}
-					freshSocketNext = true
-					rebootstrapNext = true
+					freshSocketNext = errCode == "upstream_degraded"
+					rebootstrapNext = freshSocketNext
 					opts.Metadata = nil
 					opts.Files = nil
 					curPrompt = fullPrompt
@@ -1219,9 +1269,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -1264,7 +1312,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								StartIndex:      0,
 								MaxPromptChars:  100000,
 								MaxOldToolChars: 12000,
-								AllowOverflow:   s.Cfg.HistoryOffload,
+								AllowOverflow:   cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
 								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
@@ -1287,9 +1335,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if !wasCachedContinuation && scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							switched = true
 						}
 					}
@@ -1303,8 +1349,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				}
 			}
 
+			stopGrace()
 			stopKeepalive()
-			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			streamMu.Lock()
+			sent := headersSent
+			setGSBHeaders(w, sent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			streamMu.Unlock()
 			totalMs := time.Since(reqStartedAt).Milliseconds()
 			s.logRequestJSON(map[string]any{
 				"req_id":             respID,
@@ -1323,6 +1373,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"error_code":         errCode,
 				"cached_tokens":      0,
 				"attempts":           curAttempt + 1,
+				"retry_reason":       lastRetryReason,
 				"prepare_ms":         prepareMs,
 				"cache_hit":          cacheUsed,
 				"cache_prefix_split": prep.cacheSplit,
@@ -1340,7 +1391,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
-				sendChatError(w, headersSent, runCheck)
+				if sent {
+					emitSSE("error", map[string]any{"code": errCode, "message": runCheck.Error(), "param": nil})
+				} else {
+					sendChatError(w, false, runCheck)
+				}
 			}
 			return
 		}
@@ -1383,26 +1438,42 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		var contentStr string
 		if len(calls) > 0 {
-			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
+			if (cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
 				contentStr = interpreted.Text
-			} else if s.Cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
+			} else if cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
 				thoughts = appendPreambleToThoughts(thoughts, interpreted.Text)
 			}
 		} else {
-			contentStr = text
+			contentStr = toolbridge.StripToolGuard(text)
 			if sentText == "" && thoughts != "" {
 				contentStr = stripLeakedThoughtsFromContent(contentStr, thoughts)
 			}
+			if limitFinish != "" {
+				contentStr = limitedText
+			} else {
+				contentStr, limitFinish = prep.limits.apply(contentStr)
+			}
+			if prep.limits.wantJSON {
+				contentStr = jsonObjectText(contentStr)
+			}
+		}
+		contentStr = toolbridge.StripToolGuard(contentStr)
+		thoughts = toolbridge.StripToolGuard(thoughts)
+		responseStatus := "completed"
+		var incompleteDetails any
+		if len(calls) == 0 && limitFinish == "length" {
+			responseStatus = "incomplete"
+			incompleteDetails = map[string]any{"reason": "max_output_tokens"}
 		}
 		// Web-search citations are appended to the answer so the client sees the
 		// sources the model actually used, in the order Google returned them.
-		if s.Cfg.IncludeGrounding && len(grounding) > 0 && len(calls) == 0 {
+		if cfg.IncludeGrounding && len(grounding) > 0 && len(calls) == 0 && !prep.limits.enabled() {
 			contentStr = appendGroundingCitations(contentStr, grounding)
 		}
 
 		oaCalls := toolbridge.ToOpenAIToolCalls(calls)
 
-		chatUsage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
+		chatUsage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, contentStr, thoughts)
 		respUsage := buildResponsesUsage(chatUsage)
 		s.clearModelExhausted(account, model.ModelName)
 		if !opts.Temporary {
@@ -1413,20 +1484,28 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, cachedContent, oaCalls, lastCID, lastRID, candidateID, lastContextToken)
 		}
 
+		stopGrace()
 		stopKeepalive()
 		if ctx.Err() != nil {
 			return
 		}
 
+		reasoningText := thoughts
+		if stream && cfg.LiveThoughts {
+			if tail, ok := remainingStreamTail(thoughts, sentThought); ok {
+				emitAttemptReasoning(tail)
+			}
+			reasoningText = streamedReasoning.String()
+		}
 		var outputItems []map[string]any
-		if s.Cfg.LiveThoughts && thoughts != "" {
+		if cfg.LiveThoughts && reasoningText != "" {
 			outputItems = append(outputItems, map[string]any{
 				"id":   rsID,
 				"type": "reasoning",
 				"summary": []map[string]any{
 					{
 						"type": "summary_text",
-						"text": thoughts,
+						"text": reasoningText,
 					},
 				},
 			})
@@ -1481,26 +1560,19 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 		if stream {
 			startStream(false)
-			if s.Cfg.LiveThoughts && thoughts != "" {
-				if len(thoughts) > len(sentThought) {
-					emitReasoningDelta(thoughts[len(sentThought):])
-				}
+			if reasoningAdded {
 				emitSSE("response.reasoning_summary_text.done", map[string]any{
 					"item_id":       rsID,
-					"output_index":  0,
+					"output_index":  reasoningIndex,
 					"summary_index": 0,
-					"text":          thoughts,
+					"text":          reasoningText,
 				})
 				emitSSE("response.output_item.done", map[string]any{
-					"output_index": 0,
+					"output_index": reasoningIndex,
 					"item":         outputItems[0],
 				})
 			}
 
-			nextOutIdx := 0
-			if s.Cfg.LiveThoughts && thoughts != "" {
-				nextOutIdx = 1
-			}
 			if contentStr != "" || len(oaCalls) == 0 {
 				if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
 					emitTextDelta(tail)
@@ -1522,13 +1594,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				}
 				emitSSE("response.output_text.done", map[string]any{
 					"item_id":       msgID,
-					"output_index":  nextOutIdx,
+					"output_index":  messageIndex,
 					"content_index": 0,
 					"text":          contentStr,
 				})
 				emitSSE("response.content_part.done", map[string]any{
 					"item_id":       msgID,
-					"output_index":  nextOutIdx,
+					"output_index":  messageIndex,
 					"content_index": 0,
 					"part": map[string]any{
 						"type":        "output_text",
@@ -1537,15 +1609,17 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					},
 				})
 				emitSSE("response.output_item.done", map[string]any{
-					"output_index": nextOutIdx,
+					"output_index": messageIndex,
 					"item":         msgItem,
 				})
-				nextOutIdx++
+				if reasoningAdded && messageIndex < reasoningIndex {
+					outputItems[0], outputItems[1] = outputItems[1], outputItems[0]
+				}
 			}
 
 			for idx, tc := range oaCalls {
 				fcID := fcIDs[idx]
-				fcOutIdx := nextOutIdx + idx
+				fcOutIdx := nextOutputIndex + idx
 				ns := namespaceOf[tc.Function.Name]
 				if customTools[tc.Function.Name] {
 					rawIn := extractCustomToolInput(tc.Function.Arguments)
@@ -1633,27 +1707,22 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				})
 			}
 
-			emitSSE("response.completed", map[string]any{
-				"response": map[string]any{
-					"id":         respID,
-					"object":     "response",
-					"created_at": created,
-					"status":     "completed",
-					"model":      mid,
-					"output":     outputItems,
-					"usage":      respUsage,
-				},
-			})
+		}
+		payload := map[string]any{
+			"id":         respID,
+			"object":     "response",
+			"created_at": created,
+			"status":     responseStatus,
+			"model":      mid,
+			"output":     outputItems,
+			"usage":      respUsage,
+		}
+		if incompleteDetails != nil {
+			payload["incomplete_details"] = incompleteDetails
+		}
+		if stream {
+			emitSSE("response."+responseStatus, map[string]any{"response": payload})
 		} else {
-			payload := map[string]any{
-				"id":         respID,
-				"object":     "response",
-				"created_at": created,
-				"status":     "completed",
-				"model":      mid,
-				"output":     outputItems,
-				"usage":      respUsage,
-			}
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
 			markPhase(&headerMs)
 			sendJSON(w, 200, payload, nil)
@@ -1681,6 +1750,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"error_code":         "",
 			"cached_tokens":      cachedTok,
 			"attempts":           curAttempt + 1,
+			"retry_reason":       lastRetryReason,
 			"prepare_ms":         prepareMs,
 			"cache_hit":          cacheUsed,
 			"cache_prefix_split": prep.cacheSplit,
@@ -1700,6 +1770,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 		account.mu.Lock()
 		account.Fails = 0
+		account.LastFail = time.Time{}
+		account.LastError = ""
+		account.ModelsError = nil
 		account.LastUsed = s.now()
 		account.mu.Unlock()
 		s.refreshQuotaAsync(account, c)

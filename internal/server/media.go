@@ -7,18 +7,23 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
+	"mime"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
@@ -31,28 +36,21 @@ func withRequestBaseURL(ctx context.Context, r *http.Request, defaultPort int) c
 	if r == nil {
 		return ctx
 	}
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
+	host := r.Host
+	if defaultPort <= 0 {
+		defaultPort = 20133
 	}
-	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = strings.TrimSpace(r.Host)
-	}
-	if host == "" {
-		if defaultPort <= 0 {
-			defaultPort = 20133
-		}
+	if _, _, ok := splitRequestAuthority(host); !ok {
 		host = fmt.Sprintf("127.0.0.1:%d", defaultPort)
 	}
-	return context.WithValue(ctx, requestBaseURLKey{}, scheme+"://"+host)
+	return context.WithValue(ctx, requestBaseURLKey{}, requestScheme(r)+"://"+host)
 }
 
 func (s *Server) requestBaseURL(ctx context.Context) string {
 	if v, ok := ctx.Value(requestBaseURLKey{}).(string); ok && v != "" {
 		return v
 	}
-	port := s.Cfg.Port
+	port := s.cfgSnapshot().Port
 	if port <= 0 {
 		port = 20133
 	}
@@ -69,15 +67,67 @@ type mediaEntry struct {
 	Title       string
 	CreatedAt   time.Time
 
-	fetchMu sync.Mutex
-	Data    []byte
+	fetchMu sync.Mutex // Allows only one upstream download per entry at a time.
+	// Guarded by Server.mediaMu, including byte accounting on eviction.
+	data []byte
+	contentType string
 }
 
 type mediaDownloader interface {
 	DownloadMedia(ctx context.Context, rawURL, fallbackURL string) ([]byte, string, error)
 }
 
-const maxCachedMediaEntries = 96
+const (
+	maxCachedMediaEntries = 96
+	maxCachedMediaBytes = 128 << 20
+	mediaTTL = 24 * time.Hour
+)
+
+var errMediaExpired = errors.New("media not found or expired")
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func safeMediaFilename(raw, fallback string) string {
+	clean := func(name string) string {
+		name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
+		return strings.TrimSpace(strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+				return -1
+			}
+			return r
+		}, name))
+	}
+	name := clean(raw)
+	if name == "" || name == "." || name == ".." || name == "/" || name == "-" || len(name) > 240 {
+		name = clean(fallback)
+	}
+	if name == "" || name == "." || name == ".." || name == "/" || name == "-" || len(name) > 240 {
+		return "generated-media"
+	}
+	return name
+}
+
+// mediaDownloadCommand allows an HTTP(S) media URL and a single local filename.
+// Ignore curl config, disable globbing, and never follow redirects.
+func mediaDownloadCommand(rawURL, filename string) string {
+	if strings.ContainsFunc(rawURL, unicode.IsControl) {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return ""
+	}
+	if _, _, ok := splitRequestAuthority(u.Host); !ok {
+		return ""
+	}
+	path, ok := strings.CutPrefix(u.Path, "/v1/media/")
+	if !ok || path == "" || path == "." || path == ".." || strings.ContainsAny(path, "/\\") {
+		return ""
+	}
+	return "curl -q -fsS --globoff --proto '=http,https' --no-clobber -o " + shellSingleQuote(safeMediaFilename(filename, "generated-media")) + " -- " + shellSingleQuote(u.String())
+}
 
 func (s *Server) registerMedia(ctx context.Context, accountID, upstreamURL, fallbackURL, mimeType, ext, title string) (string, *mediaEntry) {
 	if upstreamURL == "" {
@@ -94,8 +144,10 @@ func (s *Server) registerMedia(ctx context.Context, accountID, upstreamURL, fall
 	if s.mediaItems == nil {
 		s.mediaItems = make(map[string]*mediaEntry)
 	}
-	entry, exists := s.mediaItems[id]
-	if !exists {
+	now := s.now()
+	s.trimMediaCacheLocked(now, 0, "")
+	entry := s.mediaItems[id]
+	if entry == nil {
 		entry = &mediaEntry{
 			ID:          id,
 			AccountID:   accountID,
@@ -104,19 +156,32 @@ func (s *Server) registerMedia(ctx context.Context, accountID, upstreamURL, fall
 			MimeType:    mimeType,
 			Ext:         ext,
 			Title:       title,
-			CreatedAt:   s.now(),
+			CreatedAt: now,
 		}
 		s.mediaItems[id] = entry
 		s.mediaOrder = append(s.mediaOrder, id)
-		for len(s.mediaOrder) > maxCachedMediaEntries {
-			oldest := s.mediaOrder[0]
-			s.mediaOrder = s.mediaOrder[1:]
-			delete(s.mediaItems, oldest)
-		}
+		s.trimMediaCacheLocked(now, 0, id)
 	}
 	s.mediaMu.Unlock()
 
 	return proxyURL, entry
+}
+
+// trimMediaCacheLocked removes expired entries, then evicts oldest entries
+// until both limits have room. Keep the entry whose bytes are being added.
+func (s *Server) trimMediaCacheLocked(now time.Time, incoming int, keep string) {
+	for i := 0; i < len(s.mediaOrder); {
+		id := s.mediaOrder[i]
+		entry := s.mediaItems[id]
+		if !now.Before(entry.CreatedAt.Add(mediaTTL)) || id != keep && (len(s.mediaOrder) > maxCachedMediaEntries || s.mediaBytes+incoming > maxCachedMediaBytes) {
+			s.mediaBytes -= len(entry.data)
+			entry.data = nil
+			delete(s.mediaItems, id)
+			s.mediaOrder = slices.Delete(s.mediaOrder, i, i+1)
+			continue
+		}
+		i++
+	}
 }
 
 func (s *Server) ensureMediaBytes(ctx context.Context, entry *mediaEntry) ([]byte, string, error) {
@@ -126,21 +191,25 @@ func (s *Server) ensureMediaBytes(ctx context.Context, entry *mediaEntry) ([]byt
 	entry.fetchMu.Lock()
 	defer entry.fetchMu.Unlock()
 
-	if len(entry.Data) > 0 {
-		return entry.Data, entry.MimeType, nil
+	s.mediaMu.RLock()
+	data, ct := entry.data, entry.contentType
+	registered := s.mediaItems[entry.ID] == entry
+	s.mediaMu.RUnlock()
+	if !registered || !s.now().Before(entry.CreatedAt.Add(mediaTTL)) {
+		return nil, "", errMediaExpired
+	}
+	if len(data) > 0 {
+		return data, ct, nil
 	}
 
 	acct := s.findAccountByID(entry.AccountID)
 	if acct == nil {
-		accts := s.Accounts()
-		if len(accts) > 0 {
-			acct = accts[0]
-		}
-	}
-	if acct == nil {
 		return nil, "", fmt.Errorf("account %s not available to fetch media", entry.AccountID)
 	}
 
+	if err := accountBlockedError(acct); err != nil {
+		return nil, "", err
+	}
 	client := s.clientFor(acct)
 	dl, ok := client.(mediaDownloader)
 	if !ok {
@@ -151,15 +220,29 @@ func (s *Server) ensureMediaBytes(ctx context.Context, entry *mediaEntry) ([]byt
 	if err != nil {
 		return nil, "", err
 	}
-	if ct != "" && ct != "application/octet-stream" {
-		entry.MimeType = ct
+	ct = safeMediaContentType(data, ct)
+	s.mediaMu.Lock()
+	defer s.mediaMu.Unlock()
+	now := s.now()
+	if !now.Before(entry.CreatedAt.Add(mediaTTL)) {
+		s.trimMediaCacheLocked(now, 0, "")
+		return nil, "", errMediaExpired
 	}
-	entry.Data = data
-	return entry.Data, entry.MimeType, nil
+	if len(data) <= maxCachedMediaBytes && s.mediaItems[entry.ID] == entry {
+		s.trimMediaCacheLocked(now, len(data), entry.ID)
+		entry.data, entry.contentType = data, ct
+		s.mediaBytes += len(data)
+	}
+	return data, ct, nil
 }
 
 // HandleGetMedia serves a cached or proxied generated image/video at GET /v1/media/<id>.
 func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/v1/media/")
 	id = strings.TrimPrefix(id, "/media/")
 	id = strings.TrimSpace(id)
@@ -168,12 +251,10 @@ func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mediaMu.RLock()
-	var entry *mediaEntry
-	if s.mediaItems != nil {
-		entry = s.mediaItems[id]
-	}
-	s.mediaMu.RUnlock()
+	s.mediaMu.Lock()
+	s.trimMediaCacheLocked(s.now(), 0, "")
+	entry := s.mediaItems[id]
+	s.mediaMu.Unlock()
 
 	if entry == nil {
 		sendJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "media not found or expired: " + id, "type": "not_found_error"}}, nil)
@@ -182,20 +263,38 @@ func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
 
 	data, mimeType, err := s.ensureMediaBytes(r.Context(), entry)
 	if err != nil {
-		sendJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}}, nil)
+		status := http.StatusBadGateway
+		if errors.Is(err, errMediaExpired) {
+			status = http.StatusNotFound
+		}
+		sendJSON(w, status, map[string]any{"error": map[string]any{"message": http.StatusText(status)}}, nil)
 		return
 	}
-	if mimeType == "" {
-		if strings.HasSuffix(id, ".mp4") {
-			mimeType = "video/mp4"
-		} else {
-			mimeType = "image/jpeg"
-		}
-	}
 	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if mimeType == "application/octet-stream" {
+		w.Header().Set("Content-Disposition", "attachment")
+	}
 	http.ServeContent(w, r, entry.ID, entry.CreatedAt, bytes.NewReader(data))
+}
+
+func safeMediaContentType(data []byte, declared string) string {
+	const binary = "application/octet-stream"
+	ct, _, err := mime.ParseMediaType(declared)
+	if declared == "" || ct == binary {
+		ct = http.DetectContentType(data)
+	} else if err != nil {
+		return binary
+	}
+	switch ct {
+	case "image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "video/mp4", "video/webm":
+		return ct
+	default:
+		return binary
+	}
 }
 
 func (s *Server) rewriteFrameMedia(ctx context.Context, accountID string, frame *gemini.Frame) {
@@ -440,22 +539,27 @@ func (s *Server) runMediaGenerationOnAccount(
 		genPrompt = "Generate a video" + qualSuffix + ": " + cleanPrompt
 	}
 
+	cfg := s.cfgSnapshot()
 	mediaModel := model
 	opts := gemini.StreamOptions{
 		Model:           mediaModel,
 		ThinkingLevel:   1,
 		Temporary:       true,
-		Language:        s.Cfg.Locale,
+		Language:        cfg.Locale,
 		DisableTools:    false,
 		HasTools:        false,
 		ProtocolMode:    "web",
 		PersonalContext: "off",
-		NoFrameTimeout:  s.Cfg.NoFrameTimeout,
+		NoFrameTimeout:  cfg.NoFrameTimeout,
 	}
+	finish, err := s.beginAuxStream(account)
+	if err != nil {
+		return nil, "", err
+	}
+	defer finish()
 	client := s.clientFor(account)
 	var (
 		lastFrame gemini.Frame
-		hasFrame  bool
 	)
 	upstream, err := client.StreamGenerateLive(ctx, genPrompt, opts, func(update *gemini.LineParseResult) error {
 		for _, f := range update.Frames {
@@ -474,15 +578,15 @@ func (s *Server) runMediaGenerationOnAccount(
 			}
 			s.rewriteFrameMedia(ctx, account.ID, &f)
 			lastFrame = f
-			hasFrame = true
 		}
 		return nil
 	})
-	if err != nil && !hasFrame {
-		return nil, "", err
+	if err == nil && upstream != nil && upstream.Status != http.StatusOK {
+		err = transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d during media generation", upstream.Status), 502, "upstream_http_error", nil, nil)
 	}
-	if upstream != nil && upstream.Status != 200 && !hasFrame {
-		return nil, "", transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d during media generation", upstream.Status), 502, "upstream_http_error", nil, nil)
+	if err != nil {
+		s.recordAuxStreamError(ctx, account, client, err)
+		return nil, "", err
 	}
 
 	var results []generatedMediaResult
@@ -547,6 +651,11 @@ func (s *Server) runMediaGenerationOnAccount(
 			Markdown:      md,
 			Entry:         entry,
 		})
+	}
+	if len(results) > 0 {
+		s.recordAuxStreamSuccess(account, client)
+	} else {
+		s.recordAuxStreamError(ctx, account, client, errors.New("upstream did not return generated "+mType))
 	}
 	return results, lastFrame.Text, nil
 }
@@ -629,10 +738,7 @@ func (s *Server) executeServerSideMediaCalls(
 				mds = append(mds, it.Markdown)
 			}
 			baseName := filepath.Base(items[0].URL)
-			localFile := strings.TrimSpace(outPath)
-			if localFile == "" {
-				localFile = fmt.Sprintf("./generated-%s-%s", items[0].MediaType, baseName)
-			}
+			localFile := safeMediaFilename(outPath, fmt.Sprintf("generated-%s-%s", items[0].MediaType, baseName))
 			outObj = map[string]any{
 				"status":             "ok",
 				"media_type":         items[0].MediaType,
@@ -642,8 +748,10 @@ func (s *Server) executeServerSideMediaCalls(
 				"revised_prompt":     items[0].RevisedPrompt,
 				"markdown":           strings.Join(mds, "\n\n"),
 				"suggested_filename": localFile,
-				"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o %q", items[0].URL, localFile),
-				"note":               "The media is ready at the URL above. IMPORTANT: If you have a bash/shell tool available, run local_download_cmd now (or save to the filename requested by the user) so the file is saved directly into the user's current working directory on their laptop, then include the saved filename and markdown link in your final reply.",
+			}
+			if cmd := mediaDownloadCommand(items[0].URL, localFile); cmd != "" {
+				outObj["local_download_cmd"] = cmd
+				outObj["note"] = "The media is ready. If the user wants a local copy, use local_download_cmd to save it in the current working directory."
 			}
 			if items[0].AspectRatio != "" {
 				outObj["aspect_ratio"] = items[0].AspectRatio
@@ -693,7 +801,7 @@ func formatDirectMediaToolContinuation(images []gemini.GeneratedImage, videos []
 		return ""
 	}
 	baseName := filepath.Base(urls[0])
-	localFile := fmt.Sprintf("./generated-%s-%s", mediaType, baseName)
+	localFile := safeMediaFilename("", fmt.Sprintf("generated-%s-%s", mediaType, baseName))
 	synthCallBytes, _ := json.Marshal(map[string]any{
 		"tool_calls": []any{
 			map[string]any{
@@ -712,8 +820,10 @@ func formatDirectMediaToolContinuation(images []gemini.GeneratedImage, videos []
 		"urls":               urls,
 		"revised_prompt":     revPrompt,
 		"suggested_filename": localFile,
-		"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o %q", urls[0], localFile),
-		"note":               "The media has ALREADY been generated and is ready at the URL above (do NOT generate another image). IMPORTANT: If you have a bash/shell tool available, emit a JSON tool_calls block calling bash to run local_download_cmd now so the file is saved directly into the user's current working directory on their laptop, then report the saved filename and URL in your final reply.",
+	}
+	if cmd := mediaDownloadCommand(urls[0], localFile); cmd != "" {
+		outObj["local_download_cmd"] = cmd
+		outObj["note"] = "The media is already generated. If the user wants a local copy, use local_download_cmd; do not generate the media again."
 	}
 	b, _ := json.Marshal(outObj)
 	return fmt.Sprintf(" %s\n\nUser: [Harness tool result for %s]:\n%s\n\nAssistant:", string(synthCallBytes), toolbridge.BuiltinMediaToolName, string(b))
@@ -843,12 +953,6 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		sendChatError(w, false, transport.NewUpstreamError(msg, 502, "media_generation_failed", nil, nil))
 		return
 	}
-
-	prep.account.mu.Lock()
-	prep.account.Fails = 0
-	prep.account.LastUsed = s.now()
-	prep.account.mu.Unlock()
-	s.refreshQuotaAsync(prep.account, s.clientFor(prep.account))
 
 	dataList := make([]map[string]any, 0, len(items))
 	for _, it := range items {

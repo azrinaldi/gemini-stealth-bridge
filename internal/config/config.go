@@ -3,13 +3,16 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -96,6 +99,19 @@ type Config struct {
 	// Reporting is the default because rejecting would take the renamed tier
 	// offline; strict deployments can opt in.
 	RejectLabelMismatch bool
+}
+
+// Clone returns a deep copy of c with independent slices and maps so published
+// server config snapshots are safe for lock-free concurrent readers.
+func (c Config) Clone() Config {
+	c.AccountTokens = maps.Clone(c.AccountTokens)
+	c.GroupTokens = maps.Clone(c.GroupTokens)
+	c.AccountGroups = maps.Clone(c.AccountGroups)
+	c.AccountPriority = slices.Clone(c.AccountPriority)
+	c.EgressPerAccount = maps.Clone(c.EgressPerAccount)
+	c.FieldSources = maps.Clone(c.FieldSources)
+	c.Warnings = slices.Clone(c.Warnings)
+	return c
 }
 
 // ThinkingLevels maps Gemini Web's 3 thinking levels ("low", "medium", "high") to
@@ -640,11 +656,15 @@ func LoadEnvFile(path string) map[string]string {
 	return out
 }
 
-// SaveEnvFile merges updates into path atomically with 0600 permissions.
+var envFileMu sync.Mutex
+
+// SaveEnvFile serializes merges within the process and atomically replaces path with 0600 permissions.
 func SaveEnvFile(path string, updates map[string]string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("empty config.env path")
 	}
+	envFileMu.Lock()
+	defer envFileMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -671,8 +691,21 @@ func SaveEnvFile(path string, updates map[string]string) error {
 		b.WriteString(val)
 		b.WriteByte('\n')
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(b.String()), 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.env.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, path)

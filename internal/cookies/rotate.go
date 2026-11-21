@@ -18,6 +18,7 @@ const (
 	// Must be sent verbatim with leading zeros ([000,...]), never json.Marshal'd.
 	rotate1PSIDTSSentinel = `[000,"-0000000000000000000"]`
 	min1PSIDTSInterval    = 60 * time.Second
+	maxRotateInterval     = 3600 * time.Second
 	defaultRotateInterval = 9 * time.Minute
 )
 
@@ -70,6 +71,7 @@ type RotateResult struct {
 	Rotated      bool
 	CookieHeader string
 	NextInterval time.Duration
+	RetryAfter   string // Retry-After from the response that set Status.
 }
 
 // RotateAccount executes both the 1PSIDTS sentinel rotation and the 658 iframe
@@ -78,6 +80,7 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	cookie := currentCookie
 	rotatedAny := false
 	lastStatus := 0
+	var retryAfter string
 	nextInterval := defaultRotateInterval
 
 	// Primary path: POST /RotateCookies with [000,"-0000000000000000000"] and full cookie jar.
@@ -103,17 +106,19 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 			})
 			if err == nil {
 				lastStatus = res.Status
+				retryAfter = res.Headers["retry-after"]
 				r.note1PSIDTS(accountID, res.Status)
 				if merged, changed := AbsorbSetCookie(cookie, res.SetCookies); changed {
 					cookie = merged
 					rotatedAny = true
 				}
-				if res.Status == 200 && rotatedAny {
+				if res.Status == 200 || res.Status == 401 || res.Status == 403 || res.Status == 429 {
 					return &RotateResult{
 						Status:       res.Status,
 						Rotated:      rotatedAny,
 						CookieHeader: cookie,
 						NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+						RetryAfter:   retryAfter,
 					}, nil
 				}
 			}
@@ -132,8 +137,9 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 		Timeout: 20 * time.Second,
 	})
 	if pageErr == nil {
-		if lastStatus == 0 {
+		if lastStatus == 0 || pageRes.Status == 429 {
 			lastStatus = pageRes.Status
+			retryAfter = pageRes.Headers["retry-after"]
 		}
 		if merged, changed := AbsorbSetCookie(cookie, pageRes.SetCookies); changed {
 			cookie = merged
@@ -142,8 +148,15 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 		if pageRes.Status == 200 {
 			if m := rotateInitRe.FindStringSubmatch(pageRes.Body); len(m) >= 4 {
 				rotID := m[1]
-				if sec, err := strconv.ParseFloat(m[3], 64); err == nil && sec >= 60 && sec <= 3600 {
-					nextInterval = time.Duration(sec) * time.Second
+				if sec, err := strconv.ParseFloat(m[3], 64); err == nil && sec > 0 {
+					if sec >= float64(maxRotateInterval/time.Second) {
+						nextInterval = maxRotateInterval
+					} else {
+						nextInterval = time.Duration(sec * float64(time.Second))
+						if nextInterval <= 0 {
+							nextInterval = time.Nanosecond
+						}
+					}
 				}
 				body := fmt.Sprintf(`[658,%q]`, rotID)
 				postRes, postErr := sc.Do(ctx, transport.RequestOptions{
@@ -163,6 +176,7 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 				})
 				if postErr == nil {
 					lastStatus = postRes.Status
+					retryAfter = postRes.Headers["retry-after"]
 					if merged, changed := AbsorbSetCookie(cookie, postRes.SetCookies); changed {
 						cookie = merged
 						rotatedAny = true
@@ -179,6 +193,7 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 		Rotated:      rotatedAny,
 		CookieHeader: cookie,
 		NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+		RetryAfter:   retryAfter,
 	}, nil
 }
 

@@ -38,16 +38,15 @@ func TestZZAuditImportDropsNonEssentialCookies(t *testing.T) {
 		t.Fatalf("ParseImportPayload: %v", err)
 	}
 	got := ParseHeader(hdr)
-	fmt.Printf("AUDIT surviving cookie count after import = %d\n", len(got))
-	for _, n := range []string{"OSID", "LSID", "ACCOUNT_CHOOSER", "__Host-GAPS", "__Host-1PLSID", "__Secure-BUCKET", "SIDTS", "AID"} {
-		_, ok := got[n]
-		fmt.Printf("AUDIT import kept %-18s = %v\n", n, ok)
-		if ok {
-			t.Errorf("expected %s to be dropped", n)
+	for _, n := range []string{"__Secure-1PSID", "OSID", "__Secure-OSID", "LSID", "__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS", "ACCOUNT_CHOOSER"} {
+		if got[n] == "" {
+			t.Errorf("expected session/rotation cookie %s to be preserved", n)
 		}
 	}
-	if _, ok := got["__Secure-1PSID"]; !ok {
-		t.Fatalf("essential cookie lost")
+	for _, n := range []string{"__Secure-BUCKET", "SIDTS", "AID", "UV", "_gcl_au", "1P_JAR", "CONSENT", "SOCS", "SEARCH_SAMESITE", "SMSV"} {
+		if _, ok := got[n]; ok {
+			t.Errorf("expected tracking/non-essential cookie %s to be dropped", n)
+		}
 	}
 }
 
@@ -56,32 +55,44 @@ func TestZZAuditAbsorbCannotResurrectDroppedCookie(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate Gemini Web re-issuing the full jar via Set-Cookie during a request.
+	// Simulate Gemini Web re-issuing session/rotation cookies alongside tracking junk via Set-Cookie.
 	merged, changed := AbsorbSetCookie(hdr, []string{
 		"OSID=new-osid; Path=/; Domain=.google.com",
 		"LSID=new-lsid; Path=/; Domain=.google.com",
 		"__Host-GAPS=new-gaps; Path=/; Secure",
 		"__Secure-1PSIDTS=fresh-ts; Path=/; Secure; Domain=.google.com",
+		"_gcl_au=tracking-junk; Path=/; Domain=.google.com",
+		"AID=tracking-aid; Path=/; Domain=.google.com",
+		"__Secure-BUCKET=bucket-junk; Path=/; Domain=.google.com",
 	})
-	fmt.Printf("AUDIT absorb changed=%v hasOSID=%v hasLSID=%v hasGAPS=%v hasPSIDTS=%v\n",
-		changed,
-		ParseHeader(merged)["OSID"] != "",
-		ParseHeader(merged)["LSID"] != "",
-		ParseHeader(merged)["__Host-GAPS"] != "",
-		ParseHeader(merged)["__Secure-1PSIDTS"] != "")
-	if ParseHeader(merged)["OSID"] != "" || ParseHeader(merged)["LSID"] != "" || ParseHeader(merged)["__Host-GAPS"] != "" {
-		t.Fatalf("unexpected: non-essential cookie absorbed")
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+	got := ParseHeader(merged)
+	if got["OSID"] != "new-osid" || got["LSID"] != "new-lsid" || got["__Host-GAPS"] != "new-gaps" || got["__Secure-1PSIDTS"] != "fresh-ts" {
+		t.Fatalf("expected Google session/rotation cookies updated, got: OSID=%q LSID=%q GAPS=%q PSIDTS=%q",
+			got["OSID"], got["LSID"], got["__Host-GAPS"], got["__Secure-1PSIDTS"])
+	}
+	for _, junk := range []string{"_gcl_au", "AID", "__Secure-BUCKET"} {
+		if got[junk] != "" {
+			t.Fatalf("expected tracking junk %s to remain dropped, got %q", junk, got[junk])
+		}
 	}
 }
 
 func TestZZAuditRawHeaderImportAlsoDrops(t *testing.T) {
-	raw := "SID=a; HSID=b; SSID=c; APISID=d; SAPISID=e; __Secure-1PSID=f; __Secure-3PSID=g; OSID=o; LSID=l; __Secure-1PSIDTS=h"
+	raw := "SID=a; HSID=b; SSID=c; APISID=d; SAPISID=e; __Secure-1PSID=f; __Secure-3PSID=g; OSID=o; LSID=l; __Secure-1PSIDTS=h; _gcl_au=junk1; AID=junk2; __Secure-BUCKET=junk3"
 	hdr, _, err := ParseImportPayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("AUDIT raw-header import result = %q\n", hdr)
-	if ParseHeader(hdr)["OSID"] != "" || ParseHeader(hdr)["LSID"] != "" {
-		t.Fatalf("raw import kept non-essential cookies")
+	got := ParseHeader(hdr)
+	if got["OSID"] != "o" || got["LSID"] != "l" {
+		t.Fatalf("raw import dropped session cookies: OSID=%q LSID=%q", got["OSID"], got["LSID"])
+	}
+	for _, junk := range []string{"_gcl_au", "AID", "__Secure-BUCKET"} {
+		if got[junk] != "" {
+			t.Fatalf("raw import kept tracking junk %s=%q", junk, got[junk])
+		}
 	}
 }

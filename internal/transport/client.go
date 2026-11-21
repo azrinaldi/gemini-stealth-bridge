@@ -37,6 +37,10 @@ const (
 // the upstream response body immediately once the logical stream is complete.
 var ErrStopStreaming = errors.New("stop streaming")
 
+// DefaultMaxBodyBytes bounds buffered RPC responses. Media downloads set a
+// separate, larger limit.
+const DefaultMaxBodyBytes int64 = 32 << 20
+
 // UpstreamError is a typed error carrying HTTP status, OpenAI/bridge error code,
 // and retry-related upstream response headers.
 type UpstreamError struct {
@@ -251,7 +255,17 @@ type RequestOptions struct {
 	FirstByteTimeout time.Duration
 	StallTimeout     time.Duration
 	FreshSocket      bool
-	OnChunk          func(chunk string) error
+	// MaxBodyBytes bounds a buffered (non-streaming) response body; zero uses
+	// DefaultMaxBodyBytes. Exceeding it fails fast with upstream_response_too_large
+	// instead of buffering an unbounded body.
+	MaxBodyBytes int64
+	// OnHeaders runs synchronously once response headers have been received and
+	// before the body is read, for any status code (including non-200). It marks
+	// the boundary where the first-byte deadline stops and the body phase (stall
+	// and any caller-owned no-frame watchdog) begins. It is not called when no
+	// response was received (transport error, first-byte timeout, cancellation).
+	OnHeaders func(status int)
+	OnChunk   func(chunk string) error
 }
 
 // Response captures the result of an outbound HTTP request.
@@ -327,13 +341,52 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 
 	sc.applyOrderedChromeHeaders(req, opts.Kind, hdrMap)
 	sc.dumpRequestIfEnabled(req, opts.Kind, opts.Body)
-	var fbTimer *time.Timer
+
+	// First-byte timer. It fires only while waiting for HTTP response headers; a
+	// response that arrives with headers (any status) wins the race
+	// deterministically because the timer is disarmed under the same lock that
+	// records the outcome. timedOutFirstByte is therefore only ever set when no
+	// headers arrived.
+	var (
+		fbMu      sync.Mutex
+		fbTimer   *time.Timer
+		fbArmed   bool
+		fbExpired bool
+		fbStop    = func() {
+			fbMu.Lock()
+			defer fbMu.Unlock()
+			fbArmed = false
+			if fbTimer != nil {
+				fbTimer.Stop()
+			}
+		}
+		fbDisarm = func() bool {
+			fbMu.Lock()
+			defer fbMu.Unlock()
+			fbArmed = false
+			if fbTimer != nil {
+				fbTimer.Stop()
+			}
+			return fbExpired
+		}
+	)
 	if firstByteTimeout > 0 {
+		fbMu.Lock()
 		fbTimer = time.AfterFunc(firstByteTimeout, func() {
+			fbMu.Lock()
+			if !fbArmed {
+				fbMu.Unlock()
+				return
+			}
+			fbArmed = false
+			fbExpired = true
+			fbMu.Unlock()
 			timedOutFirstByte.Store(true)
 			cancel()
 		})
-		defer fbTimer.Stop()
+		fbArmed = true
+		fbMu.Unlock()
+		defer fbStop()
 	}
 
 	sendAt := time.Now()
@@ -352,22 +405,47 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 	case res := <-doneCh:
 		resp, err = res.resp, res.err
 	case <-reqCtx.Done():
-		if fbTimer != nil {
-			fbTimer.Stop()
-		}
-		sc.ResetConnections()
-		go func() {
-			if res := <-doneCh; res.resp != nil && res.resp.Body != nil {
-				_ = res.resp.Body.Close()
+		expiredFirstByte := fbDisarm()
+		if !expiredFirstByte {
+			// Our own deadlines did not expire: this is a caller cancellation or the
+			// per-request timeout. If the response was already handed back, prefer it
+			// so a race between headers and cancellation cannot discard a delivered
+			// response.
+			select {
+			case res := <-doneCh:
+				resp, err = res.resp, res.err
+			default:
 			}
-		}()
-		return nil, sc.classifyErr(reqCtx.Err(), ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
+		}
+		if resp == nil {
+			// Always close the body of a response that lands after we walked away, or
+			// the connection is never returned to the pool. The shared per-account
+			// pool itself is left alone: a cancelled peer request must not tear down
+			// connections another request on the same account is using. Recovery uses
+			// the explicit FreshSocket flag instead.
+			go func() {
+				if res := <-doneCh; res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+			}()
+			if expiredFirstByte {
+				timedOutFirstByte.Store(true)
+			}
+			return nil, sc.classifyErr(reqCtx.Err(), ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
+		}
 	}
 	if err != nil {
-		if fbTimer != nil {
-			fbTimer.Stop()
-		}
+		fbDisarm()
 		return nil, sc.classifyErr(err, ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
+	}
+	if fbDisarm() {
+		// The first-byte timer won the race: it fired before we observed these
+		// headers, so the request context is already cancelled and no body read can
+		// succeed. Report the deadline instead of letting a dead context surface as
+		// a generic transport error, and release the body.
+		timedOutFirstByte.Store(true)
+		_ = resp.Body.Close()
+		return nil, sc.classifyErr(reqCtx.Err(), ctx, reqCtx, &timedOutFirstByte, &stalled, stallTimeout, nil)
 	}
 	stopBodyCancel := context.AfterFunc(reqCtx, func() {
 		_ = resp.Body.Close()
@@ -382,9 +460,12 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 		}
 	}
 
+	// Headers are in: the first-byte deadline is over for every status code, so a
+	// slow body (model thinking, streamed media) is governed by the stall timer
+	// and the caller's own body-phase watchdog instead.
 	streaming := opts.OnChunk != nil && resp.StatusCode == 200
-	if !streaming && fbTimer != nil {
-		fbTimer.Stop()
+	if opts.OnHeaders != nil {
+		opts.OnHeaders(resp.StatusCode)
 	}
 	var stallTimer *time.Timer
 	armStall := func() {
@@ -409,6 +490,20 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 		}()
 	}
 
+	maxBody := opts.MaxBodyBytes
+	if maxBody <= 0 {
+		maxBody = DefaultMaxBodyBytes
+	}
+	if !streaming && resp.ContentLength > maxBody {
+		return nil, NewUpstreamError(
+			fmt.Sprintf("upstream response body too large: %d byte limit exceeded", maxBody),
+			502,
+			"upstream_response_too_large",
+			respHeaders,
+			nil,
+		)
+	}
+
 	var (
 		fullBuf bytes.Buffer
 		ttfbMs  int64 = -1
@@ -421,9 +516,6 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 			chunkStr := string(readBuf[:n])
 			if streaming {
 				if !isHeartbeatOrLengthChunk(chunkStr) {
-					if fbTimer != nil {
-						fbTimer.Stop()
-					}
 					if ttfbMs < 0 {
 						ttfbMs = time.Since(sendAt).Milliseconds()
 					}
@@ -444,11 +536,17 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 					return nil, NewUpstreamError(cbErr.Error(), 502, "upstream_callback_error", respHeaders, cbErr)
 				}
 			} else {
-				if fbTimer != nil {
-					fbTimer.Stop()
-				}
 				if ttfbMs < 0 {
 					ttfbMs = time.Since(sendAt).Milliseconds()
+				}
+				if int64(fullBuf.Len())+int64(n) > maxBody {
+					return nil, NewUpstreamError(
+						fmt.Sprintf("upstream response body too large: %d byte limit exceeded", maxBody),
+						502,
+						"upstream_response_too_large",
+						respHeaders,
+						nil,
+					)
 				}
 				fullBuf.Write(readBuf[:n])
 			}
@@ -484,7 +582,10 @@ func (sc *StealthClient) classifyErr(
 	if callerCtx != nil && callerCtx.Err() != nil {
 		return NewUpstreamError("request cancelled", 499, "client_cancelled", headers, err)
 	}
-	sc.ResetConnections()
+	// Deliberately no connection reset here. A cancellation, a per-request
+	// timeout, or a body stall says nothing about the shared per-account pool:
+	// peers may be streaming over it right now. Callers that want a clean socket
+	// after a same-account retry ask for it explicitly via RequestOptions.FreshSocket.
 	if stalled.Load() {
 		secs := int(stallTimeout.Seconds())
 		if secs <= 0 {

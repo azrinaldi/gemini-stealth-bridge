@@ -50,6 +50,7 @@ func TestWebUIRemoteAccessGateAndRateLimit(t *testing.T) {
 	// 1. Direct loopback with public key -> allowed
 	reqLoop := httptest.NewRequest(http.MethodGet, "/ui", nil)
 	reqLoop.RemoteAddr = "127.0.0.1:50001"
+	reqLoop.Host = "127.0.0.1:20133"
 	recLoop := httptest.NewRecorder()
 	srv.ServeHTTP(recLoop, reqLoop)
 	if recLoop.Code != http.StatusOK || !strings.Contains(recLoop.Body.String(), "Gemini Stealth Bridge Control Plane") {
@@ -68,6 +69,7 @@ func TestWebUIRemoteAccessGateAndRateLimit(t *testing.T) {
 	// 3. Loopback peer carrying X-Forwarded-For from a public IP -> treated as remote, 403
 	reqProxy := httptest.NewRequest(http.MethodGet, "/v1/admin/config", nil)
 	reqProxy.RemoteAddr = "127.0.0.1:50003"
+	reqProxy.Host = "127.0.0.1:20133"
 	reqProxy.Header.Set("X-Forwarded-For", "203.0.113.9")
 	recProxy := httptest.NewRecorder()
 	srv.ServeHTTP(recProxy, reqProxy)
@@ -76,9 +78,7 @@ func TestWebUIRemoteAccessGateAndRateLimit(t *testing.T) {
 	}
 
 	// 4. Configure AdminKey -> remote /ui serves HTML shell, /v1/admin/config requires token and rate-limits brute force
-	srv.mu.Lock()
-	srv.Cfg.AdminKey = "top-secret-admin-key"
-	srv.mu.Unlock()
+	srv.UpdateCfg(func(c *config.Config) { c.AdminKey = "top-secret-admin-key" })
 
 	for i := range 5 {
 		reqBad := httptest.NewRequest(http.MethodGet, "/v1/admin/config", nil)
@@ -133,14 +133,16 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 	raw, _ := json.Marshal(patchBody)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/admin/config", bytes.NewReader(raw))
 	req.RemoteAddr = "127.0.0.1:41000"
+	req.Host = "127.0.0.1:20133"
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PATCH /v1/admin/config failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	if srv.Cfg.DefaultThinking != 4 || srv.Cfg.AccountStrategy != "lru" || srv.Cfg.MaxRPMPerAccount != 36 || !srv.Cfg.LiveToolCalls {
-		t.Fatalf("in-memory config not updated: %+v", srv.Cfg)
+	gotCfg := srv.Config()
+	if gotCfg.DefaultThinking != 4 || gotCfg.AccountStrategy != "lru" || gotCfg.MaxRPMPerAccount != 36 || !gotCfg.LiveToolCalls {
+		t.Fatalf("in-memory config not updated: %+v", gotCfg)
 	}
 
 	// Reload from disk via config.Load() and verify config.env was persisted
@@ -173,6 +175,7 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	})
 	reqImp := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/import", bytes.NewReader(importPayload))
 	reqImp.RemoteAddr = "127.0.0.1:42000"
+	reqImp.Host = "127.0.0.1:20133"
 	recImp := httptest.NewRecorder()
 	srv.ServeHTTP(recImp, reqImp)
 	if recImp.Code != http.StatusOK {
@@ -194,6 +197,7 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 
 	reqUnq := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/ops-acct-1/unquarantine", nil)
 	reqUnq.RemoteAddr = "127.0.0.1:42000"
+	reqUnq.Host = "127.0.0.1:20133"
 	recUnq := httptest.NewRecorder()
 	srv.ServeHTTP(recUnq, reqUnq)
 	if recUnq.Code != http.StatusOK {
@@ -206,6 +210,7 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	// Delete the account via DELETE /v1/admin/accounts/ops-acct-1
 	reqDel := httptest.NewRequest(http.MethodDelete, "/v1/admin/accounts/ops-acct-1", nil)
 	reqDel.RemoteAddr = "127.0.0.1:42000"
+	reqDel.Host = "127.0.0.1:20133"
 	recDel := httptest.NewRecorder()
 	srv.ServeHTTP(recDel, reqDel)
 	if recDel.Code != http.StatusOK {
@@ -310,6 +315,7 @@ func TestStreamingPoolRotatesOnSubstitutionAfterHeadersAndMediaRound(t *testing.
 	cfg.MaxAttempts = 3
 	cfg.MaxUpstreamAttempts = 3
 	srv := New(cfg)
+	t.Cleanup(srv.FlushSessionCacheNow)
 
 	acct1Calls := 0
 	c1 := &mockUpstream{

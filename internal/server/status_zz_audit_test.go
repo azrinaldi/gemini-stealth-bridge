@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -11,38 +10,44 @@ import (
 
 const zzReal1016Msg = "session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account"
 
-// 2: a recorded auth failure is sticky — a successful request clears only Fails.
+// A recorded auth failure clears cleanly once a real request succeeds.
 func TestZZAuditAuthFailureStickyAfterSuccess(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	acct.Quota = []gemini.QuotaBucket{{ID: "5h", Label: "5-hour", Total: 100, Remaining: 99}}
 	srv.SetAccounts([]*AccountState{acct})
 
 	srv.markAccountFailure(acct, zzReal1016Msg)
-	st, reason := AccountStatus(acct, srv.now())
-	fmt.Printf("AUDIT0 after auth failure: status=%q reason=%q\n", st, reason)
+	st, _ := AccountStatus(acct, srv.now())
+	if st != StatusExpired {
+		t.Fatalf("after auth failure: got status=%q, want %q", st, StatusExpired)
+	}
 
 	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
 		makeFrame("hello", "", true, testModel.ModelID),
 	}), nil)
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 OK chat, got %d: %s", rec.Code, rec.Body.String())
+	}
 	acct.mu.RLock()
-	fails, lastErr := acct.Fails, acct.LastError
+	fails, lastErr, lastFail, modelsErr := acct.Fails, acct.LastError, acct.LastFail, acct.ModelsError
 	acct.mu.RUnlock()
-	fmt.Printf("AUDIT1 chat http=%d fails=%d lastError=%q\n", rec.Code, fails, lastErr)
+	if fails != 0 || lastErr != "" || !lastFail.IsZero() || modelsErr != nil {
+		t.Fatalf("expected auth error state cleared on success, got fails=%d lastErr=%q lastFail=%v modelsErr=%v",
+			fails, lastErr, lastFail, modelsErr)
+	}
 
-	// Well past cooling: only a recapture or probe can clear it.
 	later := srv.now().Add(2 * time.Hour)
-	st, reason = AccountStatus(acct, later)
-	fmt.Printf("AUDIT2 +2h after successful traffic: status=%q reason=%q\n", st, reason)
+	if st, _ = AccountStatus(acct, later); st != StatusOK {
+		t.Fatalf("+2h after successful traffic: got status=%q, want %q", st, StatusOK)
+	}
 
 	srv.RefreshAccount(context.Background(), acct, true)
-	st, reason = AccountStatus(acct, later)
-	fmt.Printf("AUDIT3 after scheduler refresh (healthy registry read): status=%q reason=%q\n", st, reason)
-	if st == StatusExpired {
-		fmt.Println("AUDIT CONFIRMED-2: serving account still reports expired")
+	if st, _ = AccountStatus(acct, later); st != StatusOK {
+		t.Fatalf("after scheduler refresh: got status=%q, want %q", st, StatusOK)
 	}
 }
 
-// 3: probeSingleAccount clears Fails/LastError but never clears quarantine.
+// A healthy probe clears quarantine alongside failure state.
 func TestZZAuditProbeDoesNotClearQuarantine(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	acct.Quota = []gemini.QuotaBucket{{ID: "5h", Label: "5-hour", Total: 100, Remaining: 99}}
@@ -59,13 +64,14 @@ func TestZZAuditProbeDoesNotClearQuarantine(t *testing.T) {
 		t.Fatalf("probe failed: %v", err)
 	}
 	acct.mu.RLock()
-	q, qr, fails, lastErr, surfaces := acct.Quarantined, acct.QuarantineReason, acct.Fails, acct.LastError, fmt.Sprint(acct.Surfaces)
+	q, qr, fails, lastErr, lastFail, modelsErr := acct.Quarantined, acct.QuarantineReason, acct.Fails, acct.LastError, acct.LastFail, acct.ModelsError
+	gwSurface := acct.Surfaces["geminiWeb"]
 	acct.mu.RUnlock()
-	fmt.Printf("AUDIT4 after successful probe: quarantined=%v reason=%q fails=%d lastError=%q surfaces=%s\n",
-		q, qr, fails, lastErr, surfaces)
-	st, reason := AccountStatus(acct, srv.now())
-	fmt.Printf("AUDIT5 status after successful probe: status=%q reason=%q\n", st, reason)
-	if q {
-		fmt.Println("AUDIT CONFIRMED-3: healthy probe still reports quarantined")
+	if q || qr != "" || fails != 0 || lastErr != "" || !lastFail.IsZero() || modelsErr != nil || gwSurface != "ok" {
+		t.Fatalf("healthy probe did not clear quarantine/error state: q=%v qr=%q fails=%d lastErr=%q lastFail=%v modelsErr=%v surface=%q",
+			q, qr, fails, lastErr, lastFail, modelsErr, gwSurface)
+	}
+	if st, reason := AccountStatus(acct, srv.now()); st != StatusOK {
+		t.Fatalf("status after healthy probe = %q (%q), want %q", st, reason, StatusOK)
 	}
 }

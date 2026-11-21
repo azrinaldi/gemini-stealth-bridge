@@ -1,8 +1,13 @@
 package prompt
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestHashHistoryWithToolsDistinguishesImagesToolIDsAndSchemas(t *testing.T) {
@@ -193,5 +198,65 @@ func TestFlattenMessagesContinuationIncludesRequiredToolArgsInReminder(t *testin
 	}
 	if !strings.Contains(cont, "todo(op, i)") {
 		t.Fatalf("expected continuation reminder to include required parameter names todo(op, i), got:\n%s", cont)
+	}
+}
+
+func TestPublicImageAddress(t *testing.T) {
+	for _, tc := range []struct {
+		ip     string
+		public bool
+	}{
+		{"100.64.0.0", false},
+		{"100.127.255.255", false},
+		{"100.128.0.0", true},
+		{"::ffff:100.64.0.1", false},
+		{"64:ff9b::1", false},
+		{"64:ff9b:1::1", false},
+		{"198.19.255.255", false},
+		{"240.0.0.1", false},
+		{"2001:2::1", false},
+		{"2001:4860::1", true},
+	} {
+		if got := isPublicImageAddress(netip.MustParseAddr(tc.ip)); got != tc.public {
+			t.Errorf("isPublicImageAddress(%q) = %t, want %t", tc.ip, got, tc.public)
+		}
+	}
+}
+
+func TestFetchRemoteImageUsesRasterSignature(t *testing.T) {
+	t.Setenv("BRIDGE_ALLOW_PRIVATE_IMAGE_URLS", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/png" {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"))
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("not an image"))
+	}))
+	defer srv.Close()
+
+	att, err := FetchRemoteImage(context.Background(), srv.URL+"/png", 1)
+	if err != nil || att == nil || att.ContentType != "image/png" || att.Filename != "image_2.png" {
+		t.Fatalf("expected a PNG attachment from its signature, got attachment=%+v, error=%v", att, err)
+	}
+	if att, err := FetchRemoteImage(context.Background(), srv.URL+"/text", 0); err == nil || att != nil {
+		t.Fatalf("expected mislabeled text to be rejected, got attachment=%+v, error=%v", att, err)
+	}
+
+	t.Setenv("BRIDGE_ALLOW_PRIVATE_IMAGE_URLS", "")
+	if att, err := FetchRemoteImage(context.Background(), srv.URL+"/png", 1); err == nil || att != nil {
+		t.Fatalf("expected loopback to be blocked by default, got attachment=%+v, error=%v", att, err)
+	}
+}
+
+func TestBoundOldToolTextPreservesRuneBoundaries(t *testing.T) {
+	const text = "Aé中🚀界Z"
+	const want = "Aé\n...[truncated 10 bytes of earlier tool output]...\nZ"
+	if got := BoundOldToolText(text, 7, ""); got != want || !utf8.ValidString(got) {
+		t.Fatalf("BoundOldToolText = %q, want %q", got, want)
+	}
+	if got := BoundOldToolText(text, len(text), ""); got != text {
+		t.Fatalf("expected text at byte budget unchanged, got %q", got)
 	}
 }

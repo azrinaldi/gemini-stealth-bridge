@@ -53,10 +53,20 @@ type LineParseResult struct {
 	AnsweredModelLabel string
 	AsyncVideoCID      string
 	AsyncVideoStatus   string
-	MediaToolActive    bool
-	StreamEnd          bool
-	Frames             []Frame
-	GroundingSources   []GroundingSource
+	VideoToolActive    bool
+	// Activity is the upstream's own display text for the current tool phase
+	// (pj[6][0], e.g. "Searching the web"). It is forwarded verbatim; no label is
+	// synthesized when the field is absent.
+	Activity string
+	// AsyncVideoRefCID is the conversation id named by an explicit reference
+	// field (pj[45]), when upstream sent one. It is reported separately so the
+	// stream can prefer it even when the reference and the video-tool signal
+	// arrive in different envelopes, in either order.
+	AsyncVideoRefCID string
+	MediaToolActive  bool
+	StreamEnd        bool
+	Frames           []Frame
+	GroundingSources []GroundingSource
 }
 
 var (
@@ -790,22 +800,31 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelLabel = answeredLabel
 		}
 
-		// Check for async video_generation trigger in pj[6] ("7" in 1-based sparse dictionary) or pj[45] ("46").
-		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) >= 2 {
-			if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
-				toolName, _ := toolMeta[0].(string)
-				if toolName == "video_generation" {
-					res.MediaToolActive = true
-					if res.CID != "" {
-						res.AsyncVideoCID = res.CID
-					}
-					if msg, _ := toolStatus[0].(string); msg != "" {
-						res.AsyncVideoStatus = msg
-					}
-				} else if len(toolMeta) > 1 {
-					if labelArr, ok := toolMeta[1].([]any); ok && len(labelArr) > 2 {
-						if lbl, _ := labelArr[2].(string); strings.Contains(strings.ToLower(lbl), "image") {
-							res.MediaToolActive = true
+		// pj[6] ("7" in the 1-based sparse dictionary) carries the current tool
+		// phase: [displayText, [toolName, [.., .., label]]]. The display text is
+		// upstream's own wording for what it is doing, so it is surfaced verbatim
+		// and never synthesized locally.
+		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) > 0 {
+			if activity, _ := toolStatus[0].(string); activity != "" {
+				res.Activity = activity
+			}
+			if len(toolStatus) >= 2 {
+				if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
+					toolName, _ := toolMeta[0].(string)
+					if toolName == "video_generation" {
+						res.VideoToolActive = true
+						res.MediaToolActive = true
+						if res.CID != "" {
+							res.AsyncVideoCID = res.CID
+						}
+						if msg, _ := toolStatus[0].(string); msg != "" {
+							res.AsyncVideoStatus = msg
+						}
+					} else if len(toolMeta) > 1 {
+						if labelArr, ok := toolMeta[1].([]any); ok && len(labelArr) > 2 {
+							if lbl, _ := labelArr[2].(string); strings.Contains(strings.ToLower(lbl), "image") {
+								res.MediaToolActive = true
+							}
 						}
 					}
 				}
@@ -817,9 +836,15 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelID = ""
 			res.AnsweredModelLabel = ""
 		}
+		// pj[45] is an explicit reference to the conversation that owns the async
+		// media. It is reported even when the video-tool signal arrived in another
+		// envelope, so the stream can prefer this CID over the ambient one.
 		if asyncRef, ok := jspbField(pj, 45).([]any); ok && len(asyncRef) > 0 {
-			if refCID, _ := asyncRef[0].(string); strings.HasPrefix(refCID, "c_") && res.AsyncVideoCID != "" {
-				res.AsyncVideoCID = refCID
+			if refCID, _ := asyncRef[0].(string); strings.HasPrefix(refCID, "c_") {
+				res.AsyncVideoRefCID = refCID
+				if res.AsyncVideoCID != "" {
+					res.AsyncVideoCID = refCID
+				}
 			}
 		}
 
@@ -1151,6 +1176,15 @@ func extractGeneratedVideos(c []any) []GeneratedVideo {
 				streamURL := ""
 				if len(urls) > 2 {
 					streamURL, _ = urls[2].(string)
+				}
+				if _, ok := mediaURL(downloadURL, nil); !ok {
+					downloadURL = ""
+				}
+				if _, ok := mediaURL(streamURL, nil); !ok {
+					streamURL = ""
+				}
+				if _, ok := mediaURL(thumbURL, nil); !ok {
+					thumbURL = ""
 				}
 				primary := downloadURL
 				if primary == "" {

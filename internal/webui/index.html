@@ -3,59 +3,171 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('gsb_ui_theme');
+        var meta = document.querySelector('meta[name="color-scheme"]');
+        if (saved === 'light' || saved === 'dark') {
+          if (meta) meta.content = saved;
+          document.documentElement.setAttribute('data-theme', saved);
+        } else {
+          if (meta) meta.content = 'light dark';
+          var sysLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+          document.documentElement.setAttribute('data-theme', sysLight ? 'light' : 'dark');
+        }
+      } catch (_) {}
+    })();
+  </script>
   <title>gsb · Gemini Stealth Bridge Control Plane</title>
   <style>
-    :root,
-    [data-theme="light"] {
-      --bg: #F6F6F3;
-      --surface: #FFFFFF;
-      --surface-subtle: #F0EFEA;
-      --surface-hover: #E8E6DF;
-      --surface-track: #E2E0D8;
-      --text-primary: #141413;
-      --text-secondary: #575653;
-      --border: #E2E0D8;
-      --border-strong: #C7C4B8;
-      --accent: #047857;
-      --accent-bar: #059669;
-      --btn-primary-bg: #0F5338;
-      --btn-primary-fg: #FFFFFF;
-      --btn-primary-hover: #0B3E29;
-      --status-ok-bg: #ECFDF5;
-      --status-ok-fg: #047857;
-      --status-warn-bg: #FEF3C7;
-      --status-warn-fg: #B45309;
-      --status-err-bg: #FEE2E2;
-      --status-err-fg: #B91C1C;
-      --shadow-modal: 0 16px 40px rgba(20, 20, 19, 0.18);
-      --scroll-shadow: rgba(20, 20, 19, 0.16);
-      --backdrop: rgba(20, 20, 19, 0.5);
+    :root {
+      color-scheme: light dark;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SFMono-Regular', 'Cascadia Code', 'DejaVu Sans Mono', Menlo, Consolas, monospace;
+
+      /* Dark Instrument Theme (default) */
+      --bg: #0C0D0F;
+      --surface: #131518;
+      --surface-recessed: #0E1012;
+      --surface-subtle: #1A1D21;
+      --surface-hover: #22262C;
+      --surface-track: #24282F;
+      --text-primary: #ECEFF2;
+      --text-secondary: #929AA4;
+      --text-muted: #69717B;
+      --border: rgba(255, 255, 255, 0.085);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --focus-ring: #60A5FA;
+
+      /* Monochrome high-contrast primary action */
+      --btn-primary-bg: #ECEFF2;
+      --btn-primary-fg: #0C0D0F;
+      --btn-primary-hover: #FFFFFF;
+
+      /* Semantic Hardware LEDs & Meters */
+      --ok-fg: #4ADE80;
+      --ok-bar: #22C55E;
+      --ok-bg: rgba(34, 197, 94, 0.12);
+      --ok-border: rgba(74, 222, 128, 0.25);
+
+      --active-fg: #FBBF24;
+      --active-bg: rgba(245, 158, 11, 0.14);
+      --active-border: rgba(251, 191, 36, 0.30);
+
+      --warn-fg: #FBBF24;
+      --warn-bar: #F59E0B;
+      --warn-bg: rgba(245, 158, 11, 0.12);
+      --warn-border: rgba(251, 191, 36, 0.26);
+
+      --err-fg: #F87171;
+      --err-bar: #EF4444;
+      --err-bg: rgba(239, 68, 68, 0.12);
+      --err-border: rgba(248, 113, 113, 0.28);
+
+      --shadow-overlay: 0 20px 48px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      --shadow-toast: 0 12px 32px rgba(0, 0, 0, 0.55);
+      --backdrop: rgba(6, 7, 9, 0.72);
+      --scroll-shadow: rgba(0, 0, 0, 0.52);
+
+      --radius-sm: 5px;
+      --radius-md: 8px;
+      --radius-lg: 11px;
     }
 
-    [data-theme="dark"] {
-      --bg: #111110;
-      --surface: #181816;
-      --surface-subtle: #21211E;
-      --surface-hover: #292925;
-      --surface-track: #2E2E2A;
-      --text-primary: #EDEDEC;
-      --text-secondary: #9E9D99;
-      --border: #2A2A26;
-      --border-strong: #3D3D38;
-      --accent: #4ADE80;
-      --accent-bar: #10B981;
-      --btn-primary-bg: #0F5338;
-      --btn-primary-fg: #FFFFFF;
-      --btn-primary-hover: #146B48;
-      --status-ok-bg: rgba(20, 83, 45, 0.38);
-      --status-ok-fg: #4ADE80;
-      --status-warn-bg: rgba(120, 53, 15, 0.38);
-      --status-warn-fg: #FBBF24;
-      --status-err-bg: rgba(127, 29, 29, 0.38);
-      --status-err-fg: #F87171;
-      --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.65);
-      --scroll-shadow: rgba(0, 0, 0, 0.55);
-      --backdrop: rgba(0, 0, 0, 0.72);
+    @media (prefers-color-scheme: light) {
+      :root:has(> head > meta[name="color-scheme"][content="light dark"]) {
+        --bg: #F3F2EE;
+        --surface: #FCFBF8;
+        --surface-recessed: #EAE8E1;
+        --surface-subtle: #F1EFE9;
+        --surface-hover: #E5E2D9;
+        --surface-track: #DFDCD2;
+        --text-primary: #141618;
+        --text-secondary: #525860;
+        --text-muted: #707780;
+        --border: rgba(20, 22, 24, 0.09);
+        --border-strong: rgba(20, 22, 24, 0.18);
+        --focus-ring: #2563EB;
+
+        --btn-primary-bg: #141618;
+        --btn-primary-fg: #FCFBF8;
+        --btn-primary-hover: #272B30;
+
+        --ok-fg: #15803D;
+        --ok-bar: #16A34A;
+        --ok-bg: rgba(22, 163, 74, 0.10);
+        --ok-border: rgba(21, 128, 61, 0.24);
+
+        --active-fg: #B45309;
+        --active-bg: rgba(217, 119, 6, 0.11);
+        --active-border: rgba(180, 83, 9, 0.26);
+
+        --warn-fg: #B45309;
+        --warn-bar: #D97706;
+        --warn-bg: rgba(217, 119, 6, 0.10);
+        --warn-border: rgba(180, 83, 9, 0.24);
+
+        --err-fg: #B91C1C;
+        --err-bar: #DC2626;
+        --err-bg: rgba(220, 38, 38, 0.09);
+        --err-border: rgba(185, 28, 28, 0.24);
+
+        --shadow-overlay: 0 20px 48px rgba(20, 22, 24, 0.16), 0 0 0 1px rgba(20, 22, 24, 0.08);
+        --shadow-toast: 0 10px 28px rgba(20, 22, 24, 0.14);
+        --backdrop: rgba(20, 22, 24, 0.44);
+        --scroll-shadow: rgba(20, 22, 24, 0.14);
+      }
+    }
+
+    :root:has(> head > meta[name="color-scheme"][content="light"]),
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #F3F2EE;
+      --surface: #FCFBF8;
+      --surface-recessed: #EAE8E1;
+      --surface-subtle: #F1EFE9;
+      --surface-hover: #E5E2D9;
+      --surface-track: #DFDCD2;
+      --text-primary: #141618;
+      --text-secondary: #525860;
+      --text-muted: #707780;
+      --border: rgba(20, 22, 24, 0.09);
+      --border-strong: rgba(20, 22, 24, 0.18);
+      --focus-ring: #2563EB;
+
+      --btn-primary-bg: #141618;
+      --btn-primary-fg: #FCFBF8;
+      --btn-primary-hover: #272B30;
+
+      --ok-fg: #15803D;
+      --ok-bar: #16A34A;
+      --ok-bg: rgba(22, 163, 74, 0.10);
+      --ok-border: rgba(21, 128, 61, 0.24);
+
+      --active-fg: #B45309;
+      --active-bg: rgba(217, 119, 6, 0.11);
+      --active-border: rgba(180, 83, 9, 0.26);
+
+      --warn-fg: #B45309;
+      --warn-bar: #D97706;
+      --warn-bg: rgba(217, 119, 6, 0.10);
+      --warn-border: rgba(180, 83, 9, 0.24);
+
+      --err-fg: #B91C1C;
+      --err-bar: #DC2626;
+      --err-bg: rgba(220, 38, 38, 0.09);
+      --err-border: rgba(185, 28, 28, 0.24);
+
+      --shadow-overlay: 0 20px 48px rgba(20, 22, 24, 0.16), 0 0 0 1px rgba(20, 22, 24, 0.08);
+      --shadow-toast: 0 10px 28px rgba(20, 22, 24, 0.14);
+      --backdrop: rgba(20, 22, 24, 0.44);
+      --scroll-shadow: rgba(20, 22, 24, 0.14);
+    }
+
+    :root:has(> head > meta[name="color-scheme"][content="dark"]) {
+      color-scheme: dark;
     }
 
     *, *::before, *::after {
@@ -71,17 +183,25 @@
       margin: 0;
       background-color: var(--bg);
       color: var(--text-primary);
-      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      font-family: var(--font-sans);
       font-size: 0.875rem;
       font-weight: 400;
       line-height: 1.5;
       min-height: 100dvh;
-      font-variant-numeric: tabular-nums;
       -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
 
-    button, input, select, textarea, strong, b, code, pre, .mono {
-      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    button, input, select, textarea {
+      font-family: var(--font-sans);
+    }
+
+    code, pre, kbd, .mono {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tabular {
       font-variant-numeric: tabular-nums;
     }
 
@@ -89,14 +209,26 @@
       display: none !important;
     }
 
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+      border: 0;
+    }
+
     h1, h2, h3 {
-      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
       margin: 0;
       color: var(--text-primary);
-      letter-spacing: -0.01em;
+      letter-spacing: -0.015em;
     }
+
     :focus-visible {
-      outline: 2px solid var(--accent);
+      outline: 2px solid var(--focus-ring);
       outline-offset: 2px;
     }
 
@@ -107,19 +239,52 @@
       z-index: 100;
       background: var(--btn-primary-bg);
       color: var(--btn-primary-fg);
-      padding: 8px 16px;
-      border-radius: 6px;
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
       text-decoration: none;
       font-weight: 600;
+      font-size: 0.8125rem;
     }
 
     .skip-link:focus-visible {
       left: 16px;
     }
 
-    /* Top Navigation Bar */
+    .icon {
+      width: 15px;
+      height: 15px;
+      flex: 0 0 auto;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    .icon-sm {
+      width: 13px;
+      height: 13px;
+    }
+
+    /* Theme icon branching without JS drift */
+    .theme-icon-sun,
+    .theme-icon-moon {
+      display: none;
+    }
+
+    :root[data-theme="dark"] .theme-icon-sun {
+      display: inline-flex;
+    }
+
+    :root[data-theme="light"] .theme-icon-moon {
+      display: inline-flex;
+    }
+
+    /* Top Header Bar */
     .top-bar {
-      background: var(--surface);
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       border-bottom: 1px solid var(--border);
       padding: 0 24px;
     }
@@ -141,48 +306,71 @@
       align-items: center;
       gap: 20px;
       flex-wrap: wrap;
+      min-width: 0;
     }
 
     .brand {
       display: flex;
-      align-items: baseline;
+      align-items: center;
       gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
     }
 
     .brand-title {
-      font-size: 1.0625rem;
+      font-size: 0.9375rem;
       font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-sep {
+      width: 1px;
+      height: 14px;
+      background: var(--border-strong);
+      flex: 0 0 auto;
     }
 
     .brand-meta {
-      font-size: 0.75rem;
+      font-size: 0.725rem;
       color: var(--text-secondary);
+      white-space: nowrap;
     }
 
     /* Segmented View Tabs */
     .view-tabs {
       display: inline-flex;
-      background: var(--surface-subtle);
+      background: var(--surface-recessed);
       padding: 3px;
-      border-radius: 8px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--border);
       gap: 2px;
     }
 
     .view-tab {
       appearance: none;
-      border: none;
+      border: 1px solid transparent;
       background: transparent;
       color: var(--text-secondary);
-      font-family: inherit;
       font-size: 0.8125rem;
-      font-weight: 600;
-      padding: 6px 14px;
+      font-weight: 500;
+      padding: 5px 12px;
       border-radius: 6px;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: 7px;
+      transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
     }
 
     .view-tab:hover {
@@ -192,15 +380,22 @@
     .view-tab[aria-selected="true"] {
       background: var(--surface);
       color: var(--text-primary);
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      border-color: var(--border);
+      font-weight: 600;
     }
 
     .tab-count {
       font-size: 0.6875rem;
-      padding: 1px 6px;
+      line-height: 1;
+      padding: 2px 5px;
       border-radius: 4px;
       background: var(--surface-subtle);
       color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .view-tab[aria-selected="true"] .tab-count {
+      color: var(--text-primary);
     }
 
     .nav-right {
@@ -212,34 +407,33 @@
 
     /* Buttons */
     .btn {
+      appearance: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      min-height: 36px;
-      padding: 6px 14px;
+      min-height: 34px;
+      padding: 6px 13px;
       border-radius: 6px;
-      font-family: inherit;
       font-size: 0.8125rem;
       font-weight: 500;
       line-height: 1.2;
       cursor: pointer;
       border: 1px solid transparent;
       text-decoration: none;
-      text-align: center;
-      max-width: 100%;
+      white-space: nowrap;
+      transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
     }
 
     .btn:disabled {
       opacity: 0.45;
       cursor: not-allowed;
-      pointer-events: none;
     }
 
     .btn-primary {
       background: var(--btn-primary-bg);
       color: var(--btn-primary-fg);
-      border-color: rgba(255, 255, 255, 0.08);
+      font-weight: 600;
     }
 
     .btn-primary:hover:not(:disabled) {
@@ -247,13 +441,13 @@
     }
 
     .btn-secondary {
-      background: var(--surface);
+      background: var(--surface-subtle);
       color: var(--text-primary);
       border-color: var(--border-strong);
     }
 
     .btn-secondary:hover:not(:disabled) {
-      background: var(--surface-subtle);
+      background: var(--surface-hover);
     }
 
     .btn-ghost {
@@ -267,39 +461,31 @@
       color: var(--text-primary);
     }
 
-    .btn-row {
-      min-height: 30px;
+    .btn-icon-only {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+    }
+
+    .btn-sm {
+      min-height: 28px;
       padding: 4px 10px;
       font-size: 0.75rem;
-      border-radius: 5px;
-      background: var(--surface-subtle);
-      color: var(--text-primary);
-      border: 1px solid var(--border);
     }
 
-    .btn-row:hover:not(:disabled) {
-      background: var(--surface-hover);
-      border-color: var(--border-strong);
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
 
-    .btn-row-danger {
-      background: transparent;
-      color: var(--text-secondary);
-      border-color: transparent;
+    .is-spinning {
+      animation: spin 800ms linear infinite;
     }
 
-    .btn-row-danger:hover:not(:disabled),
-    .btn-row-danger[data-confirm="1"] {
-      background: var(--status-err-bg);
-      color: var(--status-err-fg);
-      border-color: var(--status-err-fg);
-    }
-
-    /* Main Container */
+    /* Main Workspace Shell */
     .shell {
       max-width: 1120px;
       margin: 0 auto;
-      padding: 24px 24px 64px;
+      padding: 20px 24px 72px;
       display: flex;
       flex-direction: column;
       gap: 16px;
@@ -309,10 +495,16 @@
       display: none;
     }
 
-    /* Feedback Banner */
+    .view-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Critical / Persistent Status Banners (Errors, Warnings, Desktop Pairing) */
     .status-banner {
-      padding: 10px 16px;
-      border-radius: 8px;
+      padding: 10px 14px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--border);
       background: var(--surface);
       display: flex;
@@ -322,43 +514,255 @@
       font-size: 0.8125rem;
     }
 
-    .status-banner[hidden] {
-      display: none;
-    }
-
     .status-banner.ok {
-      background: var(--status-ok-bg);
-      color: var(--status-ok-fg);
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-fg);
     }
 
     .status-banner.warn {
-      background: var(--status-warn-bg);
-      color: var(--status-warn-fg);
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      color: var(--warn-fg);
     }
 
     .status-banner.err {
-      background: var(--status-err-bg);
-      color: var(--status-err-fg);
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-fg);
     }
 
-    /* Summary & Filter Toolbar */
-    .pool-toolbar {
+    /* Compact Instrument Connection Strip */
+    .connect-strip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    .connect-strip-main {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      border-bottom: 1px solid var(--border);
+    }
+
+    .endpoint-block {
+      padding: 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .endpoint-block + .endpoint-block {
+      border-left: 1px solid var(--border);
+    }
+
+    .endpoint-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      gap: 10px;
       flex-wrap: wrap;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 18px;
     }
 
-    .filter-pills {
+    .endpoint-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .endpoint-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .endpoint-tag {
+      font-size: 0.6875rem;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--surface-subtle);
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    .endpoint-tag-ok {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-fg);
+    }
+
+    .endpoint-hint {
+      font-size: 0.725rem;
+      color: var(--text-muted);
+    }
+
+    .readout-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    /* Copyable Instrument Readout Chip */
+    .copy-readout {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      max-width: 100%;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: var(--surface-recessed);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      font-size: 0.75rem;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .copy-readout:hover {
+      background: var(--surface-subtle);
+      border-color: var(--border-strong);
+    }
+
+    .copy-readout[data-copied="1"] {
+      border-color: var(--ok-border);
+      background: var(--ok-bg);
+    }
+
+    .readout-key {
+      font-family: var(--font-sans);
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      flex: 0 0 auto;
+    }
+
+    .readout-val {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .readout-copy-icon {
+      color: var(--text-muted);
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      transition: color 120ms ease;
+    }
+
+    .copy-readout:hover .readout-copy-icon {
+      color: var(--text-primary);
+    }
+
+    .copy-readout[data-copied="1"] .readout-copy-icon {
+      color: var(--ok-fg);
+    }
+
+    /* Models & Pinning Strip Footer */
+    .connect-strip-footer {
+      padding: 10px 18px;
+      background: var(--surface-recessed);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .models-row {
       display: flex;
       align-items: center;
       gap: 6px;
       flex-wrap: wrap;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .models-label {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-right: 4px;
+      flex: 0 0 auto;
+    }
+
+    .model-chip-list {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    .model-chip {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: 0.7125rem;
+      cursor: pointer;
+      transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .model-chip:hover {
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+      background: var(--surface-subtle);
+    }
+
+    .model-chip[data-copied="1"] {
+      color: var(--ok-fg);
+      border-color: var(--ok-border);
+      background: var(--ok-bg);
+    }
+
+    .pinning-note {
+      font-size: 0.725rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    /* Pool Toolbar: Filters + Live Telemetry */
+    .pool-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .filter-pills {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 3px;
     }
 
     .filter-pill {
@@ -366,12 +770,15 @@
       border: 1px solid transparent;
       background: transparent;
       color: var(--text-secondary);
-      font-family: inherit;
-      font-size: 0.8125rem;
+      font-size: 0.78125rem;
       font-weight: 500;
-      padding: 5px 11px;
-      border-radius: 6px;
+      padding: 5px 10px;
+      border-radius: 5px;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
     }
 
     .filter-pill:hover {
@@ -386,287 +793,372 @@
       font-weight: 600;
     }
 
-    .telemetry-bar {
-      display: flex;
-      align-items: center;
-      gap: 18px;
-      flex-wrap: wrap;
-      font-size: 0.75rem;
-      color: var(--text-secondary);
+    .pill-cnt {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--text-muted);
     }
 
-    .telemetry-bar strong {
+    .filter-pill[aria-pressed="true"] .pill-cnt {
+      color: var(--text-primary);
+    }
+
+    .telemetry-strip {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+    }
+
+    .telemetry-cell {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 6px 12px;
+      font-size: 0.725rem;
+    }
+
+    .telemetry-cell + .telemetry-cell {
+      border-left: 1px solid var(--border);
+    }
+
+    .telemetry-label {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .telemetry-val {
+      font-family: var(--font-mono);
       color: var(--text-primary);
       font-weight: 500;
     }
 
-    /* Account Pool Panel */
+    /* Accounts Pool Table Panel */
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--radius-lg);
       overflow: hidden;
     }
 
-    .table-wrap {
+    .table-wrapper {
       width: 100%;
       overflow-x: auto;
-    }
-
-    /* Connection Bar (Pool vs Individual) */
-    .conn-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px 18px;
-      margin-bottom: 14px;
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 16px;
-    }
-
-    .conn-col {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .conn-col + .conn-col {
-      border-left: 1px solid var(--border);
-      padding-left: 16px;
-    }
-
-    .conn-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: 0.8125rem;
-      font-weight: 600;
-      color: var(--text-primary);
-    }
-
-    .conn-desc {
-      font-size: 0.75rem;
-      color: var(--text-secondary);
-    }
-
-    .conn-pills {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 2px;
-    }
-
-    .copy-chip {
-      appearance: none;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--surface-subtle);
-      border: 1px solid var(--border);
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 0.8125rem;
-      font-weight: 400;
-      letter-spacing: 0.01em;
-      padding: 4px 10px;
-      border-radius: 5px;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-
-    .copy-chip:hover {
-      background: var(--surface-hover);
-      border-color: var(--border-strong);
-    }
-
-    .copy-chip span {
-      color: var(--text-secondary);
-      font-weight: 400;
-    }
-
-    .copy-chip strong,
-    .copy-chip .chip-val {
-      color: var(--text-primary);
-      font-weight: 400;
+      container-type: inline-size;
     }
 
     .acct-table {
       width: 100%;
-      border-collapse: collapse;
+      border-collapse: separate;
+      border-spacing: 0;
       text-align: left;
       font-size: 0.8125rem;
+      --label-1: "Account";
+      --label-2: "Status";
+      --label-3: "Quota Windows";
+      --label-4: "Actions";
     }
 
-    .acct-table th {
-      background: var(--surface-subtle);
-      color: var(--text-secondary);
-      font-size: 0.75rem;
+    .acct-table thead th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-recessed);
+      color: var(--text-muted);
+      font-size: 0.6875rem;
       font-weight: 600;
-      padding: 10px 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 10px 16px;
       border-bottom: 1px solid var(--border);
       white-space: nowrap;
     }
 
-    .acct-table th.col-actions {
+    .acct-table thead th.col-actions {
       text-align: right;
     }
 
-    .acct-table td {
-      padding: 12px 14px;
+    .acct-table tbody th,
+    .acct-table tbody td {
+      padding: 14px 16px;
       border-bottom: 1px solid var(--border);
       vertical-align: middle;
+      font-weight: 400;
     }
 
-    .acct-table tr:last-child td {
+    .acct-table tbody tr:last-child th,
+    .acct-table tbody tr:last-child td {
       border-bottom: none;
     }
 
+    .acct-table tbody tr {
+      transition: background-color 100ms ease;
+    }
+
     .acct-table tbody tr:hover {
-      background: var(--surface-subtle);
+      background: color-mix(in srgb, var(--surface-subtle) 65%, transparent);
+    }
+
+    .acct-table tbody tr.is-active-turn {
+      background: color-mix(in srgb, var(--active-bg) 32%, transparent);
+    }
+
+    .acct-table tbody tr.is-active-turn:hover {
+      background: color-mix(in srgb, var(--active-bg) 52%, transparent);
     }
 
     /* Column 1: Account Identity */
-    .acct-id-line {
+    .acct-cell {
+      min-width: 220px;
+    }
+
+    .acct-primary-line {
       display: flex;
       align-items: center;
       gap: 8px;
-      font-weight: 500;
+      flex-wrap: wrap;
+    }
+
+    .acct-rank {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      min-width: 18px;
+    }
+
+    .acct-id {
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      font-weight: 600;
       color: var(--text-primary);
+    }
+
+    .turn-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--font-sans);
+      font-size: 0.65625rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: var(--active-bg);
+      color: var(--active-fg);
+      border: 1px solid var(--active-border);
       white-space: nowrap;
     }
 
-    .cursor-badge {
-      font-size: 0.6875rem;
-      font-weight: 600;
-      padding: 1px 6px;
-      border-radius: 4px;
-      background: var(--status-ok-bg);
-      color: var(--status-ok-fg);
+    .turn-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--active-fg);
+    }
+
+    .acct-sub-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+      padding-left: 26px;
+      flex-wrap: wrap;
     }
 
     .acct-email {
+      font-family: var(--font-mono);
       color: var(--text-secondary);
-      font-size: 0.75rem;
-      margin-top: 2px;
-      max-width: 240px;
+      font-size: 0.725rem;
+      max-width: 220px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
-    /* Column 2: Status & Concise Reason */
+    .acct-key-btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      cursor: pointer;
+      transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .acct-key-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+      background: var(--surface-subtle);
+    }
+
+    .acct-key-btn[data-copied="1"] {
+      color: var(--ok-fg);
+      border-color: var(--ok-border);
+      background: var(--ok-bg);
+    }
+
+    /* Column 2: Status */
     .status-cell {
       display: flex;
       flex-direction: column;
       align-items: flex-start;
-      gap: 3px;
+      gap: 4px;
+      min-width: 112px;
     }
 
-    .badge {
+    .status-pill {
       display: inline-flex;
       align-items: center;
-      padding: 2px 8px;
-      border-radius: 4px;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 5px;
       font-size: 0.75rem;
       font-weight: 600;
       white-space: nowrap;
+      border: 1px solid transparent;
     }
 
-    .badge-ok {
-      background: var(--status-ok-bg);
-      color: var(--status-ok-fg);
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      flex: 0 0 auto;
     }
 
-    .badge-warn {
-      background: var(--status-warn-bg);
-      color: var(--status-warn-fg);
+    .status-ok {
+      background: var(--ok-bg);
+      color: var(--ok-fg);
+      border-color: var(--ok-border);
     }
 
-    .badge-err {
-      background: var(--status-err-bg);
-      color: var(--status-err-fg);
+    .status-ok .status-dot {
+      background: var(--ok-fg);
+    }
+
+    .status-warn {
+      background: var(--warn-bg);
+      color: var(--warn-fg);
+      border-color: var(--warn-border);
+    }
+
+    .status-warn .status-dot {
+      background: var(--warn-fg);
+    }
+
+    .status-err {
+      background: var(--err-bg);
+      color: var(--err-fg);
+      border-color: var(--err-border);
+    }
+
+    .status-err .status-dot {
+      background: var(--err-fg);
     }
 
     .status-note {
-      font-size: 0.75rem;
+      font-size: 0.725rem;
       color: var(--text-secondary);
-      max-width: 190px;
+      max-width: 195px;
       line-height: 1.35;
     }
 
-    /* Column 3: Quota Meter (Proportional Non-Scrolling Layout) */
+    /* Column 3: Quota Telemetry Meters */
     .acct-table td.col-quota,
     .acct-table th.col-quota {
-      width: 48%;
+      width: 46%;
+      min-width: 260px;
     }
 
     .quota-stack {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 9px;
       width: 100%;
     }
 
     .quota-item {
       display: flex;
       flex-direction: column;
-      gap: 5px;
+      gap: 4px;
     }
 
     .quota-top {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
-      gap: 12px;
-      font-size: 0.75rem;
+      gap: 10px;
+      font-size: 0.725rem;
       white-space: nowrap;
     }
 
     .quota-credits {
-      color: var(--text-primary);
-      font-weight: 400;
+      display: inline-flex;
+      align-items: baseline;
+      gap: 5px;
+      font-family: var(--font-mono);
     }
 
-    .quota-credits strong {
-      font-weight: 500;
+    .quota-window-tag {
+      font-size: 0.65625rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      min-width: 22px;
+    }
+
+    .quota-rem {
+      font-weight: 600;
       color: var(--text-primary);
     }
 
-    .quota-credits span {
-      color: var(--text-secondary);
-      font-weight: 400;
+    .quota-tot {
+      color: var(--text-muted);
     }
 
     .quota-reset {
+      font-family: var(--font-mono);
       color: var(--text-secondary);
-      font-size: 0.75rem;
+      font-size: 0.7rem;
     }
 
-    .quota-bar-bg {
-      height: 7px;
+    .quota-bar-track {
+      height: 5px;
       background: var(--surface-track);
-      border-radius: 4px;
+      border-radius: 3px;
       overflow: hidden;
     }
 
     .quota-bar-fill {
+      width: 100%;
       height: 100%;
-      background: var(--accent-bar);
-      border-radius: 4px;
+      background: var(--ok-bar);
+      border-radius: 3px;
+      transform-origin: left center;
+      transform: scaleX(var(--ratio, 0));
+      transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
     }
 
     .quota-bar-fill.warn {
-      background: var(--status-warn-fg);
+      background: var(--warn-bar);
     }
 
     .quota-bar-fill.err {
-      background: var(--status-err-fg);
+      background: var(--err-bar);
     }
 
-    /* Column 4: Compact Order & Menu Actions */
+    /* Column 4: Row Controls */
     .actions-cell {
       text-align: right;
       white-space: nowrap;
@@ -678,63 +1170,99 @@
       align-items: center;
       justify-content: flex-end;
       gap: 4px;
-      white-space: nowrap;
     }
 
-    .btn-icon {
+    .order-group {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--surface-recessed);
+    }
+
+    .order-group .btn-row-icon {
+      border: none;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    .order-group .btn-row-icon + .btn-row-icon {
+      border-left: 1px solid var(--border);
+    }
+
+    .btn-row-icon {
+      appearance: none;
       width: 30px;
       height: 30px;
-      min-height: 30px;
       padding: 0;
       border-radius: 6px;
-      background: var(--surface-subtle);
-      color: var(--text-primary);
+      background: var(--surface-recessed);
+      color: var(--text-secondary);
       border: 1px solid var(--border);
-      font-size: 0.85rem;
-      line-height: 1;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
+      transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
     }
 
-    .btn-icon:hover:not(:disabled),
-    .btn-icon[aria-expanded="true"] {
+    .btn-row-icon:hover:not(:disabled),
+    .btn-row-icon[aria-expanded="true"] {
       background: var(--surface-hover);
+      color: var(--text-primary);
       border-color: var(--border-strong);
     }
 
-    .btn-icon:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-      pointer-events: none;
+    .order-group .btn-row-icon:hover:not(:disabled) {
+      border-color: transparent;
     }
 
-    /* Floating Row Action Popover Menu */
+    .btn-row-icon:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    /* Native Popover Action Panel (Viewport-Aware Dropdown) */
     .action-popover {
-      position: fixed;
-      z-index: 80;
-      min-width: 215px;
+      min-width: 224px;
       background: var(--surface);
+      color: var(--text-primary);
       border: 1px solid var(--border-strong);
-      border-radius: 8px;
-      box-shadow: var(--shadow-modal);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-overlay);
       padding: 5px;
+    }
+
+    .action-popover:is(:popover-open, .\:popover-open) {
       display: flex;
       flex-direction: column;
       gap: 2px;
     }
 
-    .action-popover[hidden] {
-      display: none !important;
+    @supports (position-area: block-end) {
+      .action-popover {
+        position-anchor: --gsb-row-action;
+        inset: auto;
+        margin: 6px 0 0 0;
+        position-area: block-end span-inline-start;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+      }
+    }
+
+    @supports not (position-area: block-end) {
+      .action-popover {
+        position: fixed;
+        margin: 0;
+      }
     }
 
     .popover-meta {
-      padding: 6px 10px 5px;
+      padding: 6px 10px 7px;
+      font-family: var(--font-mono);
       font-size: 0.6875rem;
-      color: var(--text-secondary);
+      color: var(--text-muted);
       border-bottom: 1px solid var(--border);
-      margin-bottom: 2px;
+      margin-bottom: 3px;
       white-space: nowrap;
     }
 
@@ -744,7 +1272,6 @@
       border: none;
       background: transparent;
       color: var(--text-primary);
-      font-family: inherit;
       font-size: 0.8125rem;
       font-weight: 400;
       text-align: left;
@@ -755,6 +1282,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 10px;
+      transition: background-color 100ms ease, color 100ms ease;
     }
 
     .menu-item:hover:not(:disabled) {
@@ -767,14 +1295,14 @@
     }
 
     .menu-item-danger {
-      color: var(--status-err-fg);
+      color: var(--err-fg);
     }
 
     .menu-item-danger:hover:not(:disabled),
     .menu-item-danger[data-confirm="1"] {
-      background: var(--status-err-bg);
-      color: var(--status-err-fg);
-      font-weight: 500;
+      background: var(--err-bg);
+      color: var(--err-fg);
+      font-weight: 600;
     }
 
     .menu-divider {
@@ -782,25 +1310,34 @@
       background: var(--border);
       margin: 3px 0;
     }
+
     /* Empty / Loading / Error Box */
     .state-box {
-      padding: 40px 24px;
+      padding: 48px 24px;
       text-align: center;
       color: var(--text-secondary);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
     }
 
     .state-box strong {
-      display: block;
       color: var(--text-primary);
       font-size: 0.9375rem;
-      margin-bottom: 6px;
+      font-weight: 600;
     }
 
-    /* Configuration View (Horizontal Settings Rows) */
+    .state-box span {
+      max-width: 460px;
+      font-size: 0.8125rem;
+    }
+
+    /* Configuration Sheet */
     .settings-sheet {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--radius-lg);
       overflow: hidden;
     }
 
@@ -823,9 +1360,10 @@
     }
 
     .settings-group-info p {
-      margin: 4px 0 0;
+      margin: 5px 0 0;
       font-size: 0.8125rem;
       color: var(--text-secondary);
+      line-height: 1.5;
     }
 
     .form-grid-2 {
@@ -837,13 +1375,14 @@
     .form-stack {
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
 
     .field {
       display: flex;
       flex-direction: column;
       gap: 6px;
+      min-width: 0;
     }
 
     .field-label-row {
@@ -859,31 +1398,69 @@
       font-size: 0.8125rem;
     }
 
-    .source-tag {
-      font-size: 0.6875rem;
-      color: var(--text-secondary);
-      background: var(--surface-subtle);
+.source-tag {
+  font-family: var(--font-mono);
+  font-size: 0.65625rem;
+  color: var(--text-muted);
+  background: var(--surface-recessed);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  cursor: help;
+}
+
+    .priority-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px;
       border: 1px solid var(--border);
-      padding: 1px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-md);
+      background: var(--surface-recessed);
     }
+
+    .priority-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 36px;
+      padding: 5px 7px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      cursor: grab;
+    }
+
+    .priority-item:active { cursor: grabbing; }
+    .priority-item.is-dragged { opacity: 0.45; }
+    .priority-grip { color: var(--text-muted); letter-spacing: -2px; user-select: none; }
+    .priority-id { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+    .priority-controls { display: flex; gap: 3px; }
 
     .input,
     .select,
     .textarea {
       width: 100%;
-      min-height: 38px;
-      padding: 7px 12px;
+      min-height: 36px;
+      padding: 7px 11px;
       border-radius: 6px;
       border: 1px solid var(--border-strong);
-      background: var(--surface-subtle);
+      background: var(--surface-recessed);
       color: var(--text-primary);
-      font-family: inherit;
       font-size: 0.8125rem;
+      transition: border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .input:focus,
+    .select:focus,
+    .textarea:focus {
+      border-color: var(--focus-ring);
+      background: var(--surface);
     }
 
     .textarea {
-      min-height: 110px;
+      min-height: 96px;
       resize: vertical;
       line-height: 1.5;
     }
@@ -891,34 +1468,59 @@
     .helper {
       font-size: 0.75rem;
       color: var(--text-secondary);
+      line-height: 1.45;
     }
 
-    .checkbox-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px 20px;
+    .check-list {
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--surface-recessed);
+      overflow: hidden;
     }
 
     .check-row {
       display: flex;
-      align-items: center;
-      gap: 10px;
-      min-height: 32px;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 11px 14px;
       cursor: pointer;
       font-size: 0.8125rem;
       color: var(--text-primary);
+      transition: background-color 100ms ease;
+    }
+
+    .check-row + .check-row {
+      border-top: 1px solid var(--border);
+    }
+
+    .check-row:hover {
+      background: var(--surface-subtle);
     }
 
     .check-row input[type="checkbox"] {
       width: 16px;
       height: 16px;
+      margin: 2px 0 0;
       accent-color: var(--btn-primary-bg);
       cursor: pointer;
-      margin: 0;
+      flex: 0 0 auto;
+    }
+
+    .check-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .check-title {
+      font-weight: 500;
+      color: var(--text-primary);
     }
 
     .settings-footer {
-      background: var(--surface-subtle);
+      background: var(--surface-recessed);
       padding: 14px 24px;
       border-top: 1px solid var(--border);
       display: flex;
@@ -928,65 +1530,59 @@
       flex-wrap: wrap;
     }
 
-    .footer-buttons {
+    .footer-meta {
       display: flex;
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
     }
 
-    /* Modals (Add Account & Auth Gate) */
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: var(--backdrop);
+    .dirty-pill {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: var(--warn-bg);
+      color: var(--warn-fg);
+      border: 1px solid var(--warn-border);
+    }
+
+    .footer-buttons {
       display: flex;
       align-items: center;
-      justify-content: center;
-      padding: 16px;
-      z-index: 50;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
-    .modal-backdrop[hidden] {
-      display: none;
-    }
-
-    .modal-card {
-      background: var(--surface);
+    /* Native Modal <dialog> */
+    dialog.modal-dialog {
       border: 1px solid var(--border-strong);
-      border-radius: 10px;
-      box-shadow: var(--shadow-modal);
-      width: 100%;
-      max-width: 520px;
-      max-height: calc(100vh - 32px);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      color: var(--text-primary);
+      box-shadow: var(--shadow-overlay);
+      width: min(520px, calc(100vw - 32px));
       max-height: calc(100dvh - 32px);
-      padding: 24px;
+      padding: 0;
+      margin: auto;
+      overflow: hidden;
+    }
+
+    dialog.modal-dialog[open] {
       display: flex;
       flex-direction: column;
     }
 
-    /* The body is the only scrollable region; header and actions stay put so the
-       primary action is reachable on short viewports. The inset shadow signals
-       that more content continues below the fold. */
-    .modal-body {
-      flex: 1 1 auto;
-      min-height: 0;
-      overflow-y: auto;
+    dialog.modal-dialog:modal {
       overscroll-behavior: contain;
-      margin: 0 -24px;
-      padding: 0 24px;
-      box-shadow: inset 0 -12px 12px -12px var(--scroll-shadow);
-      scrollbar-width: thin;
-      scrollbar-color: var(--border-strong) transparent;
     }
 
-    .modal-body::-webkit-scrollbar {
-      width: 8px;
-    }
-
-    .modal-body::-webkit-scrollbar-thumb {
-      background: var(--border-strong);
-      border-radius: 4px;
+    dialog.modal-dialog::backdrop {
+      background: var(--backdrop);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+      overflow: hidden;
+      overscroll-behavior: contain;
     }
 
     .modal-header {
@@ -994,8 +1590,59 @@
       align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 16px;
+      padding: 20px 22px 14px;
+      border-bottom: 1px solid var(--border);
       flex: 0 0 auto;
+    }
+
+    .modal-title {
+      font-size: 0.9375rem;
+      font-weight: 600;
+    }
+
+    .modal-subtitle {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin: 3px 0 0;
+    }
+
+    .modal-form {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
+    }
+
+    .modal-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 18px 22px;
+      box-shadow: inset 0 -10px 10px -10px var(--scroll-shadow);
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-strong) transparent;
+    }
+
+    .modal-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 14px 22px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-recessed);
+      flex: 0 0 auto;
+    }
+
+    .modal-inline-error {
+      padding: 9px 12px;
+      border-radius: 6px;
+      background: var(--err-bg);
+      border: 1px solid var(--err-border);
+      color: var(--err-fg);
+      font-size: 0.78125rem;
+      line-height: 1.4;
     }
 
     /* Sign-in method picker */
@@ -1003,11 +1650,11 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 10px 12px;
-      background: var(--surface-subtle);
+      gap: 14px;
+      padding: 12px 14px;
+      background: var(--surface-recessed);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--radius-md);
     }
 
     .signin-option-text {
@@ -1019,17 +1666,19 @@
       font-weight: 600;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 7px;
       flex-wrap: wrap;
+      margin-bottom: 3px;
     }
 
     .signin-option-tag {
       font-size: 0.625rem;
-      font-weight: 500;
-      letter-spacing: 0.02em;
+      font-weight: 600;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
-      color: var(--status-ok-fg);
-      background: var(--status-ok-bg);
+      color: var(--ok-fg);
+      background: var(--ok-bg);
+      border: 1px solid var(--ok-border);
       border-radius: 4px;
       padding: 1px 6px;
     }
@@ -1038,10 +1687,10 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      color: var(--text-secondary);
+      color: var(--text-muted);
       font-size: 0.6875rem;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
     }
 
     .signin-divider::before,
@@ -1052,23 +1701,27 @@
       background: var(--border);
     }
 
-    /* Collapsed optional sections */
     .advanced {
       border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--surface-subtle);
+      border-radius: var(--radius-md);
+      background: var(--surface-recessed);
     }
 
     .advanced > summary {
       cursor: pointer;
-      padding: 9px 12px;
+      padding: 10px 14px;
       font-size: 0.8125rem;
       font-weight: 500;
+      color: var(--text-secondary);
       list-style: none;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+    }
+
+    .advanced > summary:hover {
+      color: var(--text-primary);
     }
 
     .advanced > summary::-webkit-details-marker {
@@ -1077,139 +1730,151 @@
 
     .advanced > summary::after {
       content: "+";
-      color: var(--text-secondary);
-      font-weight: 400;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
     }
 
     .advanced[open] > summary::after {
       content: "\2212";
     }
 
-    .advanced > summary:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: -2px;
-      border-radius: 8px;
-    }
-
     .advanced-body {
       display: flex;
       flex-direction: column;
       gap: 12px;
-      padding: 0 12px 12px;
+      padding: 0 14px 14px;
     }
 
     #inp-acct-cookie {
       min-height: 92px;
     }
 
-    .modal-title {
-      font-size: 1rem;
-      font-weight: 600;
+    /* Non-Intrusive Toast Notifications (popover="manual") */
+    .toast-region {
+      position: fixed;
+      inset-block-end: 20px;
+      inset-inline-end: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 60;
+      pointer-events: none;
+      max-width: min(380px, calc(100vw - 32px));
     }
 
-    .modal-subtitle {
+    .toast-item {
+      pointer-events: auto;
+      position: fixed;
+      inset: auto 20px 20px auto;
+      margin: 0;
+      width: min(380px, calc(100vw - 32px));
+      padding: 10px 12px 10px 14px;
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      color: var(--text-primary);
+      border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-toast);
       font-size: 0.8125rem;
-      color: var(--text-secondary);
-      margin-top: 2px;
+      line-height: 1.4;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 160ms ease, transform 160ms ease, display 160ms ease, overlay 160ms ease;
+      transition-behavior: allow-discrete;
     }
 
-    .modal-actions {
+    .toast-item:is(:popover-open, .\:popover-open) {
       display: flex;
       align-items: center;
-      justify-content: flex-end;
-      gap: 8px;
-      margin-top: 20px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border);
+      justify-content: space-between;
+      gap: 10px;
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @starting-style {
+      .toast-item:is(:popover-open, .\:popover-open) {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+    }
+
+    .toast-item.ok {
+      border-color: var(--ok-border);
+    }
+
+    .toast-item.warn {
+      border-color: var(--warn-border);
+    }
+
+    .toast-item.err {
+      border-color: var(--err-border);
+    }
+
+    .toast-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex: 0 0 auto;
+      background: var(--ok-fg);
+    }
+
+    .toast-item.warn .toast-dot {
+      background: var(--warn-fg);
+    }
+
+    .toast-item.err .toast-dot {
+      background: var(--err-fg);
+    }
+
+    .toast-msg {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .toast-close {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
       flex: 0 0 auto;
     }
 
-    .modal-form {
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
-      flex: 1 1 auto;
+    .toast-close:hover {
+      background: var(--surface-subtle);
+      color: var(--text-primary);
     }
 
-    /* Tablet Breakpoint */
-    @media (max-width: 960px) {
-      .settings-group,
-      .conn-card {
-        grid-template-columns: 1fr;
-        gap: 16px;
-      }
-
-      .conn-col + .conn-col {
-        border-left: none;
-        border-top: 1px solid var(--border);
-        padding-left: 0;
-        padding-top: 12px;
-      }
-    }
-
-    /* Mobile Breakpoint */
-    @media (max-width: 680px) {
-      .top-bar {
-        padding: 0 16px;
-      }
-
-      .shell {
-        padding: 16px 16px 48px;
-      }
-
-      .form-grid-2,
-      .checkbox-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .btn,
-      .btn-row,
-      .view-tab,
-      .filter-pill,
-      .menu-item {
-        min-height: 44px;
-        padding: 10px 14px;
-        white-space: normal;
-      }
-
-      .btn-icon {
-        width: 44px;
-        height: 44px;
-        min-height: 44px;
-      }
-
-      .check-row {
-        min-height: 44px;
-      }
-
-      .brand-meta,
-      .helper,
-      .telemetry-bar,
-      .status-note,
-      .acct-id-line,
-      .field label {
-        white-space: normal;
-        overflow-wrap: anywhere;
+    /* Container-Responsive Stacked Table */
+    @container (width < 680px) {
+      .acct-table,
+      .acct-table tbody,
+      .acct-table tr,
+      .acct-table tbody th,
+      .acct-table tbody td {
+        display: block;
+        width: 100%;
       }
 
       .acct-table thead {
         display: none;
       }
 
-      .acct-table,
-      .acct-table tbody,
-      .acct-table tr,
-      .acct-table td {
-        display: block;
-        width: 100%;
-      }
-
-      .acct-table tr {
-        padding: 16px;
+      .acct-table tbody tr {
+        padding: 14px 16px;
         border-bottom: 1px solid var(--border);
       }
 
-      .acct-table td,
+      .acct-table tbody tr:last-child {
+        border-bottom: none;
+      }
+
+      .acct-table tbody th,
+      .acct-table tbody td,
       .acct-table td.col-quota,
       .acct-table td.actions-cell {
         padding: 6px 0;
@@ -1219,44 +1884,108 @@
         min-width: 0;
       }
 
-      .acct-table td::before {
-        content: attr(data-label);
-        display: block;
-        font-size: 0.6875rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        color: var(--text-secondary);
-        margin-bottom: 3px;
+      .acct-sub-line {
+        padding-left: 0;
       }
 
-      .quota-stack {
-        min-width: 0;
-        max-width: 100%;
+      .acct-table tbody td::before {
+        display: block;
+        font-size: 0.65625rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        margin-bottom: 4px;
+      }
+
+      .acct-table tbody td:nth-child(2)::before {
+        content: var(--label-2);
+      }
+
+      .acct-table tbody td:nth-child(3)::before {
+        content: var(--label-3);
+      }
+
+      .acct-table tbody td:nth-child(4)::before {
+        content: var(--label-4);
       }
 
       .row-actions {
         justify-content: flex-start;
-        flex-wrap: wrap;
       }
 
-      .modal-backdrop {
-        padding: 8px;
+      .btn-row-icon {
+        width: 40px;
+        height: 40px;
+      }
+    }
+
+    /* Tablet Breakpoint */
+    @media (max-width: 900px) {
+      .connect-strip-main,
+      .settings-group {
+        grid-template-columns: 1fr;
       }
 
-      .modal-card {
-        padding: 16px;
-        max-height: calc(100dvh - 16px);
-        border-radius: 8px;
+      .endpoint-block + .endpoint-block {
+        border-left: none;
+        border-top: 1px solid var(--border);
       }
 
-      .modal-body {
-        margin: 0 -16px;
-        padding: 0 16px;
+      .pinning-note {
+        white-space: normal;
+      }
+    }
+
+    /* Mobile Breakpoint */
+    @media (max-width: 640px) {
+      .top-bar {
+        padding: 0 14px;
       }
 
-      .modal-actions {
-        margin-top: 12px;
-        padding-top: 12px;
+      .shell {
+        padding: 14px 14px 56px;
+      }
+
+      .brand-sep,
+      .brand-meta {
+        display: none;
+      }
+
+      .form-grid-2 {
+        grid-template-columns: 1fr;
+      }
+
+      .btn,
+      .view-tab,
+      .filter-pill,
+      .menu-item {
+        min-height: 42px;
+      }
+
+      .btn-icon-only {
+        width: 42px;
+        height: 42px;
+      }
+
+      .telemetry-strip {
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .telemetry-cell {
+        border-left: none;
+        border-top: 1px solid var(--border);
+        min-width: 0;
+      }
+
+      .telemetry-cell:nth-child(-n+2) {
+        border-top: none;
+      }
+
+      .telemetry-cell:nth-child(even) {
+        border-left: 1px solid var(--border);
       }
 
       .signin-option {
@@ -1266,6 +1995,19 @@
 
       .signin-option .btn {
         width: 100%;
+      }
+
+      dialog.modal-dialog {
+        width: calc(100vw - 16px);
+        max-height: calc(100dvh - 16px);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
       }
     }
   </style>
@@ -1277,8 +2019,14 @@
     <div class="top-bar-inner">
       <div class="nav-left">
         <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="icon-sm" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2.5 5.5h11M2.5 10.5h11M5.5 2.5v11M10.5 2.5v11"/>
+            </svg>
+          </span>
           <h1 class="brand-title">gsb</h1>
-          <span id="hdr-meta" class="brand-meta mono">v0.3.0 · connecting...</span>
+          <span class="brand-sep" aria-hidden="true"></span>
+          <span id="hdr-meta" class="brand-meta mono">v0.4.4 · connecting…</span>
         </div>
 
         <div class="view-tabs" role="tablist" aria-label="Control plane views">
@@ -1293,94 +2041,177 @@
       </div>
 
       <div class="nav-right">
-        <button type="button" id="btn-open-import" class="btn btn-secondary">+ Add Account</button>
-        <button type="button" id="btn-refresh-live" class="btn btn-primary">Refresh All</button>
         <button type="button" id="btn-auth-modal" class="btn btn-ghost" hidden>Access Key</button>
-        <button type="button" id="btn-theme-toggle" class="btn btn-ghost" aria-label="Switch color theme">Light Mode</button>
+        <button type="button" id="btn-theme-toggle" class="btn btn-ghost btn-icon-only" title="Toggle color theme" aria-label="Toggle color theme">
+          <span class="theme-icon-sun" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="4"/>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+            </svg>
+          </span>
+          <span class="theme-icon-moon" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/>
+            </svg>
+          </span>
+        </button>
+        <button type="button" id="btn-refresh-live" class="btn btn-secondary">
+          <svg id="icon-refresh" class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <polyline points="21 3 21 9 15 9"/>
+          </svg>
+          <span id="lbl-refresh-live">Refresh</span>
+        </button>
+        <button type="button" id="btn-open-import" class="btn btn-primary">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"/>
+          </svg>
+          <span>Add Account</span>
+        </button>
       </div>
     </div>
   </header>
 
   <main id="main-content" class="shell">
-    <div id="feedback-banner" class="status-banner" role="status" aria-live="polite" hidden>
+    <div id="feedback-banner" class="status-banner" role="alert" hidden>
       <span id="feedback-text"></span>
-      <button type="button" id="feedback-close" class="btn btn-ghost">Dismiss</button>
+      <button type="button" id="feedback-close" class="btn btn-ghost btn-sm">Dismiss</button>
+    </div>
+
+    <div id="desktop-connect" class="status-banner warn" hidden>
+      <span id="desktop-connect-status" role="status" aria-live="polite">Approve this browser once to manage your bridge.</span>
+      <button type="button" id="btn-desktop-connect" class="btn btn-secondary btn-sm">Connect desktop</button>
     </div>
 
     <!-- VIEW 1: ACCOUNTS POOL -->
     <section id="view-accounts" class="view-section" role="tabpanel" aria-labelledby="tab-btn-accounts">
-      <!-- Outbound Connection Reference: Pool vs Per-Account -->
-      <div class="conn-card" aria-label="Client connection settings">
-        <div class="conn-col">
-          <div class="conn-head">
-            <span>1. Pool Connection (All Accounts · Auto-Failover)</span>
-            <span class="badge badge-ok">Recommended for 9router / Harness</span>
+      <div class="view-stack">
+        <!-- Compact Instrument Connection Strip -->
+        <section class="connect-strip" aria-label="Client connection endpoints">
+          <div class="connect-strip-main">
+            <div class="endpoint-block">
+              <div class="endpoint-header">
+                <div class="endpoint-title-group">
+                  <span class="endpoint-title">Pool API</span>
+                  <span class="endpoint-tag endpoint-tag-ok">Auto-Failover</span>
+                </div>
+                <span class="endpoint-hint">Recommended for 9router &amp; coding agents</span>
+              </div>
+              <div class="readout-grid">
+                <button type="button" class="copy-readout" data-copy-id="conn-base-url" title="Copy OpenAI-compatible Base URL">
+                  <span class="readout-key">Base</span>
+                  <span class="readout-val" id="conn-base-url">http://127.0.0.1:20133/v1</span>
+                  <span class="readout-copy-icon" aria-hidden="true">
+                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </span>
+                </button>
+                <button type="button" class="copy-readout" data-copy-id="conn-pool-key" title="Copy Pool API Key">
+                  <span class="readout-key">Key</span>
+                  <span class="readout-val" id="conn-pool-key">gsb-pool</span>
+                  <span class="readout-copy-icon" aria-hidden="true">
+                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div class="endpoint-block">
+              <div class="endpoint-header">
+                <div class="endpoint-title-group">
+                  <span class="endpoint-title">MCP Search</span>
+                  <span class="endpoint-tag mono">web_search</span>
+                </div>
+                <span class="endpoint-hint">Claude Code · Cursor · OMP</span>
+              </div>
+              <div class="readout-grid">
+                <button type="button" class="copy-readout" data-copy-id="conn-mcp-url" title="Copy MCP Streamable HTTP URL">
+                  <span class="readout-key">URL</span>
+                  <span class="readout-val" id="conn-mcp-url">http://127.0.0.1:20133/mcp</span>
+                  <span class="readout-copy-icon" aria-hidden="true">
+                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </span>
+                </button>
+                <button type="button" class="copy-readout" data-copy-id="conn-mcp-key" title="Copy MCP API Key">
+                  <span class="readout-key">Key</span>
+                  <span class="readout-val" id="conn-mcp-key">gsb-pool</span>
+                  <span class="readout-copy-icon" aria-hidden="true">
+                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </span>
+                </button>
+              </div>
+            </div>
           </div>
-          <div class="conn-desc">Automatically rotates across all Ready accounts and fails over when a 5h quota window is spent.</div>
-          <div class="conn-pills mono">
-            <button type="button" class="copy-chip" data-copy-id="conn-base-url"><span>Base URL:</span> <span class="chip-val" id="conn-base-url">http://127.0.0.1:20133/v1</span></button>
-            <button type="button" class="copy-chip" data-copy-id="conn-pool-key"><span>API Key:</span> <span class="chip-val" id="conn-pool-key">gsb-pool</span></button>
-            <button type="button" class="copy-chip" data-copy-id="conn-models"><span>Models:</span> <span class="chip-val" id="conn-models">loading…</span></button>
+
+          <div class="connect-strip-footer">
+            <div class="models-row">
+              <span class="models-label">Models</span>
+              <span id="conn-models" class="sr-only">loading…</span>
+              <div id="conn-models-list" class="model-chip-list">
+                <span class="helper">loading…</span>
+              </div>
+            </div>
+            <span class="pinning-note">Pin 1 account (no failover): copy <code class="mono">gsb-&lt;id&gt;</code> on any row</span>
+          </div>
+        </section>
+
+        <!-- Filter & Telemetry Bar -->
+        <div class="pool-toolbar">
+          <div class="filter-pills" role="group" aria-label="Filter accounts by status">
+            <button type="button" class="filter-pill" data-filter="all" aria-pressed="true">
+              <span>All</span><span id="cnt-all" class="pill-cnt">0</span>
+            </button>
+            <button type="button" class="filter-pill" data-filter="ok" aria-pressed="false">
+              <span>Ready</span><span id="cnt-ok" class="pill-cnt">0</span>
+            </button>
+            <button type="button" class="filter-pill" data-filter="exhausted" aria-pressed="false">
+              <span>Exhausted</span><span id="cnt-exhausted" class="pill-cnt">0</span>
+            </button>
+            <button type="button" class="filter-pill" data-filter="issue" aria-pressed="false">
+              <span>Attention</span><span id="cnt-issue" class="pill-cnt">0</span>
+            </button>
+          </div>
+
+          <div class="telemetry-strip" aria-label="Daemon pool telemetry">
+            <div class="telemetry-cell">
+              <span class="telemetry-label">Strategy</span>
+              <span id="stat-strategy" class="telemetry-val">rotate</span>
+            </div>
+            <div class="telemetry-cell">
+              <span class="telemetry-label">Cursor</span>
+              <span id="stat-cursor" class="telemetry-val">auto</span>
+            </div>
+            <div class="telemetry-cell">
+              <span class="telemetry-label">H2</span>
+              <span id="stat-sessions" class="telemetry-val">0</span>
+            </div>
+            <div class="telemetry-cell">
+              <span class="telemetry-label">Cache</span>
+              <span id="stat-cache" class="telemetry-val">0 / 0</span>
+            </div>
           </div>
         </div>
 
-        <div class="conn-col">
-          <div class="conn-head">
-            <span>2. Individual Account Connection (Pin 1 Account)</span>
-            <span class="source-tag mono">No Failover</span>
+        <!-- Primary Workspace: Accounts Table -->
+        <div class="panel">
+          <div id="accounts-state" class="state-box" aria-live="polite">
+            <strong>Loading account pool…</strong>
+            <span>Reading account states from the local bridge daemon.</span>
           </div>
-          <div class="conn-desc">Use the same Base URL, but set the API Key to <code class="mono">gsb-&lt;account&gt;</code> to isolate traffic to one specific Google account.</div>
-          <div class="conn-pills mono">
-            <span class="helper">Click any <code class="mono">Key: gsb-...</code> button in the Account column below to copy that account's dedicated key.</span>
+
+          <div id="accounts-table-wrap" class="table-wrapper" tabindex="0" role="region" aria-labelledby="accounts-table-caption" hidden>
+            <table class="acct-table">
+              <caption id="accounts-table-caption" class="sr-only">Google account pool and active quota windows</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Account</th>
+                  <th scope="col">Status</th>
+                  <th scope="col" class="col-quota">Quota Windows (5h / Weekly)</th>
+                  <th scope="col" class="col-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-tbody"></tbody>
+            </table>
           </div>
-        </div>
-
-        <div class="conn-col">
-          <div class="conn-head">
-            <span>3. MCP Endpoint (Web Search Tool)</span>
-            <span class="source-tag mono">Claude Code · Cursor · OMP</span>
-          </div>
-          <div class="conn-desc">Built-in MCP server exposing Gemini Web's Google Search grounding as a <code class="mono">web_search</code> tool.</div>
-          <div class="conn-pills mono">
-            <button type="button" class="copy-chip" data-copy-id="conn-mcp-url"><span>URL:</span> <span class="chip-val" id="conn-mcp-url">http://127.0.0.1:20133/mcp</span></button>
-            <button type="button" class="copy-chip" data-copy-id="conn-mcp-key"><span>API Key:</span> <span class="chip-val" id="conn-mcp-key">gsb-pool</span></button>
-          </div>
-        </div>
-      </div>
-      <div class="pool-toolbar" style="margin-bottom: 14px;">
-        <div class="filter-pills" role="group" aria-label="Filter accounts by status">
-          <button type="button" class="filter-pill" data-filter="all" aria-pressed="true">All (<span id="cnt-all" class="mono">0</span>)</button>
-          <button type="button" class="filter-pill" data-filter="ok" aria-pressed="false">Ready (<span id="cnt-ok" class="mono">0</span>)</button>
-          <button type="button" class="filter-pill" data-filter="exhausted" aria-pressed="false">Exhausted (<span id="cnt-exhausted" class="mono">0</span>)</button>
-          <button type="button" class="filter-pill" data-filter="issue" aria-pressed="false">Attention (<span id="cnt-issue" class="mono">0</span>)</button>
-        </div>
-
-        <div class="telemetry-bar mono">
-          <span>Strategy: <strong id="stat-strategy">rotate</strong></span>
-          <span>Cursor: <strong id="stat-cursor">auto</strong></span>
-          <span>H2 Sessions: <strong id="stat-sessions">0</strong></span>
-          <span>Cache Hits: <strong id="stat-cache">0 / 0</strong></span>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div id="accounts-state" class="state-box" aria-live="polite">
-          <strong>Loading account pool...</strong>
-          <span>Reading account states from the local bridge daemon.</span>
-        </div>
-
-        <div id="accounts-table-wrap" class="table-wrap" hidden>
-          <table class="acct-table">
-            <thead>
-              <tr>
-                <th scope="col">Account</th>
-                <th scope="col">Status</th>
-                <th scope="col" class="col-quota">Active Quota Window (5h / Weekly)</th>
-                <th scope="col" class="col-actions">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="accounts-tbody"></tbody>
-          </table>
         </div>
       </div>
     </section>
@@ -1388,17 +2219,20 @@
     <!-- VIEW 2: RUNTIME CONFIGURATION -->
     <section id="view-config" class="view-section" role="tabpanel" aria-labelledby="tab-btn-config" hidden>
       <form id="form-config" class="settings-sheet" novalidate>
+        <div class="status-banner warn" role="note">
+          <strong>Choose by scope:</strong> request fields change one turn; controls below change daemon runtime; listener, keys, proxies, TLS, timeouts, and account groups stay in <code class="mono">config.env</code> or the service environment. Keep defaults unless you have a measured reason.
+        </div>
         <div class="settings-group">
           <div class="settings-group-info">
-            <h2>Pool Routing &amp; Failover</h2>
-            <p>Controls how the pool API key selects accounts and checks quota before sending a turn.</p>
+            <h2>Pool Routing &amp; Failover <span class="source-tag">safe runtime</span></h2>
+            <p>Keep <code class="mono">rotate</code> for normal chat. Use <code class="mono">lru</code> for many independent requests; use <code class="mono">fill-first</code> only when priority order matters.</p>
           </div>
           <div class="form-stack">
             <div class="form-grid-2">
               <div class="field">
                 <div class="field-label-row">
                   <label for="cfg-strategy">Pool Routing Strategy</label>
-                  <span id="src-accountStrategy" class="source-tag mono">default</span>
+                  <span id="src-accountStrategy" class="source-tag">default</span>
                 </div>
                 <select id="cfg-strategy" class="select">
                   <option value="rotate">rotate (Sticky until exhausted)</option>
@@ -1410,7 +2244,7 @@
               <div class="field">
                 <div class="field-label-row">
                   <label for="cfg-preflight">Quota Preflight Mode</label>
-                  <span id="src-quotaPreflight" class="source-tag mono">default</span>
+                  <span id="src-quotaPreflight" class="source-tag">default</span>
                 </div>
                 <select id="cfg-preflight" class="select">
                   <option value="strict">strict (Skip exhausted accounts)</option>
@@ -1422,25 +2256,25 @@
 
             <div class="field">
               <div class="field-label-row">
-                <label for="cfg-priority">Account Priority Order (for fill-first)</label>
-                <span id="src-accountPriority" class="source-tag mono">default</span>
+                <label for="cfg-priority-list">Account Priority Order (for fill-first)</label>
+                <span id="src-accountPriority" class="source-tag">default</span>
               </div>
-              <input id="cfg-priority" type="text" class="input mono" placeholder="acct1,acct2,acct3" autocomplete="off">
-              <span class="helper">Comma-separated account IDs drained in order when strategy is set to fill-first.</span>
+              <div id="cfg-priority-list" class="priority-list" role="listbox" aria-label="Account priority order"></div>
+              <span class="helper">Drag accounts to reorder. Use ↑/↓ buttons with keyboard. Only <code class="mono">fill-first</code> uses this order.</span>
             </div>
           </div>
         </div>
 
         <div class="settings-group">
           <div class="settings-group-info">
-            <h2>Thinking &amp; Rate Limits</h2>
-            <p>Per-account concurrency and request-per-minute caps to prevent upstream throttling.</p>
+            <h2>Thinking &amp; Rate Limits <span class="source-tag">safe runtime</span></h2>
+            <p>Low is fastest. High spends more time reasoning. Keep RPM and concurrency at defaults until upstream returns rate-limit or busy errors.</p>
           </div>
           <div class="form-grid-2">
             <div class="field">
               <div class="field-label-row">
                 <label for="cfg-thinking">Default Thinking Effort</label>
-                <span id="src-defaultThinking" class="source-tag mono">default</span>
+                <span id="src-defaultThinking" class="source-tag">default</span>
               </div>
               <select id="cfg-thinking" class="select">
                 <option value="low">low (Standard / Fast)</option>
@@ -1452,7 +2286,7 @@
             <div class="field">
               <div class="field-label-row">
                 <label for="cfg-max-rpm">Max RPM per Account</label>
-                <span id="src-maxRpmPerAccount" class="source-tag mono">default</span>
+                <span id="src-maxRpmPerAccount" class="source-tag">default</span>
               </div>
               <input id="cfg-max-rpm" type="number" min="0" max="600" class="input mono" value="24">
             </div>
@@ -1460,7 +2294,7 @@
             <div class="field">
               <div class="field-label-row">
                 <label for="cfg-max-conc">Max Concurrent Streams</label>
-                <span id="src-maxConcurrentPerAccount" class="source-tag mono">default</span>
+                <span id="src-maxConcurrentPerAccount" class="source-tag">default</span>
               </div>
               <input id="cfg-max-conc" type="number" min="0" max="64" class="input mono" value="2">
             </div>
@@ -1469,37 +2303,62 @@
 
         <div class="settings-group">
           <div class="settings-group-info">
-            <h2>Streaming &amp; Protocol Guards</h2>
-            <p>Controls downgrade protection, live reasoning deltas, and long-context attachment offload.</p>
+            <h2>Streaming &amp; Protocol Guards <span class="source-tag">advanced runtime</span></h2>
+            <p>These change client-visible output or failover. Keep downgrade rejection and live thoughts enabled. Live tool deltas trade repairability for earlier partial output.</p>
           </div>
-          <div class="form-stack">
+          <div class="check-list">
             <label class="check-row">
               <input type="checkbox" id="cfg-reject-downgrade" checked>
-              <span><strong>Reject silent model downgrades</strong> <span class="helper">(Fail over to next account if Google silently switches Pro/Argon down to Flash)</span></span>
+              <span class="check-copy">
+                <span class="check-title">Reject silent model downgrades</span>
+                <span class="helper">Fail over to next account if Google silently switches Pro/Argon down to Flash.</span>
+              </span>
             </label>
             <label class="check-row">
               <input type="checkbox" id="cfg-live-thoughts" checked>
-              <span><strong>Stream reasoning_content live</strong> <span class="helper">(Send thinking process tokens in real time as the model reasons)</span></span>
+              <span class="check-copy">
+                <span class="check-title">Stream reasoning_content live</span>
+                <span class="helper">Send thinking process tokens in real time as the model reasons.</span>
+              </span>
             </label>
             <label class="check-row">
               <input type="checkbox" id="cfg-live-tools">
-              <span><strong>Stream tool_calls deltas live</strong> <span class="helper">(Emit partial tool arguments early before the JSON block finishes)</span></span>
+              <span class="check-copy">
+                <span class="check-title">Stream tool_calls deltas live</span>
+                <span class="helper">Emit partial tool arguments early before the JSON block finishes.</span>
+              </span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfg-reject-label-mismatch">
+              <span class="check-copy">
+                <span class="check-title">Reject served-label changes</span>
+                <span class="helper">Strictly fail over when Google labels a response as another tier even if backend ID matches. Usually keep off because Google can rename tiers.</span>
+              </span>
             </label>
             <label class="check-row">
               <input type="checkbox" id="cfg-tool-preamble">
-              <span><strong>Keep pre-tool preamble in content</strong> <span class="helper">(Include introductory text before a tool call in the main assistant message)</span></span>
+              <span class="check-copy">
+                <span class="check-title">Keep pre-tool preamble in content</span>
+                <span class="helper">Include introductory text before a tool call in the main assistant message.</span>
+              </span>
             </label>
             <label class="check-row">
               <input type="checkbox" id="cfg-history-offload" checked>
-              <span><strong>Offload long history as file attachment</strong> <span class="helper">(Upload oversized multi-turn transcripts as a file when starting a new session)</span></span>
+              <span class="check-copy">
+                <span class="check-title">Offload long history as file attachment</span>
+                <span class="helper">Upload oversized multi-turn transcripts as a file when starting a new session.</span>
+              </span>
             </label>
           </div>
         </div>
 
         <div class="settings-footer">
-          <span class="helper">Persisting writes to <code id="lbl-env-file">$BRIDGE_HOME/config.env</code> (mode 0600).</span>
+          <div class="footer-meta">
+            <span class="helper">Persisting writes to <code id="lbl-env-file" class="mono">$BRIDGE_HOME/config.env</code> (mode 0600).</span>
+            <span id="cfg-dirty-badge" class="dirty-pill" hidden>Unsaved changes</span>
+          </div>
           <div class="footer-buttons">
-            <button type="button" id="btn-cfg-memory" class="btn btn-secondary">Apply In-Memory Only</button>
+            <button type="button" id="btn-cfg-memory" class="btn btn-secondary">Apply In-Memory</button>
             <button type="submit" id="btn-cfg-persist" class="btn btn-primary">Save to config.env</button>
           </div>
         </div>
@@ -1507,110 +2366,137 @@
     </section>
   </main>
 
-  <!-- MODAL 1: ADD / IMPORT ACCOUNT -->
-  <div id="import-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="import-modal-title" hidden>
-    <div class="modal-card">
-      <div class="modal-header">
-        <div>
-          <h2 id="import-modal-title" class="modal-title">Add Google Account</h2>
-          <p class="modal-subtitle">Use an isolated session so Chrome and gsb never rotate the same cookies.</p>
-        </div>
-        <button type="button" id="btn-import-close" class="btn btn-ghost">Close</button>
+  <!-- MODAL 1: ADD / IMPORT ACCOUNT (Native <dialog>) -->
+  <dialog id="import-modal" class="modal-dialog" closedby="any" aria-labelledby="import-modal-title">
+    <div class="modal-header">
+      <div>
+        <h2 id="import-modal-title" class="modal-title">Add Google Account</h2>
+        <p class="modal-subtitle">Use an isolated session so Chrome and gsb never rotate the same cookies.</p>
       </div>
-
-      <form id="form-import" class="modal-form" novalidate>
-        <div class="modal-body">
-          <div class="form-stack">
-            <div class="signin-option">
-              <div class="signin-option-text">
-                <div class="signin-option-title">
-                  Isolated browser window
-                  <span class="signin-option-tag">Recommended</span>
-                </div>
-                <div class="helper">Opens a disposable profile, captures cookies, then closes it. Needs a desktop GUI on the machine running gsb.</div>
-              </div>
-              <button type="button" id="btn-isolated-login" class="btn btn-secondary">Launch</button>
-            </div>
-
-            <div class="signin-divider">or paste cookies</div>
-
-            <div class="field">
-              <div class="field-label-row">
-                <label for="inp-acct-cookie">Incognito session cookies</label>
-                <span class="source-tag mono">Ctrl+Shift+N</span>
-              </div>
-              <textarea id="inp-acct-cookie" name="cookie" class="textarea mono" placeholder="Cookie-Editor JSON array or raw Cookie header" spellcheck="false" autocomplete="off" required></textarea>
-              <span class="helper">Sign in to <code class="mono">gemini.google.com/app</code> in an Incognito window, copy the cookies, then close that window without signing out.</span>
-            </div>
-
-            <details class="advanced">
-              <summary>Optional settings</summary>
-              <div class="advanced-body">
-                <div class="field">
-                  <label for="inp-acct-id">Account name</label>
-                  <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Auto-named from email" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
-                </div>
-                <div class="field">
-                  <label for="inp-acct-proxy">Outbound proxy</label>
-                  <input id="inp-acct-proxy" name="proxyUrl" type="text" class="input mono" placeholder="socks5://127.0.0.1:1080" autocomplete="off">
-                  <span class="helper">Leave blank to use <code class="mono">BRIDGE_PROXY_SERVER</code>.</span>
-                </div>
-                <div class="field">
-                  <label for="inp-acct-group">Account group</label>
-                  <input id="inp-acct-group" name="accountGroup" type="text" class="input mono" placeholder="Optional" autocomplete="off">
-                  <span class="helper">Only needed for a group key (<code class="mono">BRIDGE_GROUP_TOKENS</code>). Ignore it for single-key setups.</span>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
-
-        <div class="modal-actions">
-          <button type="button" id="btn-import-cancel" class="btn btn-secondary">Cancel</button>
-          <button type="submit" id="btn-import-submit" class="btn btn-primary">Verify &amp; Add Account</button>
-        </div>
-      </form>
+      <button type="button" id="btn-import-close" class="btn btn-ghost btn-sm" aria-label="Close Add Google Account dialog">Close</button>
     </div>
-  </div>
 
-  <!-- MODAL 2: AUTHENTICATION KEY -->
-  <div id="auth-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title" hidden>
-    <div class="modal-card">
-      <div class="modal-header">
-        <div>
-          <h2 id="auth-modal-title" class="modal-title">Control Plane Access Key</h2>
-          <p class="modal-subtitle" id="auth-modal-desc">Enter BRIDGE_ADMIN_KEY or BRIDGE_API_KEY to authenticate requests.</p>
-        </div>
-        <button type="button" id="btn-auth-cancel" class="btn btn-ghost">Close</button>
-      </div>
+    <form id="form-import" class="modal-form" novalidate>
+      <div class="modal-body">
+        <div class="form-stack">
+          <div class="signin-option">
+            <div class="signin-option-text">
+              <div class="signin-option-title">
+                Isolated browser window
+                <span class="signin-option-tag">Recommended</span>
+              </div>
+              <div class="helper" id="isolated-login-help">Opens a disposable profile, captures cookies, then closes it. Needs a desktop GUI on the machine running gsb.</div>
+            </div>
+            <button type="button" id="btn-isolated-login" class="btn btn-secondary" autofocus>Launch</button>
+          </div>
 
-      <form id="form-auth" class="modal-form">
-        <div class="modal-body">
+          <div id="desktop-login-error" class="modal-inline-error" role="status" aria-live="polite" hidden></div>
+
+          <div class="field" id="helper-pairing" hidden>
+            <label for="inp-helper-token">Desktop helper token</label>
+            <input id="inp-helper-token" type="password" class="input mono" placeholder="Paste terminal token" autocomplete="off" spellcheck="false">
+            <span class="helper">On your desktop, run <code class="mono">gsb --login-helper</code> in an interactive terminal. Open this UI via <code class="mono">http://127.0.0.1:20133/ui</code> (use your SSH tunnel for a remote daemon), paste the token, then click Launch again.</span>
+            <span id="helper-pairing-error" class="helper" role="status" aria-live="polite"></span>
+          </div>
+
+          <div class="signin-divider">or paste cookies</div>
+
+          <div id="import-inline-error" class="modal-inline-error" role="status" aria-live="polite" hidden></div>
+
           <div class="field">
-            <label for="inp-admin-token">Access Key</label>
-            <input id="inp-admin-token" type="password" class="input mono" placeholder="Enter admin or pool key" autocomplete="current-password">
-            <span class="helper">Kept in this tab's sessionStorage only.</span>
+            <div class="field-label-row">
+              <label for="inp-acct-cookie">Incognito session cookies</label>
+              <span class="source-tag">Ctrl+Shift+N</span>
+            </div>
+            <textarea id="inp-acct-cookie" name="cookie" class="textarea mono" placeholder="Cookie-Editor JSON array or raw Cookie header" spellcheck="false" autocomplete="off" required></textarea>
+            <span class="helper">Sign in to <code class="mono">gemini.google.com/app</code> in an Incognito window, copy the cookies, then close that window without signing out.</span>
           </div>
-        </div>
-        <div class="modal-actions">
-          <button type="submit" class="btn btn-primary">Save Key &amp; Connect</button>
-        </div>
-      </form>
-    </div>
-  </div>
 
-  <!-- FLOATING ROW ACTION POPOVER MENU -->
-  <div id="action-popover" class="action-popover" role="menu" hidden></div>
+          <details class="advanced">
+            <summary>Optional settings (name, proxy, group)</summary>
+            <div class="advanced-body">
+              <div class="field">
+                <label for="inp-acct-id">Account name</label>
+                <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Auto-named from email" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="inp-acct-proxy">Outbound proxy</label>
+                <input id="inp-acct-proxy" name="proxyUrl" type="text" class="input mono" placeholder="socks5://127.0.0.1:1080" autocomplete="off">
+                <span class="helper">Leave blank to use <code class="mono">BRIDGE_PROXY_SERVER</code>.</span>
+              </div>
+              <div class="field">
+                <label for="inp-acct-group">Account group</label>
+                <input id="inp-acct-group" name="accountGroup" type="text" class="input mono" placeholder="Optional" autocomplete="off">
+                <span class="helper">Only needed for a group key (<code class="mono">BRIDGE_GROUP_TOKENS</code>). Ignore it for single-key setups.</span>
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" id="btn-import-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="submit" id="btn-import-submit" class="btn btn-primary">Verify &amp; Add Account</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- MODAL 2: AUTHENTICATION KEY (Native <dialog>) -->
+  <dialog id="auth-modal" class="modal-dialog" closedby="any" aria-labelledby="auth-modal-title">
+    <div class="modal-header">
+      <div>
+        <h2 id="auth-modal-title" class="modal-title">Control Plane Access Key</h2>
+        <p class="modal-subtitle" id="auth-modal-desc">Enter BRIDGE_ADMIN_KEY or BRIDGE_API_KEY to authenticate requests.</p>
+      </div>
+      <button type="button" id="btn-auth-cancel" class="btn btn-ghost btn-sm" aria-label="Close Access Key dialog">Close</button>
+    </div>
+
+    <form id="form-auth" class="modal-form">
+      <div class="modal-body">
+        <div class="field">
+          <label for="inp-admin-token">Access Key</label>
+          <input id="inp-admin-token" type="password" class="input mono" placeholder="Enter admin or pool key" autocomplete="current-password" autofocus>
+          <span class="helper">Kept in this tab's sessionStorage only.</span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="submit" class="btn btn-primary">Save Key &amp; Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- VIEWPORT-AWARE ROW ACTION PANEL (Native Popover API) -->
+  <div id="action-popover" class="action-popover" popover="auto"></div>
+
+  <!-- TOAST NOTIFICATIONS REGION -->
+  <div id="toast-region" class="toast-region" role="region" aria-label="Notifications"></div>
+  <p class="sr-only">Status notifications</p>
+  <div id="sr-announce" class="sr-only" aria-live="polite"></div>
 
   <script>
     (function () {
       const THEME_KEY = 'gsb_ui_theme';
       const TOKEN_KEY = 'gsb_admin_token';
+      const DESKTOP_KEY = 'gsb_desktop_key';
 
       const rootEl = document.documentElement;
+      const metaColorScheme = document.querySelector('meta[name="color-scheme"]');
+      const desktopUI = rootEl.dataset.desktopUi === 'true';
+      const clientOrigin = desktopUI ? 'http://127.0.0.1:20133' : window.location.origin;
+
+      const desktopLoginError = document.getElementById('desktop-login-error');
+      const importInlineError = document.getElementById('import-inline-error');
+      const desktopConnect = document.getElementById('desktop-connect');
+      const desktopConnectStatus = document.getElementById('desktop-connect-status');
+      const btnDesktopConnect = document.getElementById('btn-desktop-connect');
+      if (desktopUI) {
+        document.getElementById('isolated-login-help').textContent = 'Opens a browser on this computer. Sign in to Google; the desktop app sends the session through the SSH tunnel.';
+      }
+
       const btnTheme = document.getElementById('btn-theme-toggle');
-      const btnRefreshCached = document.getElementById('btn-refresh-cached');
       const btnRefreshLive = document.getElementById('btn-refresh-live');
+      const iconRefresh = document.getElementById('icon-refresh');
+      const lblRefreshLive = document.getElementById('lbl-refresh-live');
       const btnOpenImport = document.getElementById('btn-open-import');
       const btnAuthModal = document.getElementById('btn-auth-modal');
       const hdrMeta = document.getElementById('hdr-meta');
@@ -1633,36 +2519,219 @@
       const formAuth = document.getElementById('form-auth');
       const inpAdminToken = document.getElementById('inp-admin-token');
 
+      const formConfig = document.getElementById('form-config');
+      const cfgDirtyBadge = document.getElementById('cfg-dirty-badge');
+
+      const actionPopover = document.getElementById('action-popover');
+      const toastRegion = document.getElementById('toast-region');
+      const srAnnounce = document.getElementById('sr-announce');
+
+      const supportsPopover = Object.hasOwn(HTMLElement.prototype, 'popover');
+      const supportsAnchorPositioning = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('position-area', 'block-end');
+      if (!supportsPopover) {
+        actionPopover.removeAttribute('popover');
+        actionPopover.hidden = true;
+      }
+
       let currentRotateCursor = '';
       let allAccountsCache = [];
       let currentFilter = 'all';
+      let lastConfigSnapshot = '';
 
-      function initTheme() {
-        const saved = localStorage.getItem(THEME_KEY);
-        let theme = saved;
-        if (theme !== 'light' && theme !== 'dark') {
-          theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-        }
-        applyTheme(theme);
+      /* ---------- Theme (2-state system-aware toggle) ---------- */
+      function getSystemScheme() {
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
       }
 
-      function applyTheme(theme) {
-        rootEl.setAttribute('data-theme', theme);
-        btnTheme.textContent = theme === 'dark' ? 'Light Mode' : 'Dark Mode';
+      function getStoredScheme() {
+        try {
+          const v = localStorage.getItem(THEME_KEY);
+          return (v === 'light' || v === 'dark') ? v : null;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function syncThemeUI() {
+        const stored = getStoredScheme();
+        const resolved = stored || getSystemScheme();
+        if (metaColorScheme) {
+          metaColorScheme.content = stored || 'light dark';
+        }
+        rootEl.setAttribute('data-theme', resolved);
+        const nextLabel = resolved === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+        btnTheme.setAttribute('aria-label', nextLabel);
+        btnTheme.title = nextLabel;
       }
 
       btnTheme.addEventListener('click', function () {
-        const next = rootEl.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-        localStorage.setItem(THEME_KEY, next);
-        applyTheme(next);
+        const currentRendered = getStoredScheme() || getSystemScheme();
+        const target = currentRendered === 'dark' ? 'light' : 'dark';
+        const sys = getSystemScheme();
+        try {
+          if (target === sys) {
+            localStorage.removeItem(THEME_KEY);
+          } else {
+            localStorage.setItem(THEME_KEY, target);
+          }
+        } catch (_) {}
+        if (metaColorScheme) {
+          metaColorScheme.content = (target === sys) ? 'light dark' : target;
+        }
+        rootEl.setAttribute('data-theme', target);
+        const nextLabel = target === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+        btnTheme.setAttribute('aria-label', nextLabel);
+        btnTheme.title = nextLabel;
       });
 
+      window.addEventListener('storage', function (ev) {
+        if (ev.key === THEME_KEY) syncThemeUI();
+      });
+
+      if (window.matchMedia) {
+        const mq = window.matchMedia('(prefers-color-scheme: light)');
+        if (mq.addEventListener) {
+          mq.addEventListener('change', syncThemeUI);
+        }
+      }
+
+      /* ---------- Dialog Light-Dismiss Fallback (Safari / older engines) ---------- */
+      if (!('closedBy' in HTMLDialogElement.prototype)) {
+        const isOutside = function (ev, dlg) {
+          const r = dlg.getBoundingClientRect();
+          return ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom;
+        };
+        [importModal, authModal].forEach(function (dlg) {
+          let pressedOutside = false;
+          dlg.addEventListener('pointerdown', function (ev) {
+            pressedOutside = isOutside(ev, dlg);
+          });
+          dlg.addEventListener('pointerup', function (ev) {
+            if (pressedOutside && isOutside(ev, dlg)) dlg.close();
+          });
+        });
+      }
+
+      /* ---------- Screen Reader Announce + Toast / Banner Feedback ---------- */
+      function announceStatus(message) {
+        if (typeof document.ariaNotify === 'function') {
+          try {
+            document.ariaNotify(message);
+            return;
+          } catch (_) {}
+        }
+        srAnnounce.textContent = '';
+        requestAnimationFrame(function () {
+          srAnnounce.textContent = message;
+        });
+      }
+
+      let activeToastEl = null;
+      let activeToastTimer = null;
+
+      function dismissActiveToast() {
+        if (activeToastTimer) {
+          clearTimeout(activeToastTimer);
+          activeToastTimer = null;
+        }
+        if (activeToastEl) {
+          try {
+            if (supportsPopover && activeToastEl.matches(':popover-open')) {
+              activeToastEl.hidePopover();
+            }
+          } catch (_) {}
+          if (activeToastEl.parentNode) activeToastEl.parentNode.removeChild(activeToastEl);
+          activeToastEl = null;
+        }
+      }
+
+      function showToast(kind, message) {
+        // Never surface a toast while a modal dialog is open (top-layer / inert conflict)
+        if (importModal.open || authModal.open) {
+          announceStatus(message);
+          return;
+        }
+        dismissActiveToast();
+        const toast = document.createElement('div');
+        toast.className = 'toast-item ' + (kind || 'ok');
+        toast.id = 'gsb-active-toast';
+        if (supportsPopover) {
+          toast.setAttribute('popover', 'manual');
+        }
+
+        const dot = document.createElement('span');
+        dot.className = 'toast-dot';
+        dot.setAttribute('aria-hidden', 'true');
+
+        const msgSpan = document.createElement('span');
+        msgSpan.className = 'toast-msg';
+        msgSpan.textContent = message;
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'toast-close';
+        closeBtn.textContent = 'Dismiss';
+        if (supportsPopover) {
+          closeBtn.setAttribute('popovertarget', toast.id);
+          closeBtn.setAttribute('popovertargetaction', 'hide');
+        }
+        closeBtn.addEventListener('click', dismissActiveToast);
+
+        toast.appendChild(dot);
+        toast.appendChild(msgSpan);
+        toast.appendChild(closeBtn);
+        toastRegion.appendChild(toast);
+        activeToastEl = toast;
+
+        if (supportsPopover) {
+          try { toast.showPopover(); } catch (_) {}
+        }
+        announceStatus(message);
+
+        const scheduleHide = function () {
+          if (activeToastTimer) clearTimeout(activeToastTimer);
+          activeToastTimer = setTimeout(function () {
+            if (toast.contains(document.activeElement)) {
+              scheduleHide();
+              return;
+            }
+            dismissActiveToast();
+          }, 4200);
+        };
+        toast.addEventListener('mouseenter', function () {
+          if (activeToastTimer) clearTimeout(activeToastTimer);
+        });
+        toast.addEventListener('mouseleave', scheduleHide);
+        toast.addEventListener('focusin', function () {
+          if (activeToastTimer) clearTimeout(activeToastTimer);
+        });
+        toast.addEventListener('focusout', scheduleHide);
+        scheduleHide();
+      }
+
+      function showBanner(kind, message) {
+        if (kind === 'ok') {
+          bannerEl.hidden = true;
+          showToast('ok', message);
+          return;
+        }
+        bannerEl.className = 'status-banner ' + kind;
+        bannerText.textContent = message;
+        bannerEl.hidden = false;
+      }
+
+      bannerClose.addEventListener('click', function () {
+        bannerEl.hidden = true;
+      });
+
+      /* ---------- Views & Filters ---------- */
       function switchView(target) {
         const isAccts = target === 'accounts';
         tabBtnAccounts.setAttribute('aria-selected', isAccts ? 'true' : 'false');
         tabBtnConfig.setAttribute('aria-selected', isAccts ? 'false' : 'true');
         viewAccounts.hidden = !isAccts;
         viewConfig.hidden = isAccts;
+        closeActionPopover();
       }
 
       tabBtnAccounts.addEventListener('click', function () { switchView('accounts'); });
@@ -1678,58 +2747,71 @@
         });
       });
 
-      function showBanner(kind, message) {
-        bannerEl.className = 'status-banner ' + kind;
-        bannerText.textContent = message;
-        bannerEl.hidden = false;
-      }
-
-      bannerClose.addEventListener('click', function () {
-        bannerEl.hidden = true;
-      });
-
+      /* ---------- Auth & Modals ---------- */
       function getToken() {
         return sessionStorage.getItem(TOKEN_KEY) || '';
       }
 
+      function resetImportModalState() {
+        document.getElementById('inp-helper-token').value = '';
+        document.getElementById('helper-pairing-error').textContent = '';
+        document.getElementById('helper-pairing').hidden = true;
+        desktopLoginError.hidden = true;
+        desktopLoginError.textContent = '';
+        importInlineError.hidden = true;
+        importInlineError.textContent = '';
+      }
+
       function openImportModal() {
-        importModal.hidden = false;
-        document.getElementById('inp-acct-cookie').focus();
+        dismissActiveToast();
+        resetImportModalState();
+        if (!importModal.open) {
+          importModal.showModal();
+        }
       }
 
       function closeImportModal() {
-        importModal.hidden = true;
+        if (importModal.open) {
+          importModal.close();
+        }
+        resetImportModalState();
       }
+
+      importModal.addEventListener('close', function () {
+        importModal.returnValue = '';
+        resetImportModalState();
+      });
 
       btnOpenImport.addEventListener('click', openImportModal);
       document.getElementById('btn-import-close').addEventListener('click', closeImportModal);
       document.getElementById('btn-import-cancel').addEventListener('click', closeImportModal);
 
       function openAuthModal(message) {
+        dismissActiveToast();
         if (message) {
           document.getElementById('auth-modal-desc').textContent = message;
         }
         inpAdminToken.value = getToken();
-        authModal.hidden = false;
+        if (!authModal.open) {
+          authModal.showModal();
+        }
         inpAdminToken.focus();
       }
 
       function closeAuthModal() {
-        authModal.hidden = true;
+        if (authModal.open) {
+          authModal.close();
+        }
       }
+
+      authModal.addEventListener('close', function () {
+        authModal.returnValue = '';
+      });
 
       btnAuthModal.addEventListener('click', function () {
         openAuthModal('Enter BRIDGE_ADMIN_KEY or BRIDGE_API_KEY to authenticate requests.');
       });
       document.getElementById('btn-auth-cancel').addEventListener('click', closeAuthModal);
-
-      document.addEventListener('keydown', function (ev) {
-        if (ev.key === 'Escape') {
-          if (!importModal.hidden) closeImportModal();
-          if (!authModal.hidden) closeAuthModal();
-          closeActionPopover();
-        }
-      });
 
       formAuth.addEventListener('submit', function (ev) {
         ev.preventDefault();
@@ -1738,8 +2820,33 @@
         loadAll(false);
       });
 
+      /* ---------- Desktop Pairing ---------- */
+      btnDesktopConnect.addEventListener('click', async function () {
+        const code = Array.from(crypto.getRandomValues(new Uint8Array(8)), function (x) { return x % 10; }).join('');
+        btnDesktopConnect.disabled = true;
+        desktopConnectStatus.textContent = 'Approve only if the desktop dialog shows this code: ' + code;
+        try {
+          const res = await fetch('/desktop/pair', { method: 'POST', body: code, redirect: 'error', cache: 'no-store' });
+          const data = await res.json();
+          if (!res.ok || !data.key) throw new Error((data.error && data.error.message) || 'Desktop approval failed.');
+          sessionStorage.setItem(DESKTOP_KEY, data.key);
+          desktopConnect.hidden = true;
+          bannerEl.hidden = true;
+          await loadAll(false);
+        } catch (err) {
+          desktopConnectStatus.textContent = err.message;
+        } finally {
+          btnDesktopConnect.disabled = false;
+        }
+      });
+
+      /* ---------- API Client ---------- */
       async function apiRequest(path, options) {
         const opts = Object.assign({ method: 'GET', headers: {} }, options || {});
+        if (desktopUI) {
+          const desktopKey = sessionStorage.getItem(DESKTOP_KEY);
+          if (desktopKey) opts.headers['X-GSB-Desktop-Key'] = desktopKey;
+        }
         const tok = getToken();
         if (tok) {
           opts.headers['Authorization'] = 'Bearer ' + tok;
@@ -1756,16 +2863,34 @@
         } catch (_) {}
         if (res.status === 401) {
           const msg = (data.error && data.error.message) || 'Authentication required for this daemon.';
+          if (desktopUI && res.headers.get('X-GSB-Desktop-Connect') === 'required') {
+            sessionStorage.removeItem(DESKTOP_KEY);
+            desktopConnectStatus.textContent = 'Approve this browser once to manage your bridge.';
+            desktopConnect.hidden = false;
+            throw new Error(msg);
+          }
           openAuthModal(msg);
           throw new Error(msg);
         }
         if (!res.ok) {
           const errMsg = (data.error && data.error.message) || ('HTTP ' + res.status);
+          if (res.status === 429 && data.error && data.error.code === 'rate_limit_error' &&
+              (path === '/v1/admin/accounts/import' || path === '/v1/admin/accounts/browser-login')) {
+            const retryAfter = (res.headers.get('Retry-After') || '').trim();
+            const seconds = /^\d+$/.test(retryAfter)
+              ? Number(retryAfter)
+              : Math.ceil((Date.parse(retryAfter) - Date.now()) / 1000);
+            const wait = Number.isFinite(seconds) && seconds > 0
+              ? 'Wait at least ' + seconds + ' seconds before trying again.'
+              : 'Wait for the upstream cooldown before trying again.';
+            throw new Error(errMsg + '. Account was not saved. ' + wait);
+          }
           throw new Error(errMsg);
         }
         return data;
       }
 
+      /* ---------- Formatting & Status Helpers ---------- */
       function formatDuration(sec) {
         const s = Math.max(0, Number(sec) || 0);
         const h = Math.floor(s / 3600);
@@ -1804,8 +2929,9 @@
       }
 
       function humanizeStatusReason(status, rawReason) {
+        // Silence on healthy rows keeps errors & resets instantly scannable
         if (!rawReason) {
-          return status === 'ok' ? 'Session verified' : '';
+          return '';
         }
         const m = rawReason.match(/quota spent until\s+(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/i);
         if (m) {
@@ -1819,21 +2945,21 @@
       function statusBadgeInfo(status) {
         switch (status) {
           case 'ok':
-            return { label: 'Ready', cls: 'badge badge-ok' };
+            return { label: 'Ready', cls: 'status-pill status-ok' };
           case 'disabled':
-            return { label: 'Paused', cls: 'badge badge-warn' };
+            return { label: 'Paused', cls: 'status-pill status-warn' };
           case 'exhausted':
-            return { label: 'Exhausted', cls: 'badge badge-warn' };
+            return { label: 'Exhausted', cls: 'status-pill status-warn' };
           case 'cooling':
-            return { label: 'Cooling', cls: 'badge badge-warn' };
+            return { label: 'Cooling', cls: 'status-pill status-warn' };
           case 'degraded':
-            return { label: 'Degraded', cls: 'badge badge-warn' };
+            return { label: 'Degraded', cls: 'status-pill status-warn' };
           case 'quarantined':
-            return { label: 'Quarantined', cls: 'badge badge-err' };
+            return { label: 'Quarantined', cls: 'status-pill status-err' };
           case 'expired':
-            return { label: 'Expired', cls: 'badge badge-err' };
+            return { label: 'Expired', cls: 'status-pill status-err' };
           default:
-            return { label: 'Unprobed', cls: 'badge badge-warn' };
+            return { label: 'Unprobed', cls: 'status-pill status-warn' };
         }
       }
 
@@ -1861,7 +2987,7 @@
         return { q5h: q5h, qWeekly: qWeekly };
       }
 
-      function buildSingleQuotaBar(title, remaining, total, rightNote, stateKind) {
+      function buildSingleQuotaBar(tag, remaining, total, rightNote, stateKind) {
         const item = document.createElement('div');
         item.className = 'quota-item';
 
@@ -1870,15 +2996,18 @@
 
         const credits = document.createElement('span');
         credits.className = 'quota-credits';
-        const lblPart = document.createElement('span');
-        lblPart.textContent = title + ': ';
-        const strongPart = document.createElement('strong');
-        strongPart.textContent = remaining != null ? Number(remaining).toLocaleString() : '—';
-        const subPart = document.createElement('span');
-        subPart.textContent = ' / ' + Number(total).toLocaleString();
-        credits.appendChild(lblPart);
-        credits.appendChild(strongPart);
-        credits.appendChild(subPart);
+        const tagPart = document.createElement('span');
+        tagPart.className = 'quota-window-tag';
+        tagPart.textContent = tag;
+        const remPart = document.createElement('span');
+        remPart.className = 'quota-rem';
+        remPart.textContent = remaining != null ? Number(remaining).toLocaleString() : '—';
+        const totPart = document.createElement('span');
+        totPart.className = 'quota-tot';
+        totPart.textContent = '/ ' + Number(total).toLocaleString();
+        credits.appendChild(tagPart);
+        credits.appendChild(remPart);
+        credits.appendChild(totPart);
 
         const resetSpan = document.createElement('span');
         resetSpan.className = 'quota-reset';
@@ -1889,12 +3018,12 @@
         item.appendChild(top);
 
         const track = document.createElement('div');
-        track.className = 'quota-bar-bg';
+        track.className = 'quota-bar-track';
         const fill = document.createElement('div');
-        const pct = (remaining != null && total > 0) ? Math.max(0, Math.min(100, Math.round((remaining / total) * 100))) : 0;
-        const visualPct = (remaining != null && remaining > 0) ? Math.max(5, pct) : 0;
+        const rawRatio = (remaining != null && total > 0) ? Math.max(0, Math.min(1, remaining / total)) : 0;
+        const visualRatio = (remaining != null && remaining > 0) ? Math.max(0.03, rawRatio) : 0;
         fill.className = 'quota-bar-fill' + (stateKind ? (' ' + stateKind) : '');
-        fill.style.width = visualPct + '%';
+        fill.style.setProperty('--ratio', String(visualRatio));
         track.appendChild(fill);
         item.appendChild(track);
         return item;
@@ -1907,12 +3036,11 @@
         if (!pair.q5h && !pair.qWeekly) {
           const span = document.createElement('span');
           span.className = 'helper';
-          span.textContent = 'Not checked yet. Click Refresh to load quota.';
+          span.textContent = 'Not checked yet — click Refresh.';
           wrap.appendChild(span);
           return wrap;
         }
 
-        // Bar 1 (Top): 5h Window (2,400 max)
         if (pair.q5h) {
           const rem5 = pair.q5h.remaining;
           const tot5 = pair.q5h.total || 2400;
@@ -1921,21 +3049,60 @@
           wrap.appendChild(buildSingleQuotaBar('5h', rem5, tot5, note5, kind5));
         }
 
-        // Bar 2 (Bottom): Weekly Pool (48,384 max)
         if (pair.qWeekly) {
           const remW = pair.qWeekly.remaining;
           const totW = pair.qWeekly.total || 48384;
           const kindW = remW === 0 ? 'err' : (remW < 1000 ? 'warn' : '');
           const relW = pair.qWeekly.resetAt ? formatRelativeTime(pair.qWeekly.resetAt) : '';
           const dateW = pair.qWeekly.resetAt ? formatResetDateShort(pair.qWeekly.resetAt) : '';
-          const noteW = (dateW && relW) ? (dateW + ' (' + relW + ')') : (relW || '7d window');
-          wrap.appendChild(buildSingleQuotaBar('Weekly', remW, totW, noteW, kindW));
+          const noteW = (dateW && relW) ? (dateW + ' · ' + relW) : (relW || '7d window');
+          wrap.appendChild(buildSingleQuotaBar('7d', remW, totW, noteW, kindW));
         } else {
-          wrap.appendChild(buildSingleQuotaBar('Weekly', null, 48384, '7d window', ''));
+          wrap.appendChild(buildSingleQuotaBar('7d', null, 48384, '7d window', ''));
         }
         return wrap;
       }
 
+      /* ---------- Inline Copy Affordance (Zero Layout Shift) ---------- */
+      const SVG_COPY = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+      const SVG_CHECK = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+
+      function flashCopied(el) {
+        if (!el) return;
+        if (el._copyTimer) clearTimeout(el._copyTimer);
+        el.setAttribute('data-copied', '1');
+        const iconSlot = el.querySelector('.readout-copy-icon');
+        if (iconSlot) iconSlot.innerHTML = SVG_CHECK;
+        el._copyTimer = setTimeout(function () {
+          el.removeAttribute('data-copied');
+          if (iconSlot) iconSlot.innerHTML = SVG_COPY;
+          el._copyTimer = null;
+        }, 1500);
+      }
+
+      function copyToClipboard(text, triggerEl, announceMsg) {
+        const done = function () {
+          flashCopied(triggerEl);
+          announceStatus(announceMsg || ('Copied ' + text));
+          if (!triggerEl) showToast('ok', announceMsg || ('Copied "' + text + '" to clipboard.'));
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(function () {
+            showToast('ok', text);
+          });
+        } else {
+          showToast('ok', text);
+        }
+      }
+
+      document.querySelectorAll('[data-copy-id]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const target = document.getElementById(btn.getAttribute('data-copy-id'));
+          if (target) copyToClipboard(target.textContent, btn, 'Copied ' + target.textContent);
+        });
+      });
+
+      /* ---------- Accounts Rendering ---------- */
       function updateFilterCounts(accounts) {
         const list = Array.isArray(accounts) ? accounts : [];
         let okCnt = 0;
@@ -1966,20 +3133,21 @@
         closeActionPopover();
         updateFilterCounts(accounts);
         tbodyEl.textContent = '';
+
         if (!Array.isArray(accounts) || accounts.length === 0) {
           tableWrap.hidden = true;
           stateEl.hidden = false;
-          stateEl.innerHTML = '';
+          stateEl.textContent = '';
           const title = document.createElement('strong');
-          title.textContent = 'No Google accounts loaded in the pool yet.';
+          title.textContent = 'No Google accounts in the pool yet';
           const sub = document.createElement('span');
-          sub.textContent = 'Add a Google Gemini account via isolated browser sign-in, Incognito cookie paste, or local browser profile import.';
+          sub.textContent = 'Add a Gemini account via isolated browser sign-in, Incognito cookie paste, or local browser profile import.';
           const ctaWrap = document.createElement('div');
-          ctaWrap.style.marginTop = '14px';
+          ctaWrap.style.marginTop = '10px';
           const ctaBtn = document.createElement('button');
           ctaBtn.type = 'button';
           ctaBtn.className = 'btn btn-primary';
-          ctaBtn.textContent = '+ Add First Google Account';
+          ctaBtn.textContent = '+ Add First Account';
           ctaBtn.addEventListener('click', openImportModal);
           ctaWrap.appendChild(ctaBtn);
           stateEl.appendChild(title);
@@ -1992,11 +3160,11 @@
         if (filtered.length === 0) {
           tableWrap.hidden = true;
           stateEl.hidden = false;
-          stateEl.innerHTML = '';
+          stateEl.textContent = '';
           const title = document.createElement('strong');
-          title.textContent = 'No accounts match the selected filter (' + currentFilter + ').';
+          title.textContent = 'No accounts match "' + currentFilter + '"';
           const sub = document.createElement('span');
-          sub.textContent = 'Select "All" above to view all ' + accounts.length + ' loaded accounts.';
+          sub.textContent = 'Switch back to All to inspect all ' + accounts.length + ' loaded account(s).';
           stateEl.appendChild(title);
           stateEl.appendChild(sub);
           return;
@@ -2006,52 +3174,75 @@
         tableWrap.hidden = false;
 
         filtered.forEach(function (acct, idx) {
+          const isTurn = Boolean(currentRotateCursor && currentRotateCursor === acct.id);
           const tr = document.createElement('tr');
+          if (isTurn) tr.className = 'is-active-turn';
 
-          // 1. Account
-          const tdId = document.createElement('td');
-          tdId.setAttribute('data-label', 'Account');
-          const idLine = document.createElement('div');
-          idLine.className = 'acct-id-line mono';
+          // 1. Account (Row Header <th scope="row">)
+          const thId = document.createElement('th');
+          thId.scope = 'row';
+          thId.className = 'acct-cell';
+
+          const primaryLine = document.createElement('div');
+          primaryLine.className = 'acct-primary-line';
+
+          const rank = document.createElement('span');
+          rank.className = 'acct-rank';
+          rank.textContent = String(idx + 1).padStart(2, '0');
+          primaryLine.appendChild(rank);
+
           const idSpan = document.createElement('span');
-          idSpan.textContent = (idx + 1) + '. ' + acct.id;
-          idLine.appendChild(idSpan);
-          if (currentRotateCursor && currentRotateCursor === acct.id) {
-            const cur = document.createElement('span');
-            cur.className = 'cursor-badge';
-            cur.textContent = 'Current Turn';
-            cur.title = 'Sticky rotation cursor: pool traffic currently routes to this account until its 5h quota window is exhausted, then rotates to the next Ready account.';
-            idLine.appendChild(cur);
-          }
-          tdId.appendChild(idLine);
+          idSpan.className = 'acct-id';
+          idSpan.textContent = acct.id;
+          primaryLine.appendChild(idSpan);
 
-          const emailDiv = document.createElement('div');
-          emailDiv.className = 'acct-email mono';
-          emailDiv.title = acct.email || '';
-          emailDiv.textContent = acct.email || 'unverified email';
-          tdId.appendChild(emailDiv);
+          if (isTurn) {
+            const cur = document.createElement('span');
+            cur.className = 'turn-badge';
+            cur.title = 'Sticky rotation cursor: pool traffic routes here until its 5h quota window is exhausted.';
+            const curDot = document.createElement('span');
+            curDot.className = 'turn-dot';
+            curDot.setAttribute('aria-hidden', 'true');
+            cur.appendChild(curDot);
+            cur.appendChild(document.createTextNode('Active Turn'));
+            primaryLine.appendChild(cur);
+          }
+          thId.appendChild(primaryLine);
+
+          const subLine = document.createElement('div');
+          subLine.className = 'acct-sub-line';
+
+          const emailSpan = document.createElement('span');
+          emailSpan.className = 'acct-email';
+          emailSpan.title = acct.email || '';
+          emailSpan.textContent = acct.email || 'unverified email';
+          subLine.appendChild(emailSpan);
 
           const keyBtn = document.createElement('button');
           keyBtn.type = 'button';
-          keyBtn.className = 'copy-chip mono';
-          keyBtn.style.marginTop = '5px';
-          keyBtn.innerHTML = '<span>Key:</span> <span class="chip-val">gsb-' + acct.id + '</span>';
-          keyBtn.title = 'Click to copy dedicated API key for ' + acct.id;
+          keyBtn.className = 'acct-key-btn';
+          keyBtn.title = 'Copy dedicated key gsb-' + acct.id + ' (pins traffic to this account, no failover)';
+          keyBtn.innerHTML = '<span>gsb-' + escapeHTML(acct.id) + '</span><span class="readout-copy-icon" aria-hidden="true">' + SVG_COPY + '</span>';
           keyBtn.addEventListener('click', function () {
-            copyToClipboard('gsb-' + acct.id, 'Copied individual API key "gsb-' + acct.id + '" (use with Base URL ' + document.getElementById('conn-base-url').textContent + ').');
+            copyToClipboard('gsb-' + acct.id, keyBtn, 'Copied dedicated key gsb-' + acct.id);
           });
-          tdId.appendChild(keyBtn);
-          tr.appendChild(tdId);
+          subLine.appendChild(keyBtn);
+
+          thId.appendChild(subLine);
+          tr.appendChild(thId);
 
           // 2. Status
           const tdStatus = document.createElement('td');
-          tdStatus.setAttribute('data-label', 'Status');
           const stWrap = document.createElement('div');
           stWrap.className = 'status-cell';
           const bInfo = statusBadgeInfo(acct.status);
           const badge = document.createElement('span');
           badge.className = bInfo.cls;
-          badge.textContent = bInfo.label;
+          const dot = document.createElement('span');
+          dot.className = 'status-dot';
+          dot.setAttribute('aria-hidden', 'true');
+          badge.appendChild(dot);
+          badge.appendChild(document.createTextNode(bInfo.label));
           stWrap.appendChild(badge);
 
           const noteText = humanizeStatusReason(acct.status, acct.statusReason);
@@ -2067,48 +3258,50 @@
           // 3. Active Quota Window (5h / Weekly)
           const tdQuota = document.createElement('td');
           tdQuota.className = 'col-quota';
-          tdQuota.setAttribute('data-label', 'Active Quota Window');
           tdQuota.appendChild(renderQuotaCell(acct.quota));
           tr.appendChild(tdQuota);
 
-          // 4. Compact Order & Three-Dots Menu
+          // 4. Compact Order & Action Panel
           const tdAct = document.createElement('td');
-          tdAct.setAttribute('data-label', 'Actions');
           tdAct.className = 'actions-cell';
           const actRow = document.createElement('div');
           actRow.className = 'row-actions';
 
+          const orderGrp = document.createElement('div');
+          orderGrp.className = 'order-group';
+
           const btnUp = document.createElement('button');
           btnUp.type = 'button';
-          btnUp.className = 'btn-icon mono';
-          btnUp.textContent = '↑';
-          btnUp.title = 'Move account higher in priority order';
+          btnUp.className = 'btn-row-icon';
+          btnUp.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>';
+          btnUp.title = 'Move account up in priority order';
           btnUp.setAttribute('aria-label', 'Move ' + acct.id + ' up');
           btnUp.disabled = idx === 0;
           btnUp.addEventListener('click', function () {
             moveAccount(acct.id, 'up', btnUp);
           });
-          actRow.appendChild(btnUp);
+          orderGrp.appendChild(btnUp);
 
           const btnDown = document.createElement('button');
           btnDown.type = 'button';
-          btnDown.className = 'btn-icon mono';
-          btnDown.textContent = '↓';
-          btnDown.title = 'Move account lower in priority order';
+          btnDown.className = 'btn-row-icon';
+          btnDown.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
+          btnDown.title = 'Move account down in priority order';
           btnDown.setAttribute('aria-label', 'Move ' + acct.id + ' down');
           btnDown.disabled = idx === filtered.length - 1;
           btnDown.addEventListener('click', function () {
             moveAccount(acct.id, 'down', btnDown);
           });
-          actRow.appendChild(btnDown);
+          orderGrp.appendChild(btnDown);
+
+          actRow.appendChild(orderGrp);
 
           const btnMore = document.createElement('button');
           btnMore.type = 'button';
-          btnMore.className = 'btn-icon mono';
-          btnMore.textContent = '⋯';
-          btnMore.title = 'Account actions for ' + acct.id;
+          btnMore.className = 'btn-row-icon';
+          btnMore.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>';
+          btnMore.title = 'More actions for ' + acct.id;
           btnMore.setAttribute('aria-label', 'Actions for ' + acct.id);
-          btnMore.setAttribute('aria-haspopup', 'menu');
           btnMore.setAttribute('aria-expanded', 'false');
           btnMore.addEventListener('click', function (ev) {
             ev.stopPropagation();
@@ -2122,79 +3315,185 @@
         });
       }
 
-      function copyToClipboard(text, msg) {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(function () {
-            showBanner('ok', msg || ('Copied "' + text + '" to clipboard.'));
-          }).catch(function () {
-            showBanner('ok', text);
+      function escapeHTML(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function renderLiveModels(models) {
+        const list = Array.isArray(models) ? models : [];
+        const hiddenEl = document.getElementById('conn-models');
+        if (hiddenEl) {
+          hiddenEl.textContent = list.length ? list.join(', ') : 'no models loaded yet';
+        }
+        const wrap = document.getElementById('conn-models-list');
+        wrap.textContent = '';
+        if (!list.length) {
+          const empty = document.createElement('span');
+          empty.className = 'helper';
+          empty.textContent = 'no models loaded yet';
+          wrap.appendChild(empty);
+          return;
+        }
+        list.forEach(function (modelId) {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'model-chip';
+          chip.title = 'Click to copy model ID "' + modelId + '"';
+          chip.textContent = modelId;
+          chip.addEventListener('click', function () {
+            copyToClipboard(modelId, chip, 'Copied model ' + modelId);
           });
-        } else {
-          showBanner('ok', text);
+          wrap.appendChild(chip);
+        });
+      }
+      function getPriorityList() {
+        return Array.from(document.querySelectorAll('#cfg-priority-list [data-account-id]')).map(function (el) {
+          return el.getAttribute('data-account-id');
+        });
+      }
+
+      function renderPriorityList(ids) {
+        const list = document.getElementById('cfg-priority-list');
+        if (!list) return;
+        list.textContent = '';
+        (Array.isArray(ids) ? ids : []).forEach(function (id, index, all) {
+          const row = document.createElement('div');
+          row.className = 'priority-item';
+          row.draggable = true;
+          row.setAttribute('role', 'option');
+          row.setAttribute('data-account-id', id);
+          row.setAttribute('aria-label', id + ', priority ' + (index + 1));
+          row.addEventListener('dragstart', function () { list._dragged = row; row.classList.add('is-dragged'); });
+          row.addEventListener('dragend', function () { row.classList.remove('is-dragged'); list._dragged = null; });
+          row.addEventListener('dragover', function (ev) {
+            ev.preventDefault();
+            const dragged = list._dragged;
+            if (dragged && dragged !== row) list.insertBefore(dragged, row);
+          });
+          const grip = document.createElement('span');
+          grip.className = 'priority-grip';
+          grip.textContent = '⋮⋮';
+          grip.setAttribute('aria-hidden', 'true');
+          row.appendChild(grip);
+          const label = document.createElement('span');
+          label.className = 'priority-id mono';
+          label.textContent = id;
+          row.appendChild(label);
+          const controls = document.createElement('span');
+          controls.className = 'priority-controls';
+          [['↑', -1, 'Move up'], ['↓', 1, 'Move down']].forEach(function (entry) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'btn-row-icon';
+            button.textContent = entry[0];
+            button.title = entry[2] + ' ' + id;
+            button.setAttribute('aria-label', entry[2] + ' ' + id);
+            button.disabled = index + entry[1] < 0 || index + entry[1] >= all.length;
+            button.addEventListener('click', function () {
+              const target = list.children[index + entry[1]];
+              if (target) list.insertBefore(row, entry[1] < 0 ? target : target.nextSibling);
+              updateConfigDirtyState();
+            });
+            controls.appendChild(button);
+          });
+          row.appendChild(controls);
+          list.appendChild(row);
+        });
+      }
+
+
+      /* ---------- Config Population & Dirty Tracking ---------- */
+      function serializeConfigForm() {
+        return JSON.stringify({
+          defaultThinking: document.getElementById('cfg-thinking').value,
+          accountStrategy: document.getElementById('cfg-strategy').value,
+          quotaPreflight: document.getElementById('cfg-preflight').value,
+          accountPriority: getPriorityList(),
+          maxRpmPerAccount: Number(document.getElementById('cfg-max-rpm').value),
+          maxConcurrentPerAccount: Number(document.getElementById('cfg-max-conc').value),
+          rejectDowngrade: document.getElementById('cfg-reject-downgrade').checked,
+          rejectLabelMismatch: document.getElementById('cfg-reject-label-mismatch').checked,
+          liveThoughts: document.getElementById('cfg-live-thoughts').checked,
+          liveToolCalls: document.getElementById('cfg-live-tools').checked,
+          keepToolPreamble: document.getElementById('cfg-tool-preamble').checked,
+          historyOffload: document.getElementById('cfg-history-offload').checked
+        });
+      }
+
+      function updateConfigDirtyState() {
+        if (!lastConfigSnapshot) return;
+        cfgDirtyBadge.hidden = (serializeConfigForm() === lastConfigSnapshot);
+      }
+
+      formConfig.addEventListener('input', updateConfigDirtyState);
+      formConfig.addEventListener('change', updateConfigDirtyState);
+
+      function humanizeConfigSource(source) {
+        switch (source) {
+          case 'file': return {label: 'Saved', title: 'Saved in config file'};
+          case 'env': return {label: 'Env', title: 'Set by environment variable'};
+          case 'runtime': return {label: 'Runtime', title: 'Runtime override'};
+          default: return {label: 'Default', title: 'Built-in default'};
         }
       }
 
-      document.querySelectorAll('[data-copy-id]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          const target = document.getElementById(btn.getAttribute('data-copy-id'));
-          if (target) copyToClipboard(target.textContent, 'Copied "' + target.textContent + '" to clipboard.');
-        });
-      });
-
-      document.querySelectorAll('[data-copy-text]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          const txt = btn.getAttribute('data-copy-text');
-          if (txt) copyToClipboard(txt, 'Copied "' + txt + '" to clipboard.');
-        });
-      });
-
       function populateConfigForm(adm) {
         currentRotateCursor = adm.rotateCursor || '';
-        hdrMeta.textContent = 'v' + (adm.version || '0.3.0') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
+        hdrMeta.textContent = 'v' + (adm.version || '0.4.4') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
         document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
-        document.getElementById('conn-base-url').textContent = window.location.origin + '/v1';
+        document.getElementById('conn-base-url').textContent = clientOrigin + '/v1';
         document.getElementById('conn-pool-key').textContent = adm.poolKey || 'gsb-pool';
-        // Filled from the live registry, never from a written-out list: a rename
-        // upstream must not leave a stale model id in the copy chip.
-        const liveModels = Array.isArray(adm.models) ? adm.models : [];
-        const modelsChip = document.getElementById('conn-models');
-        if (modelsChip) {
-          modelsChip.textContent = liveModels.length ? liveModels.join(', ') : 'no models loaded yet';
-        }
-        document.getElementById('conn-mcp-url').textContent = window.location.origin + '/mcp';
+        renderLiveModels(adm.models);
+        document.getElementById('conn-mcp-url').textContent = clientOrigin + '/mcp';
         document.getElementById('conn-mcp-key').textContent = adm.poolKey || 'gsb-pool';
         btnAuthModal.hidden = (adm.authMode === 'local_public');
+
         const cfg = adm.config || {};
         const metrics = adm.metrics || {};
         document.getElementById('stat-strategy').textContent = cfg.accountStrategy || 'rotate';
         document.getElementById('stat-cursor').textContent = currentRotateCursor || 'auto';
         document.getElementById('stat-sessions').textContent = String(metrics.activeSessions || 0);
         document.getElementById('stat-cache').textContent = (metrics.cacheHits || 0) + ' / ' + (metrics.cacheMisses || 0);
+
         document.getElementById('cfg-thinking').value = cfg.defaultThinking || 'low';
         document.getElementById('cfg-strategy').value = cfg.accountStrategy || 'rotate';
         document.getElementById('cfg-preflight').value = cfg.quotaPreflight || 'strict';
-        document.getElementById('cfg-priority').value = Array.isArray(cfg.accountPriority) ? cfg.accountPriority.join(',') : '';
+        renderPriorityList(Array.isArray(cfg.accountPriority) ? cfg.accountPriority : []);
         document.getElementById('cfg-max-rpm').value = cfg.maxRpmPerAccount != null ? cfg.maxRpmPerAccount : 24;
         document.getElementById('cfg-max-conc').value = cfg.maxConcurrentPerAccount != null ? cfg.maxConcurrentPerAccount : 2;
 
         document.getElementById('cfg-reject-downgrade').checked = Boolean(cfg.rejectDowngrade);
+        document.getElementById('cfg-reject-label-mismatch').checked = Boolean(cfg.rejectLabelMismatch);
         document.getElementById('cfg-live-thoughts').checked = Boolean(cfg.liveThoughts);
         document.getElementById('cfg-live-tools').checked = Boolean(cfg.liveToolCalls);
         document.getElementById('cfg-tool-preamble').checked = Boolean(cfg.keepToolPreamble);
         document.getElementById('cfg-history-offload').checked = Boolean(cfg.historyOffload);
 
         const sources = adm.sources || {};
-        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount'].forEach(function (k) {
+        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount', 'rejectDowngrade', 'rejectLabelMismatch', 'liveThoughts', 'liveToolCalls', 'keepToolPreamble', 'historyOffload'].forEach(function (k) {
           const el = document.getElementById('src-' + k);
-          if (el) el.textContent = sources[k] || 'default';
+          if (el) {
+            const sourceInfo = humanizeConfigSource(sources[k]);
+            el.textContent = sourceInfo.label;
+            el.title = sourceInfo.title;
+            el.setAttribute('aria-label', sourceInfo.title);
+          }
         });
+
+        lastConfigSnapshot = serializeConfigForm();
+        cfgDirtyBadge.hidden = true;
       }
 
       async function loadAll(live) {
         try {
           if (live) {
             btnRefreshLive.disabled = true;
-            btnRefreshLive.textContent = 'Refreshing...';
+            lblRefreshLive.textContent = 'Refreshing…';
+            iconRefresh.classList.add('is-spinning');
           }
           const adm = await apiRequest('/v1/admin/config');
           populateConfigForm(adm);
@@ -2207,9 +3506,9 @@
         } catch (err) {
           tableWrap.hidden = true;
           stateEl.hidden = false;
-          stateEl.innerHTML = '';
+          stateEl.textContent = '';
           const title = document.createElement('strong');
-          title.textContent = 'Unable to load control plane state.';
+          title.textContent = 'Unable to load control plane state';
           const sub = document.createElement('span');
           sub.textContent = err.message;
           stateEl.appendChild(title);
@@ -2217,7 +3516,8 @@
           showBanner('err', err.message);
         } finally {
           btnRefreshLive.disabled = false;
-          btnRefreshLive.textContent = 'Refresh All';
+          lblRefreshLive.textContent = 'Refresh';
+          iconRefresh.classList.remove('is-spinning');
         }
       }
 
@@ -2235,30 +3535,76 @@
         }
       }
 
-      const actionPopover = document.getElementById('action-popover');
+      /* ---------- Row Action Popover (Native Popover + Progressive Anchor Positioning) ---------- */
       let activePopoverBtn = null;
       let activePopoverAcctId = '';
 
-      function closeActionPopover() {
-        if (actionPopover) actionPopover.hidden = true;
+      function isPopoverOpen() {
+        if (supportsPopover) {
+          return actionPopover.matches(':popover-open');
+        }
+        return !actionPopover.hidden;
+      }
+
+      function clearAnchorOnBtn() {
         if (activePopoverBtn) {
+          activePopoverBtn.style.removeProperty('anchor-name');
           activePopoverBtn.setAttribute('aria-expanded', 'false');
           activePopoverBtn = null;
         }
         activePopoverAcctId = '';
       }
 
-      document.addEventListener('click', function (ev) {
-        if (!actionPopover.hidden && !actionPopover.contains(ev.target)) {
-          closeActionPopover();
+      function closeActionPopover() {
+        if (supportsPopover) {
+          if (actionPopover.matches(':popover-open')) {
+            try { actionPopover.hidePopover(); } catch (_) {}
+          }
+        } else {
+          actionPopover.hidden = true;
         }
-      });
+        clearAnchorOnBtn();
+      }
 
-      window.addEventListener('scroll', closeActionPopover, true);
-      window.addEventListener('resize', closeActionPopover);
+      if (supportsPopover) {
+        actionPopover.addEventListener('toggle', function (ev) {
+          if (ev.newState === 'closed') {
+            clearAnchorOnBtn();
+          }
+        });
+      } else {
+        document.addEventListener('click', function (ev) {
+          if (!actionPopover.hidden && !actionPopover.contains(ev.target)) {
+            closeActionPopover();
+          }
+        });
+        document.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Escape' && !actionPopover.hidden) {
+            closeActionPopover();
+          }
+        });
+      }
+
+      if (!supportsAnchorPositioning) {
+        window.addEventListener('scroll', closeActionPopover, true);
+        window.addEventListener('resize', closeActionPopover);
+      }
+
+      function positionPopoverFallback(btn) {
+        const rect = btn.getBoundingClientRect();
+        const popRect = actionPopover.getBoundingClientRect();
+        let top = rect.bottom + 6;
+        if (top + popRect.height > window.innerHeight - 12) {
+          top = Math.max(12, rect.top - popRect.height - 6);
+        }
+        let left = rect.right - popRect.width;
+        if (left < 12) left = 12;
+        actionPopover.style.top = top + 'px';
+        actionPopover.style.left = left + 'px';
+      }
 
       function toggleActionPopover(acct, btn) {
-        if (!actionPopover.hidden && activePopoverAcctId === acct.id) {
+        if (isPopoverOpen() && activePopoverAcctId === acct.id) {
           closeActionPopover();
           return;
         }
@@ -2266,18 +3612,20 @@
         activePopoverBtn = btn;
         activePopoverAcctId = acct.id;
         btn.setAttribute('aria-expanded', 'true');
+        if (supportsAnchorPositioning) {
+          btn.style.setProperty('anchor-name', '--gsb-row-action');
+        }
 
         actionPopover.textContent = '';
 
         const meta = document.createElement('div');
-        meta.className = 'popover-meta mono';
+        meta.className = 'popover-meta';
         meta.textContent = acct.id + ' · ' + (acct.totalRequests || 0) + ' reqs · rot ' + formatRelativeTime(acct.rotatedAt);
         actionPopover.appendChild(meta);
 
         const itemProbe = document.createElement('button');
         itemProbe.type = 'button';
         itemProbe.className = 'menu-item';
-        itemProbe.setAttribute('role', 'menuitem');
         itemProbe.textContent = 'Refresh Quota & Session';
         itemProbe.addEventListener('click', function () {
           closeActionPopover();
@@ -2288,7 +3636,6 @@
         const itemToggle = document.createElement('button');
         itemToggle.type = 'button';
         itemToggle.className = 'menu-item';
-        itemToggle.setAttribute('role', 'menuitem');
         itemToggle.textContent = acct.disabled ? 'Resume Account in Pool' : 'Pause Account in Pool';
         itemToggle.addEventListener('click', function () {
           closeActionPopover();
@@ -2299,11 +3646,10 @@
         const itemCopy = document.createElement('button');
         itemCopy.type = 'button';
         itemCopy.className = 'menu-item';
-        itemCopy.setAttribute('role', 'menuitem');
         itemCopy.textContent = 'Copy Key (gsb-' + acct.id + ')';
         itemCopy.addEventListener('click', function () {
           closeActionPopover();
-          copyToClipboard('gsb-' + acct.id, 'Copied individual API key "gsb-' + acct.id + '".');
+          copyToClipboard('gsb-' + acct.id, null, 'Copied dedicated API key "gsb-' + acct.id + '".');
         });
         actionPopover.appendChild(itemCopy);
 
@@ -2311,7 +3657,6 @@
           const itemUnq = document.createElement('button');
           itemUnq.type = 'button';
           itemUnq.className = 'menu-item';
-          itemUnq.setAttribute('role', 'menuitem');
           itemUnq.textContent = acct.quarantined ? 'Unquarantine Account' : 'Reset Failure Counter';
           itemUnq.addEventListener('click', function () {
             closeActionPopover();
@@ -2327,7 +3672,6 @@
         const itemDel = document.createElement('button');
         itemDel.type = 'button';
         itemDel.className = 'menu-item menu-item-danger';
-        itemDel.setAttribute('role', 'menuitem');
         itemDel.textContent = 'Remove Account';
         itemDel.addEventListener('click', function (ev) {
           ev.stopPropagation();
@@ -2335,21 +3679,18 @@
         });
         actionPopover.appendChild(itemDel);
 
-        actionPopover.hidden = false;
-        const rect = btn.getBoundingClientRect();
-        const popRect = actionPopover.getBoundingClientRect();
-        let top = rect.bottom + 6;
-        if (top + popRect.height > window.innerHeight - 12) {
-          top = Math.max(12, rect.top - popRect.height - 6);
+        if (supportsPopover) {
+          actionPopover.showPopover();
+        } else {
+          actionPopover.hidden = false;
         }
-        let left = rect.right - popRect.width;
-        if (left < 12) left = 12;
-        actionPopover.style.top = top + 'px';
-        actionPopover.style.left = left + 'px';
+        if (!supportsAnchorPositioning) {
+          positionPopoverFallback(btn);
+        }
       }
 
       async function runAccountAction(id, action, btn) {
-        const orig = btn ? btn.textContent : '';
+        const origHtml = btn ? btn.innerHTML : '';
         if (btn) {
           btn.disabled = true;
           btn.textContent = '…';
@@ -2369,7 +3710,7 @@
         } finally {
           if (btn && btn.isConnected) {
             btn.disabled = false;
-            btn.textContent = orig;
+            btn.innerHTML = origHtml;
           }
         }
       }
@@ -2381,7 +3722,7 @@
           return;
         }
         btn.disabled = true;
-        btn.textContent = 'Removing...';
+        btn.textContent = 'Removing…';
         try {
           await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
           closeActionPopover();
@@ -2396,42 +3737,92 @@
       document.getElementById('btn-isolated-login').addEventListener('click', async function () {
         const btn = document.getElementById('btn-isolated-login');
         const id = document.getElementById('inp-acct-id').value.trim();
+        const proxyUrl = document.getElementById('inp-acct-proxy').value.trim();
+        const accountGroup = document.getElementById('inp-acct-group').value.trim();
+        const helperInput = document.getElementById('inp-helper-token');
+        const helperPairing = document.getElementById('helper-pairing');
+        const helperError = document.getElementById('helper-pairing-error');
+        helperError.textContent = '';
+        desktopLoginError.hidden = true;
+        desktopLoginError.textContent = '';
+        importInlineError.hidden = true;
+        importInlineError.textContent = '';
+        const helperToken = helperInput.value.trim();
+        helperInput.value = '';
         btn.disabled = true;
-        btn.textContent = 'Waiting for login...';
+        btn.textContent = 'Waiting for login…';
         try {
           let res = null;
           try {
             res = await apiRequest('/v1/admin/accounts/browser-login', {
               method: 'POST',
-              body: { id: id }
+              body: { id: id, proxyUrl: proxyUrl, accountGroup: accountGroup }
             });
           } catch (serverErr) {
-            // If the gsb server is on a headless VPS without Chrome, try the local desktop login helper on 127.0.0.1:20134
-            if (/no Chromium|no GUI display/i.test(serverErr.message)) {
-              const helperResp = await fetch('http://127.0.0.1:20134/browser-login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: id })
-              });
-              const helperData = await helperResp.json();
-              if (!helperResp.ok || !helperData.cookie) {
-                throw new Error((helperData.error && helperData.error.message) || 'Local browser login failed.');
+            if (!desktopUI && /no Chromium|no GUI display/i.test(serverErr.message)) {
+              helperPairing.hidden = false;
+              if (!helperToken) {
+                helperInput.focus();
+                throw new Error('Enter the desktop helper token in the Add Account dialog, then click Launch again.');
               }
+              if (!['http://127.0.0.1:20133', 'http://localhost:20133', 'http://[::1]:20133'].includes(window.location.origin)) {
+                throw new Error('Open the Web UI at http://127.0.0.1:20133/ui to use the desktop helper.');
+              }
+              let helperResp;
+              try {
+                helperResp = await fetch('http://127.0.0.1:20134/browser-login', {
+                  method: 'POST',
+                  headers: { 'X-GSB-Helper-Token': helperToken },
+                  credentials: 'omit',
+                  redirect: 'error',
+                  cache: 'no-store',
+                  referrerPolicy: 'no-referrer',
+                  signal: AbortSignal.timeout(255000)
+                });
+              } catch (_) {
+                throw new Error('Could not reach the desktop helper. Check that gsb --login-helper is running and that your browser permits local network access.');
+              }
+              if (helperResp.status === 401) {
+                helperInput.focus();
+                throw new Error('Desktop helper token rejected. Paste the token from the current helper terminal.');
+              }
+              const helperText = await helperResp.text();
+              let helperData = null;
+              try {
+                helperData = helperText ? JSON.parse(helperText) : null;
+              } catch (_) {
+                throw new Error('Desktop helper returned a non-JSON response (HTTP ' + helperResp.status + '). Check that the current `gsb --login-helper` is running, then retry.');
+              }
+              if (!helperResp.ok) {
+                const helperMessage = helperData && helperData.error && helperData.error.message;
+                throw new Error(helperMessage || 'Desktop browser sign-in failed (HTTP ' + helperResp.status + '). Check the browser and try again.');
+              }
+              if (!helperData || !helperData.cookie) throw new Error('Desktop browser sign-in returned no session.');
               res = await apiRequest('/v1/admin/accounts/import', {
                 method: 'POST',
-                body: { id: id, cookie: helperData.cookie }
+                body: { id: id, cookie: helperData.cookie, proxyUrl: proxyUrl, accountGroup: accountGroup }
               });
             } else {
               throw serverErr;
             }
           }
           document.getElementById('inp-acct-id').value = '';
+          document.getElementById('inp-acct-proxy').value = '';
+          document.getElementById('inp-acct-group').value = '';
           closeImportModal();
           const addedId = (res.account && res.account.id) || id || 'account';
           showBanner('ok', 'Captured isolated session for ' + addedId + ' (' + ((res.account && res.account.email) || 'session active') + ').');
           await loadAll(false);
         } catch (err) {
-          showBanner('err', err.message);
+          if (desktopUI) {
+            desktopLoginError.hidden = false;
+            desktopLoginError.textContent = err.message;
+          } else if (!helperPairing.hidden) {
+            helperError.textContent = err.message;
+          } else {
+            desktopLoginError.hidden = false;
+            desktopLoginError.textContent = err.message;
+          }
         } finally {
           btn.disabled = false;
           btn.textContent = 'Launch';
@@ -2445,13 +3836,17 @@
         const cookie = cookieEl.value.trim();
         const proxyUrl = document.getElementById('inp-acct-proxy').value.trim();
         const accountGroup = document.getElementById('inp-acct-group').value.trim();
+        importInlineError.hidden = true;
+        importInlineError.textContent = '';
         if (!cookie) {
-          showBanner('err', 'Please paste a Cookie header or Cookie-Editor JSON array.');
+          importInlineError.hidden = false;
+          importInlineError.textContent = 'Please paste a Cookie header or Cookie-Editor JSON array.';
+          cookieEl.focus();
           return;
         }
         const btn = document.getElementById('btn-import-submit');
         btn.disabled = true;
-        btn.textContent = 'Verifying...';
+        btn.textContent = 'Verifying…';
         try {
           const res = await apiRequest('/v1/admin/accounts/import', {
             method: 'POST',
@@ -2466,7 +3861,8 @@
           showBanner('ok', 'Verified and added account ' + addedId + ' (' + ((res.account && res.account.email) || 'session active') + ').');
           await loadAll(false);
         } catch (err) {
-          showBanner('err', 'Import failed: ' + err.message);
+          importInlineError.hidden = false;
+          importInlineError.textContent = 'Import failed: ' + err.message;
         } finally {
           btn.disabled = false;
           btn.textContent = 'Verify & Add Account';
@@ -2478,10 +3874,11 @@
           defaultThinking: document.getElementById('cfg-thinking').value,
           accountStrategy: document.getElementById('cfg-strategy').value,
           quotaPreflight: document.getElementById('cfg-preflight').value,
-          accountPriority: document.getElementById('cfg-priority').value,
+          accountPriority: getPriorityList(),
           maxRpmPerAccount: Number(document.getElementById('cfg-max-rpm').value),
           maxConcurrentPerAccount: Number(document.getElementById('cfg-max-conc').value),
           rejectDowngrade: document.getElementById('cfg-reject-downgrade').checked,
+          rejectLabelMismatch: document.getElementById('cfg-reject-label-mismatch').checked,
           liveThoughts: document.getElementById('cfg-live-thoughts').checked,
           liveToolCalls: document.getElementById('cfg-live-tools').checked,
           keepToolPreamble: document.getElementById('cfg-tool-preamble').checked,
@@ -2501,15 +3898,14 @@
         submitConfig(false);
       });
 
-      document.getElementById('form-config').addEventListener('submit', function (ev) {
+      formConfig.addEventListener('submit', function (ev) {
         ev.preventDefault();
         submitConfig(true);
       });
 
-      if (btnRefreshCached) btnRefreshCached.addEventListener('click', function () { loadAll(false); });
       btnRefreshLive.addEventListener('click', function () { loadAll(true); });
 
-      initTheme();
+      syncThemeUI();
       loadAll(false);
     })();
   </script>

@@ -20,6 +20,9 @@ var EssentialNames = []string{
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 	"__Secure-1PSIDTS", "__Secure-3PSIDTS",
 	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "NID", "AEC",
+	"OSID", "__Secure-OSID", "LSID",
+	"__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS",
+	"ACCOUNT_CHOOSER",
 }
 
 var essentialSet = func() map[string]bool {
@@ -216,11 +219,7 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 			return norm, &cf, nil
 		}
 		var wrapper struct {
-			Cookies []struct {
-				Name   string `json:"name"`
-				Value  string `json:"value"`
-				Domain string `json:"domain"`
-			} `json:"cookies"`
+			Cookies []domainCookie `json:"cookies"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &wrapper); err == nil && len(wrapper.Cookies) > 0 {
 			h := selectBestDomainCookies(wrapper.Cookies)
@@ -228,11 +227,7 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 		}
 	}
 	if strings.HasPrefix(trimmed, "[") {
-		var list []struct {
-			Name   string `json:"name"`
-			Value  string `json:"value"`
-			Domain string `json:"domain"`
-		}
+		var list []domainCookie
 		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
 			return "", nil, fmt.Errorf("invalid cookie JSON array: %w", err)
 		}
@@ -242,12 +237,20 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 	return CanonicalHeader(m), nil, nil
 }
 
-func selectBestDomainCookies(list []struct {
+type domainCookie struct {
 	Name   string `json:"name"`
 	Value  string `json:"value"`
 	Domain string `json:"domain"`
-}) string {
+}
+
+func selectBestDomainCookies(list []domainCookie) string {
+	_, hdr := selectBestDomainCookieMap(list)
+	return hdr
+}
+
+func selectBestDomainCookieMap(list []domainCookie) (map[string]string, string) {
 	score := func(d string) int {
+		d = strings.ToLower(strings.TrimSpace(d))
 		if d == ".google.com" || d == "google.com" {
 			return 3
 		}
@@ -268,7 +271,7 @@ func selectBestDomainCookies(list []struct {
 			bestScore[c.Name] = s
 		}
 	}
-	return CanonicalHeader(best)
+	return best, CanonicalHeader(best)
 }
 
 // SaveCredentialFile atomically writes a CredentialFile to path with mode 0600.
@@ -285,6 +288,9 @@ func SaveCredentialFile(path string, cred CredentialFile) (int64, error) {
 		}
 		if cred.FSid == "" {
 			cred.FSid = prev.FSid
+		}
+		if cred.AuthUser == 0 && prev.AuthUser > 0 {
+			cred.AuthUser = prev.AuthUser
 		}
 		if cred.Email == "" {
 			cred.Email = prev.Email

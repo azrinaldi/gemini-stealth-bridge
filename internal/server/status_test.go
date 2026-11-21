@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -394,5 +397,218 @@ func TestLoadCredentialsPreservesRuntimeStateAndClearsOnRecapture(t *testing.T) 
 	acc1.mu.RUnlock()
 	if gotFails != 0 || gotErr != "" {
 		t.Fatalf("expected recapture to clear fails/error, got fails=%d err=%q", gotFails, gotErr)
+	}
+}
+
+func TestSuccessAndRotateClearStickyExpired(t *testing.T) {
+	if !looksLikeAuthFailure("upstream redirected to Google sign-in (https://accounts.google.com/ServiceLogin)") {
+		t.Fatal("expected looksLikeAuthFailure to recognize 'redirected to Google sign-in'")
+	}
+
+	seedAuthFailure := func(srv *Server, acct *AccountState) {
+		acct.mu.Lock()
+		acct.Fails = 2
+		acct.LastFail = srv.now()
+		acct.LastError = "upstream redirected to Google sign-in (https://accounts.google.com/ServiceLogin)"
+		acct.ModelsError = errors.New("upstream_auth_error: code 1016")
+		acct.mu.Unlock()
+		if st, _ := AccountStatus(acct, srv.now()); st != StatusExpired {
+			t.Fatalf("expected StatusExpired after auth failure, got %q", st)
+		}
+	}
+
+	assertCleared := func(t *testing.T, srv *Server, acct *AccountState, label string) {
+		t.Helper()
+		acct.mu.RLock()
+		fails, lastErr, lastFail, modelsErr := acct.Fails, acct.LastError, acct.LastFail, acct.ModelsError
+		acct.mu.RUnlock()
+		if fails != 0 || lastErr != "" || !lastFail.IsZero() || modelsErr != nil {
+			t.Fatalf("%s: expected error state cleared, got fails=%d lastErr=%q lastFail=%v modelsErr=%v",
+				label, fails, lastErr, lastFail, modelsErr)
+		}
+		if st, reason := AccountStatus(acct, srv.now()); st != StatusOK {
+			t.Fatalf("%s: expected StatusOK, got %q (%q)", label, st, reason)
+		}
+	}
+
+	t.Run("chat_responses_image_and_rotate_clear_expired", func(t *testing.T) {
+		cfg := config.Load()
+		cfg.HomeDir = t.TempDir()
+		cfg.AccountsDir = filepath.Join(cfg.HomeDir, "accounts")
+		cfg.AccountTokens = map[string]string{"audit": "acct"}
+		cfg.WebUI = true
+		cfg.APIKey = "public"
+		srv := New(cfg)
+		t.Cleanup(func() { srv.FlushSessionCacheNow() })
+		acct := &AccountState{
+			ID:       "acct",
+			Email:    "acct@example.com",
+			Models:   []gemini.ModelInfo{testModel},
+			Capacity: 2,
+			ModelsAt: time.Now(),
+			Quota:    []gemini.QuotaBucket{{ID: "5h", Label: "5h", Total: 100, Remaining: 99}},
+		}
+		srv.SetAccounts([]*AccountState{acct})
+
+		// 1. HandleChat
+		seedAuthFailure(srv, acct)
+		recChat := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
+			makeFrame("ok chat", "", true, testModel.ModelID),
+		}), nil)
+		if recChat.Code != 200 {
+			t.Fatalf("HandleChat failed: %d %s", recChat.Code, recChat.Body.String())
+		}
+		assertCleared(t, srv, acct, "HandleChat")
+
+		// 2. HandleResponses
+		seedAuthFailure(srv, acct)
+		acct.mu.Lock()
+		acct.Client = clientFromFrames([]gemini.Frame{makeFrame("ok responses", "", true, testModel.ModelID)})
+		acct.mu.Unlock()
+		reqResp := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-pro","input":"hi"}`))
+		reqResp.Header.Set("Authorization", "Bearer audit")
+		reqResp.Header.Set("Content-Type", "application/json")
+		recResp := httptest.NewRecorder()
+		srv.ServeHTTP(recResp, reqResp)
+		if recResp.Code != 200 {
+			t.Fatalf("HandleResponses failed: %d %s", recResp.Code, recResp.Body.String())
+		}
+		assertCleared(t, srv, acct, "HandleResponses")
+
+		// 3. HandleImageGeneration
+		seedAuthFailure(srv, acct)
+		acct.mu.Lock()
+		acct.Client = &mockUpstream{
+			streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+				_ = onFrame(&gemini.LineParseResult{
+					CID:             "cid-img",
+					RID:             "rid-img",
+					AnsweredModelID: testModel.ModelID,
+					Frames: []gemini.Frame{{
+						RCID:            "rc-img",
+						Done:            true,
+						AnsweredModelID: testModel.ModelID,
+						GeneratedImages: []gemini.GeneratedImage{{URL: "https://lh3.googleusercontent.com/gg-dl/img1=s1024", Title: "Img"}},
+					}},
+				})
+				return &gemini.StreamResponse{Status: 200, CID: "cid-img", RID: "rid-img"}, nil
+			},
+		}
+		acct.mu.Unlock()
+		reqImg := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"sunset"}`))
+		reqImg.Header.Set("Authorization", "Bearer audit")
+		reqImg.Header.Set("Content-Type", "application/json")
+		recImg := httptest.NewRecorder()
+		srv.ServeHTTP(recImg, reqImg)
+		if recImg.Code != 200 {
+			t.Fatalf("HandleImageGeneration failed: %d %s", recImg.Code, recImg.Body.String())
+		}
+		assertCleared(t, srv, acct, "HandleImageGeneration")
+
+		// 4. POST /v1/admin/accounts/<id>/rotate (Rotated: true)
+		seedAuthFailure(srv, acct)
+		acct.mu.Lock()
+		acct.Client = &mockUpstream{
+			rotateFn: func(ctx context.Context) (*cookies.RotateResult, error) {
+				return &cookies.RotateResult{Status: 200, Rotated: true, CookieHeader: "SAPISID=fresh"}, nil
+			},
+		}
+		acct.mu.Unlock()
+		reqRot := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/acct/rotate", nil)
+		reqRot.RemoteAddr = "127.0.0.1:43210"
+		reqRot.Host = "127.0.0.1:20133"
+		recRot := httptest.NewRecorder()
+		srv.ServeHTTP(recRot, reqRot)
+		if recRot.Code != 200 {
+			t.Fatalf("admin rotate failed: %d %s", recRot.Code, recRot.Body.String())
+		}
+		assertCleared(t, srv, acct, "AdminRotate")
+	})
+
+	t.Run("refresh_account_alone_preserves_1016", func(t *testing.T) {
+		srv, acct := newTestHarness(false, false)
+		acct.Quota = []gemini.QuotaBucket{{ID: "5h", Label: "5h", Total: 100, Remaining: 99}}
+		acct.mu.Lock()
+		acct.LastError = "session is unauthenticated (code 1016)"
+		acct.Fails = 1
+		acct.Client = &mockUpstream{}
+		acct.mu.Unlock()
+
+		srv.RefreshAccount(context.Background(), acct, true)
+		if st, _ := AccountStatus(acct, srv.now()); st != StatusExpired {
+			t.Fatalf("RefreshAccount alone must preserve code 1016 expired status, got %q", st)
+		}
+	})
+}
+
+func TestHealthyProbeClearsQuarantinedAndPersists(t *testing.T) {
+	home := t.TempDir()
+	acctsDir := filepath.Join(home, "accounts")
+	acctPath := filepath.Join(acctsDir, "accq.json")
+	if _, err := cookies.SaveCredentialFile(acctPath, cookies.CredentialFile{
+		Name:             "accq",
+		Email:            "accq@example.com",
+		Cookies:          "SAPISID=sapq; __Secure-1PSID=pq",
+		Quarantined:      true,
+		QuarantineReason: "upstream rejected (code 1033)",
+		Surfaces:         map[string]string{"geminiWeb": "blocked"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Load()
+	cfg.HomeDir = home
+	cfg.AccountsDir = acctsDir
+	cfg.WebUI = true
+	cfg.APIKey = "public"
+	srv := New(cfg)
+	t.Cleanup(func() { srv.FlushSessionCacheNow() })
+	if n := srv.LoadCredentials(); n != 1 {
+		t.Fatalf("LoadCredentials = %d, want 1", n)
+	}
+	acct := srv.Accounts()[0]
+	acct.mu.Lock()
+	acct.Quota = []gemini.QuotaBucket{
+		{ID: "5h", Label: "5h", Total: 100, Remaining: 90},
+		{ID: "sub:gemini-pro", Label: "gemini-pro", Total: 1, Remaining: 0, Synthetic: true, ResetAt: srv.now().Add(time.Hour).UTC().Format(time.RFC3339)},
+	}
+	acct.subStrikes["sub:gemini-pro"] = 3
+	acct.LastError = "account_banned (code 1033)"
+	acct.Fails = 2
+	acct.mu.Unlock()
+
+	srv.clientFactory = func(_ *AccountState) UpstreamClient {
+		return &mockUpstream{}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/accq/probe", nil)
+	req.RemoteAddr = "127.0.0.1:43210"
+	req.Host = "127.0.0.1:20133"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("probe endpoint failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	acct.mu.RLock()
+	q, qr, fails, lastErr := acct.Quarantined, acct.QuarantineReason, acct.Fails, acct.LastError
+	strikes := len(acct.subStrikes)
+	surf := acct.Surfaces["geminiWeb"]
+	acct.mu.RUnlock()
+	if q || qr != "" || fails != 0 || lastErr != "" || strikes != 0 || surf != "ok" {
+		t.Fatalf("probe did not clear quarantine/synthetic state: q=%v qr=%q fails=%d err=%q strikes=%d surf=%q",
+			q, qr, fails, lastErr, strikes, surf)
+	}
+	if st, reason := AccountStatus(acct, srv.now()); st != StatusOK {
+		t.Fatalf("expected StatusOK after healthy probe, got %q (%q)", st, reason)
+	}
+
+	// Verify disk file persisted quarantined=false.
+	diskRec, _, err := cookies.LoadAccountFile(acctPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diskRec.Quarantined || diskRec.QuarantineReason != "" || diskRec.Surfaces["geminiWeb"] != "ok" {
+		t.Fatalf("disk file did not persist unquarantine: %+v", diskRec)
 	}
 }
