@@ -18,6 +18,7 @@ const (
 	// Must be sent verbatim with leading zeros ([000,...]), never json.Marshal'd.
 	rotate1PSIDTSSentinel = `[000,"-0000000000000000000"]`
 	min1PSIDTSInterval    = 60 * time.Second
+	maxRotateInterval     = 3600 * time.Second
 	defaultRotateInterval = 9 * time.Minute
 )
 
@@ -69,7 +70,19 @@ type RotateResult struct {
 	Status       int
 	Rotated      bool
 	CookieHeader string
+	SetCookies   []string
 	NextInterval time.Duration
+	RetryAfter   string // Retry-After from the response that set Status.
+}
+
+// Forget removes per-account rotation cooldown state for key.
+func (r *Rotator) Forget(key string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.lastPSIDTSAt, key)
+	r.mu.Unlock()
 }
 
 // RotateAccount executes both the 1PSIDTS sentinel rotation and the 658 iframe
@@ -78,44 +91,71 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	cookie := currentCookie
 	rotatedAny := false
 	lastStatus := 0
+	var retryAfter string
+	var setCookies []string
 	nextInterval := defaultRotateInterval
 
 	// Primary path: POST /RotateCookies with [000,"-0000000000000000000"] and full cookie jar.
 	// Renews both __Secure-1PSIDTS / __Secure-3PSIDTS and SIDCC / __Secure-*PSIDCC in a single call.
 	// Calling /RotateCookies twice in the same minute triggers HTTP 429 on the second call,
-	// so the 658 iframe flow is used only as a fallback if the primary call does not succeed.
-	if r.allow1PSIDTS(accountID) {
-		subset := Subset(cookie, rotationCookieSet)
-		if subset != "" {
-			res, err := sc.Do(ctx, transport.RequestOptions{
-				Method: "POST",
-				URL:    rotatePostURL,
-				Kind:   transport.ReqKindCORS,
-				Headers: map[string]string{
-					"content-type":   "application/json",
-					"origin":         "https://accounts.google.com",
-					"referer":        "https://accounts.google.com/",
-					"sec-fetch-site": "same-origin",
-					"cookie":         subset,
-				},
-				Body:    []byte(rotate1PSIDTSSentinel),
-				Timeout: 20 * time.Second,
-			})
-			if err == nil {
-				lastStatus = res.Status
-				r.note1PSIDTS(accountID, res.Status)
+	// so return early during the 60s cooldown instead of falling through to iframe rotation.
+	if !r.allow1PSIDTS(accountID) {
+		return &RotateResult{
+			Status:       0,
+			Rotated:      false,
+			CookieHeader: cookie,
+			NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+		}, nil
+	}
+
+	subset := Subset(cookie, rotationCookieSet)
+	if subset != "" {
+		res, err := sc.Do(ctx, transport.RequestOptions{
+			Method: "POST",
+			URL:    rotatePostURL,
+			Kind:   transport.ReqKindCORS,
+			Headers: map[string]string{
+				"content-type":   "application/json",
+				"origin":         "https://accounts.google.com",
+				"referer":        "https://accounts.google.com/",
+				"sec-fetch-site": "same-origin",
+				"cookie":         subset,
+			},
+			Body:    []byte(rotate1PSIDTSSentinel),
+			Timeout: 20 * time.Second,
+		})
+		if err == nil {
+			lastStatus = res.Status
+			retryAfter = res.Headers["retry-after"]
+			r.note1PSIDTS(accountID, res.Status)
+			if res.Status == 200 {
+				var primarySetCookies []string
+				if len(res.SetCookies) > 0 {
+					primarySetCookies = append([]string(nil), res.SetCookies...)
+				}
 				if merged, changed := AbsorbSetCookie(cookie, res.SetCookies); changed {
 					cookie = merged
-					rotatedAny = true
+					if hasEssentialCookieUpdate(res.SetCookies) {
+						rotatedAny = true
+					}
 				}
-				if res.Status == 200 && rotatedAny {
-					return &RotateResult{
-						Status:       res.Status,
-						Rotated:      rotatedAny,
-						CookieHeader: cookie,
-						NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
-					}, nil
-				}
+				return &RotateResult{
+					Status:       res.Status,
+					Rotated:      rotatedAny,
+					CookieHeader: cookie,
+					SetCookies:   primarySetCookies,
+					NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+					RetryAfter:   retryAfter,
+				}, nil
+			}
+			if res.Status == 401 || res.Status == 403 || res.Status == 429 {
+				return &RotateResult{
+					Status:       res.Status,
+					Rotated:      false,
+					CookieHeader: cookie,
+					NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+					RetryAfter:   retryAfter,
+				}, nil
 			}
 		}
 	}
@@ -132,18 +172,31 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 		Timeout: 20 * time.Second,
 	})
 	if pageErr == nil {
-		if lastStatus == 0 {
+		if lastStatus == 0 || pageRes.Status == 401 || pageRes.Status == 403 || pageRes.Status == 429 {
 			lastStatus = pageRes.Status
-		}
-		if merged, changed := AbsorbSetCookie(cookie, pageRes.SetCookies); changed {
-			cookie = merged
-			rotatedAny = true
+			retryAfter = pageRes.Headers["retry-after"]
 		}
 		if pageRes.Status == 200 {
+			if len(pageRes.SetCookies) > 0 {
+				setCookies = append(setCookies, pageRes.SetCookies...)
+			}
+			if merged, changed := AbsorbSetCookie(cookie, pageRes.SetCookies); changed {
+				cookie = merged
+				if hasEssentialCookieUpdate(pageRes.SetCookies) {
+					rotatedAny = true
+				}
+			}
 			if m := rotateInitRe.FindStringSubmatch(pageRes.Body); len(m) >= 4 {
 				rotID := m[1]
-				if sec, err := strconv.ParseFloat(m[3], 64); err == nil && sec >= 60 && sec <= 3600 {
-					nextInterval = time.Duration(sec) * time.Second
+				if sec, err := strconv.ParseFloat(m[3], 64); err == nil && sec > 0 {
+					if sec >= float64(maxRotateInterval/time.Second) {
+						nextInterval = maxRotateInterval
+					} else {
+						nextInterval = time.Duration(sec * float64(time.Second))
+						if nextInterval <= 0 {
+							nextInterval = time.Nanosecond
+						}
+					}
 				}
 				body := fmt.Sprintf(`[658,%q]`, rotID)
 				postRes, postErr := sc.Do(ctx, transport.RequestOptions{
@@ -161,12 +214,25 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 					Body:    []byte(body),
 					Timeout: 20 * time.Second,
 				})
-				if postErr == nil {
-					lastStatus = postRes.Status
+				if postErr != nil {
+					return nil, postErr
+				}
+				lastStatus = postRes.Status
+				retryAfter = postRes.Headers["retry-after"]
+				if postRes.Status == 200 {
+					if len(postRes.SetCookies) > 0 {
+						setCookies = append(setCookies, postRes.SetCookies...)
+					}
 					if merged, changed := AbsorbSetCookie(cookie, postRes.SetCookies); changed {
 						cookie = merged
-						rotatedAny = true
+						if hasEssentialCookieUpdate(postRes.SetCookies) {
+							rotatedAny = true
+						}
 					}
+				} else {
+					rotatedAny = false
+					setCookies = nil
+					cookie = currentCookie
 				}
 			}
 		}
@@ -174,11 +240,17 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	if lastStatus == 0 && pageErr != nil {
 		return nil, pageErr
 	}
+	if lastStatus != 200 {
+		rotatedAny = false
+		setCookies = nil
+	}
 	return &RotateResult{
 		Status:       lastStatus,
 		Rotated:      rotatedAny,
 		CookieHeader: cookie,
+		SetCookies:   setCookies,
 		NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+		RetryAfter:   retryAfter,
 	}, nil
 }
 

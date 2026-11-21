@@ -17,6 +17,7 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
@@ -293,6 +294,50 @@ func TestPoolQuotaErrorSummarizesUnavailableAccounts(t *testing.T) {
 	srv.HandleChat(context.Background(), pinnedRec, body, AuthScope{OK: true, AccountID: "acct1"})
 	if pinnedRec.Code != 429 || !strings.Contains(pinnedRec.Body.String(), "on account acct1") {
 		t.Fatalf("expected pinned account error to remain account-specific, got %d: %s", pinnedRec.Code, pinnedRec.Body.String())
+	}
+}
+
+// TestStalledStreamFailsOverInsteadOfHoldingTheClient pins the watchdog path end
+// to end: an account whose upstream never yields a frame must be abandoned and
+// the request retried on a healthy account. Before the frame watchdog existed the
+// transport timers were satisfied by keepalive envelopes, so the caller waited
+// until its own timeout, no failover happened, and the healthy account was never
+// tried.
+func TestStalledStreamFailsOverInsteadOfHoldingTheClient(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.MaxConcurrentPerAccount = 0
+	cfg.MaxRPMPerAccount = 0
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	srv := New(cfg)
+
+	stalled := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			// Stands in for the frame watchdog firing on the first account.
+			return nil, transport.NewUpstreamError("upstream sent no candidate frame", 504, "upstream_stalled", nil, nil)
+		},
+	}
+	healthy := clientFromFrames([]gemini.Frame{
+		makeFrame("OK", "", true, testModel.ModelID),
+	})
+
+	a1 := &AccountState{ID: "acct1", Email: "a1@example.com", Models: []gemini.ModelInfo{testModel}, Capacity: 2, ModelsAt: time.Now(), Client: stalled}
+	a2 := &AccountState{ID: "acct2", Email: "a2@example.com", Models: []gemini.ModelInfo{testModel}, Capacity: 2, ModelsAt: time.Now(), Client: healthy}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	body := map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "synthetic"}},
+	}
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, body, AuthScope{OK: true})
+	if rec.Code != 200 {
+		t.Fatalf("expected failover to the healthy account, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "OK") {
+		t.Fatalf("expected the healthy account's answer, got %s", rec.Body.String())
 	}
 }
 
@@ -665,14 +710,14 @@ func TestBufferedStreamRevisionLiveThoughtsAndCrossModelQuota(t *testing.T) {
 	}
 
 	// 2. LiveThoughts=false must suppress reasoning_content in chat responses
-	srv.Cfg.LiveThoughts = false
+	srv.UpdateCfg(func(c *config.Config) { c.LiveThoughts = false })
 	noThinkRec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
 		makeFrame("visible reply", "secret reasoning", true, testModel.ModelID),
 	}), nil)
 	if noThinkRec.Code != 200 || strings.Contains(noThinkRec.Body.String(), "secret reasoning") {
 		t.Fatalf("expected reasoning suppressed when LiveThoughts=false, got %d: %s", noThinkRec.Code, noThinkRec.Body.String())
 	}
-	srv.Cfg.LiveThoughts = true
+	srv.UpdateCfg(func(c *config.Config) { c.LiveThoughts = true })
 
 	// 3. Exhausted Flash quota bucket must not block Pro model requests
 	acct.mu.Lock()
@@ -1304,7 +1349,7 @@ func TestContinuationCachedTokens(t *testing.T) {
 
 func TestEarlySSEFirstByteInRelaxedMode(t *testing.T) {
 	srv, acct := newTestHarness(true, false)
-	srv.Cfg.EarlySSE = true
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSE = true })
 
 	firstPingAt := make(chan time.Duration, 1)
 	startAt := time.Now()
@@ -1347,7 +1392,7 @@ func TestEarlySSEFirstByteInRelaxedMode(t *testing.T) {
 func TestSessionBusyRetryAndFallback(t *testing.T) {
 	// 1. Account-scoped token gets 429 session_busy on attempt 1 -> sleeps ~1s and succeeds on attempt 2 on SAME account
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) { c.MaxAttempts = 3 })
 	calls := 0
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -1447,7 +1492,7 @@ func TestSyntheticQuotaBackoffAndClear(t *testing.T) {
 	}
 
 	// Successful request in advisory mode clears the synthetic bucket
-	srv.Cfg.QuotaPreflight = "advisory"
+	srv.UpdateCfg(func(c *config.Config) { c.QuotaPreflight = "advisory" })
 	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
 		makeFrame("ok", "", true, testModel.ModelID),
 	}), nil)
@@ -1695,7 +1740,7 @@ func TestAccountsEndpointPostureAndIdleRotationBackoff(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
 	baseNow := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
 	srv.clock = func() time.Time { return baseNow }
-	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	srv.UpdateCfg(func(c *config.Config) { c.RotateCookiesEvery = 9 * time.Minute })
 	acct.ImportedFrom = "chrome"
 	acct.ProfileID = "Default"
 	acct.ProxyURL = "socks5://127.0.0.1:1080"
@@ -2016,7 +2061,7 @@ func TestRotateFallbackAdvancesAndWraps(t *testing.T) {
 // downgrade guard keeps working on the stream body.
 func TestGraceFlushesStrictHeadersBeforeIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 20 * time.Millisecond })
 
 	frameSent := make(chan time.Time, 1)
 	client := &mockUpstream{
@@ -2070,7 +2115,7 @@ func TestGraceFlushesStrictHeadersBeforeIdentity(t *testing.T) {
 // body check is what replaces the status-line check once headers are gone.
 func TestGraceFlushStillStopsOnDowngrade(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 20 * time.Millisecond })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2106,7 +2151,7 @@ func TestGraceFlushStillStopsOnDowngrade(t *testing.T) {
 
 func TestGraceDisabledKeepsHeadersBuffered(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 0
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 0 })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2138,7 +2183,7 @@ func TestGraceDisabledKeepsHeadersBuffered(t *testing.T) {
 
 func TestHeadersFlushOnVerifiedIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 5 * time.Second
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 5 * time.Second })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2184,7 +2229,7 @@ func TestHeadersFlushOnVerifiedIdentity(t *testing.T) {
 
 func TestDowngradeStillReturnsHTTPError(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 5 * time.Second
+	srv.UpdateCfg(func(c *config.Config) { c.EarlySSEGrace = 5 * time.Second })
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2320,7 +2365,7 @@ func TestRetrySelectiveBootstrapAndFreshSocket(t *testing.T) {
 
 	// Same-account transport error retry MUST set FreshSocket=true and call Bootstrap
 	srvSame, acctSame := newTestHarness(false, false)
-	srvSame.Cfg.MaxAttempts = 2
+	srvSame.UpdateCfg(func(c *config.Config) { c.MaxAttempts = 2 })
 	var sameBoot atomic.Int32
 	var sameFreshOnRetry atomic.Bool
 	sameCalls := 0
@@ -2373,8 +2418,10 @@ func TestStrictIdentityUnknownDoesNotEmitReasoning(t *testing.T) {
 
 func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
-	srv.Cfg.MaxUpstreamAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) {
+		c.MaxAttempts = 3
+		c.MaxUpstreamAttempts = 3
+	})
 	var calls atomic.Int32
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
@@ -2428,8 +2475,10 @@ func TestResponsesCanonicalizesAssistantFunctionCallTurn(t *testing.T) {
 
 func TestStreamingToolCallErrorRetriesInStreamAndAppendsCorrection(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.MaxAttempts = 3
-	srv.Cfg.MaxUpstreamAttempts = 3
+	srv.UpdateCfg(func(c *config.Config) {
+		c.MaxAttempts = 3
+		c.MaxUpstreamAttempts = 3
+	})
 
 	var calls atomic.Int32
 	var secondPrompt string
@@ -2493,7 +2542,7 @@ func TestStreamingToolCallErrorRetriesInStreamAndAppendsCorrection(t *testing.T)
 
 func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.KeepToolPreamble = true
+	srv.UpdateCfg(func(c *config.Config) { c.KeepToolPreamble = true })
 	longPreamble := " " + strings.Repeat("Analyzing transit headway and corridor speed bottlenecks. ", 8)
 	toolBlock := "\n\n```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/data.db\"}}]}\n```"
 
@@ -2537,6 +2586,159 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 	}
 }
 
+// A protocol refusal is not a schema error: telling the model to fix its JSON
+// produced the same refusal again and burned every retry. The correction must
+// contradict the invented budget instead, and must land right before the
+// Assistant cue so the model reads it last.
+func TestAppendToolErrorCorrectionRefusal(t *testing.T) {
+	base := "User: do the task\n\nAssistant:"
+	got := appendToolErrorCorrection(base, toolbridge.RefusalErrorText+" (hallucinated tool limit or refusal)")
+
+	if !strings.HasSuffix(got, "\n\nAssistant:") {
+		t.Fatalf("note must stay before the Assistant cue, got suffix %q", got[len(got)-20:])
+	}
+	if !strings.Contains(got, "budget that does not exist") {
+		t.Fatalf("refusal correction must contradict the invented budget, got %q", got)
+	}
+	if strings.Contains(got, "failed tool validation") {
+		t.Fatal("refusal must not receive the schema correction")
+	}
+}
+
+// A genuine schema failure still gets the schema correction, which asks for the
+// required properties.
+func TestAppendToolErrorCorrectionSchema(t *testing.T) {
+	base := "User: do the task\n\nAssistant:"
+	got := appendToolErrorCorrection(base, `missing required property "path"`)
+
+	if !strings.Contains(got, "failed tool validation") {
+		t.Fatalf("schema error must keep the schema correction, got %q", got)
+	}
+	if strings.Contains(got, "budget that does not exist") {
+		t.Fatal("schema error must not receive the refusal correction")
+	}
+	if !strings.HasSuffix(got, "\n\nAssistant:") {
+		t.Fatal("note must stay before the Assistant cue")
+	}
+}
+
+// A successful background model refresh proves the account is reachable and
+// authenticated, so the transient failure label must clear on its own. Only a
+// served request used to reset the counters, and the scheduler never serves one,
+// so "degraded" outlived its cause until an operator pressed Refresh manually.
+func TestRefreshAccountClearsTransientFailure(t *testing.T) {
+	a := &AccountState{ID: "acc1"}
+	a.Fails = 3
+	a.LastFail = time.Now()
+	a.LastError = "upstream_stalled: no candidate frame"
+
+	if !shouldClearTransientFailure(a.LastError) {
+		t.Fatal("a transient stall must be cleared by a healthy registry read")
+	}
+
+	// The session/auth verdicts must survive: they are not disproved by listing
+	// models, and hiding them would send the operator to the wrong remedy.
+	for _, severe := range []string{
+		"session is unauthenticated or the saved cookies have expired (code 1016)",
+		"upstream auth error 401: auth_redirect",
+		"account_banned: TOS_VIOLATION",
+		"account restricted upstream (PERMISSION_DENIED)",
+	} {
+		if shouldClearTransientFailure(severe) {
+			t.Errorf("severe failure %q must not be cleared by a registry read", severe)
+		}
+	}
+}
+
+// An account carrying a failure must be re-checked on a short cadence. The
+// recheck is what proves the failure is over and clears the degraded label, so a
+// full 30-minute model-refresh interval would leave the account looking broken
+// long after it recovered - the reason the operator was pressing Refresh by hand.
+func TestFailedAccountRechecksSooner(t *testing.T) {
+	now := time.Now()
+	s := &Server{}
+	s.SetCfg(config.Config{ModelRefreshEvery: 30 * time.Minute})
+
+	healthy := &AccountState{ID: "healthy"}
+	now2, healthyNext := s.nextRefreshAt(now, healthy)
+	failed := &AccountState{ID: "failed"}
+	failed.Fails = 2
+	failed.LastFail = now.Add(-time.Minute)
+	now3, failedNext := s.nextRefreshAt(now, failed)
+
+	if !now2.Equal(now) || !now3.Equal(now) {
+		t.Fatal("nextRefreshAt must not advance the clock")
+	}
+	if !healthyNext.After(now.Add(10 * time.Minute)) {
+		t.Errorf("a healthy account should keep the slow cadence, got %v", healthyNext.Sub(now))
+	}
+	if failedNext.Sub(now) > 3*failureRecheckInterval {
+		t.Errorf("a failed account must be re-checked within a few minutes, got %v", failedNext.Sub(now))
+	}
+	if !failedNext.Before(healthyNext) {
+		t.Errorf("failed recheck %v must come before healthy %v", failedNext.Sub(now), healthyNext.Sub(now))
+	}
+}
+
+func TestSchedulerSchedulesRecoveryForDegradedAccountWithoutDeadline(t *testing.T) {
+	now := time.Now()
+	srv := &Server{clock: func() time.Time { return now }}
+	srv.SetCfg(config.Config{ModelRefreshEvery: 30 * time.Minute})
+	acct := &AccountState{ID: "degraded", Fails: 1, LastError: "upstream_stalled"}
+	srv.SetAccounts([]*AccountState{acct})
+	srv.RunSchedulerStep(context.Background(), now)
+	acct.mu.RLock()
+	due := acct.NextModelRefAt
+	acct.mu.RUnlock()
+	if due.IsZero() || due.After(now.Add(30*time.Second)) {
+		t.Fatalf("degraded account without deadline got recovery probe at %v", due.Sub(now))
+	}
+}
+
+// Recording a failure must pull the next model refresh forward. The recheck is
+// what proves the failure is over, and an account keeps whatever deadline it was
+// given while healthy - which is the slow cadence. Without this, an account that
+// breaks just after its scheduled refresh waits the full interval, which is the
+// state the operator kept escaping by pressing Refresh by hand.
+func TestMarkAccountFailureSchedulesFastRecheck(t *testing.T) {
+	now := time.Now()
+	a := &AccountState{ID: "acc1"}
+	// Healthy cadence: a refresh 25 minutes out.
+	a.NextModelRefAt = now.Add(25 * time.Minute)
+
+	s := &Server{clock: func() time.Time { return now }}
+	s.markAccountFailure(a, "upstream_stalled: no candidate frame")
+
+	a.mu.RLock()
+	due := a.NextModelRefAt
+	fails := a.Fails
+	a.mu.RUnlock()
+
+	if fails != 1 {
+		t.Fatalf("failure not recorded, Fails=%d", fails)
+	}
+	if d := due.Sub(now); d > 3*failureRecheckInterval {
+		t.Errorf("next refresh still %v out; a failed account must be re-checked within minutes", d)
+	}
+}
+
+// A failure must never push the recheck later than it already was.
+func TestMarkAccountFailureNeverDelaysRecheck(t *testing.T) {
+	now := time.Now()
+	a := &AccountState{ID: "acc1"}
+	a.NextModelRefAt = now.Add(30 * time.Second)
+
+	s := &Server{clock: func() time.Time { return now }}
+	s.markAccountFailure(a, "upstream_stalled")
+
+	a.mu.RLock()
+	due := a.NextModelRefAt
+	a.mu.RUnlock()
+	if due.After(now.Add(30 * time.Second)) {
+		t.Errorf("a failure moved the recheck later (%v); it must only pull it forward", due.Sub(now))
+	}
+}
+
 // A rotation rejected by Google is the only signal that a saved session can no
 // longer be renewed (expired, or bound to a browser key gsb does not hold).
 // Recording it as an auth failure makes the account report `expired` at once
@@ -2544,7 +2746,7 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 func TestSchedulerMarksExpiredWhenRotationRejected(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	now := time.Now()
-	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	srv.UpdateCfg(func(c *config.Config) { c.RotateCookiesEvery = 9 * time.Minute })
 	acct.mu.Lock()
 	acct.NextRotateAt = now.Add(-time.Second)
 	acct.NextModelRefAt = now.Add(time.Hour)

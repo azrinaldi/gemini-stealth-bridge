@@ -2,6 +2,7 @@ package cookies
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
@@ -9,8 +10,10 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,23 +149,38 @@ func isKnownBrowser(name string) bool {
 }
 
 func expandPercentEnv(s string) string {
-	for {
-		start := strings.IndexByte(s, '%')
-		if start < 0 {
-			return s
-		}
-		end := strings.IndexByte(s[start+1:], '%')
-		if end <= 0 {
-			return s
-		}
-		end += start + 1
-		key := s[start+1 : end]
-		val := os.Getenv(key)
-		if val == "" {
-			return s
-		}
-		s = s[:start] + val + s[end+1:]
+	if !strings.ContainsRune(s, '%') {
+		return s
 	}
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		relStart := strings.IndexByte(s[i:], '%')
+		if relStart < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		start := i + relStart
+		b.WriteString(s[i:start])
+		relEnd := strings.IndexByte(s[start+1:], '%')
+		if relEnd < 0 {
+			b.WriteString(s[start:])
+			break
+		}
+		end := start + 1 + relEnd
+		key := s[start+1 : end]
+		if key != "" {
+			if val := os.Getenv(key); val != "" {
+				b.WriteString(val)
+				i = end + 1
+				continue
+			}
+		}
+		b.WriteString(s[start : end+1])
+		i = end + 1
+	}
+	return b.String()
 }
 
 func normalizeInputPath(raw string) string {
@@ -234,7 +252,13 @@ func isPathLike(s string) bool {
 
 func browserUserDataDirs(browser string) []string {
 	b := strings.ToLower(strings.TrimSpace(browser))
-	home, _ := os.UserHomeDir()
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = os.Getenv("USERPROFILE")
+	}
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
 	localAppData := os.Getenv("LOCALAPPDATA")
 	if localAppData == "" && home != "" {
 		localAppData = filepath.Join(home, "AppData", "Local")
@@ -435,26 +459,51 @@ func FindBrowserCookieDB(nameOrPath string) (string, error) {
 	return "", fmt.Errorf("unknown browser %q (known: chrome, chromium, brave, edge, vivaldi, arc; or pass a profile directory/path)", nameOrPath)
 }
 
-// ReadBrowserCookies reads and decrypts Google session cookies from a Chrome/Chromium
-// or Firefox SQLite database without locking the browser's live file.
-func ReadBrowserCookies(dbPath string) (*ReadResult, error) {
+func sqliteFileURI(dbPath, rawQuery string) string {
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		absPath = dbPath
+	}
+	slashPath := filepath.ToSlash(absPath)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	u := url.URL{
+		Scheme:   "file",
+		Path:     slashPath,
+		RawQuery: rawQuery,
+	}
+	return u.String()
+}
+
+func copyCookieDBToTemp(dbPath string) (string, string, error) {
 	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("gsb-ck-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
-		return nil, err
+		return "", "", err
 	}
-	defer os.RemoveAll(tmpDir)
-
 	tmpDB := filepath.Join(tmpDir, "Cookies.db")
 	if err := copyFile(dbPath, tmpDB); err != nil {
-		return nil, fmt.Errorf("copy cookie db: %w", err)
+		_ = os.RemoveAll(tmpDir)
+		return "", "", fmt.Errorf("copy cookie db: %w", err)
 	}
-	for _, suffix := range []string{"-wal", "-shm"} {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		if _, err := os.Stat(dbPath + suffix); err == nil {
 			_ = copyFile(dbPath+suffix, tmpDB+suffix)
 		}
 	}
+	return tmpDir, tmpDB, nil
+}
 
-	db, err := sql.Open("sqlite", tmpDB)
+// ReadBrowserCookies reads and decrypts Google session cookies from a Chrome/Chromium
+// or Firefox SQLite database without locking the browser's live file.
+func ReadBrowserCookies(dbPath string) (*ReadResult, error) {
+	tmpDir, tmpDB, err := copyCookieDBToTemp(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	db, err := sql.Open("sqlite", sqliteFileURI(tmpDB, ""))
 	if err != nil {
 		return nil, err
 	}
@@ -552,7 +601,7 @@ func readChromiumCookies(db *sql.DB, dbPath string) (*ReadResult, error) {
 				res.Failed++
 				continue
 			}
-			dec := decryptCookieBytes(r.encrypted, key256, key128)
+			dec := decryptCookieBytesForHost(r.encrypted, key256, key128, r.host)
 			if dec == nil {
 				res.Failed++
 				continue
@@ -687,14 +736,25 @@ func keychainServicesFor(dbPath string) []string {
 	return out
 }
 
+var keyringCmdTimeout = 10 * time.Second
+
+func runKeyringCmd(name string, args ...string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), keyringCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 500 * time.Millisecond
+	out, err := cmd.Output()
+	if err != nil {
+		return "", errors.Is(ctx.Err(), context.DeadlineExceeded)
+	}
+	return strings.TrimSpace(string(out)), false
+}
+
 // keychainPassword reads a macOS Keychain generic password. An empty result
 // means the item is absent or the user declined the access prompt.
 func keychainPassword(service string) string {
-	out, err := exec.Command("security", "find-generic-password", "-s", service, "-w").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	out, _ := runKeyringCmd("security", "find-generic-password", "-s", service, "-w")
+	return out
 }
 
 func candidatePasswords(dbPath string) []string {
@@ -715,15 +775,20 @@ func candidatePasswords(dbPath string) []string {
 			// Chromium forks keep their cookie key in the login Keychain under
 			// "<Product> Safe Storage"; macOS prompts once per item.
 			for _, svc := range keychainServicesFor(dbPath) {
-				add(keychainPassword(svc))
+				out, timedOut := runKeyringCmd("security", "find-generic-password", "-s", svc, "-w")
+				add(out)
+				if timedOut {
+					break
+				}
 			}
 		case "windows":
 			// The key is DPAPI-wrapped inside "Local State"; see detectBestKey.
 		default:
 			for _, app := range keyringApps {
-				out, err := exec.Command("secret-tool", "lookup", "application", app).Output()
-				if err == nil {
-					add(strings.TrimSpace(string(out)))
+				out, timedOut := runKeyringCmd("secret-tool", "lookup", "application", app)
+				add(out)
+				if timedOut {
+					break
 				}
 			}
 		}
@@ -775,7 +840,7 @@ func detectBestKey(rows []rawChromiumRow, dbPath string) (best256, best128 []byt
 			if len(r.encrypted) == 0 {
 				continue
 			}
-			if decryptCookieBytes(r.encrypted, cand.k256, cand.k128) != nil {
+			if decryptCookieBytesForHost(r.encrypted, cand.k256, cand.k128, r.host) != nil {
 				score++
 			}
 		}
@@ -795,7 +860,34 @@ func detectBestKey(rows []rawChromiumRow, dbPath string) (best256, best128 []byt
 	return best256, best128, ok
 }
 
+func isValidCookieOctets(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	if len(b) >= 2 && b[0] == '"' && b[len(b)-1] == '"' {
+		b = b[1 : len(b)-1]
+		if len(b) == 0 {
+			return false
+		}
+	}
+	for _, ch := range b {
+		if ch == 0x21 ||
+			(ch >= 0x23 && ch <= 0x2b) ||
+			(ch >= 0x2d && ch <= 0x3a) ||
+			(ch >= 0x3c && ch <= 0x5b) ||
+			(ch >= 0x5d && ch <= 0x7e) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func decryptCookieBytes(buf, key256, key128 []byte) []byte {
+	return decryptCookieBytesForHost(buf, key256, key128, "")
+}
+
+func decryptCookieBytesForHost(buf, key256, key128 []byte, host string) []byte {
 	if len(buf) < 4 {
 		return nil
 	}
@@ -835,7 +927,14 @@ func decryptCookieBytes(buf, key256, key128 []byte) []byte {
 					}
 				}
 				if validPad {
-					return out[:len(out)-pad]
+					plain := out[:len(out)-pad]
+					check := plain
+					if host != "" {
+						check, _ = stripDomainPrefix(plain, host)
+					}
+					if isValidCookieOctets(check) {
+						return plain
+					}
 				}
 			}
 		}
@@ -855,15 +954,6 @@ func stripDomainPrefix(buf []byte, host string) ([]byte, bool) {
 }
 
 func bestHeaderFromRows(rows []CookieRow) string {
-	score := func(h string) int {
-		if h == ".google.com" || h == "google.com" {
-			return 3
-		}
-		if strings.HasSuffix(h, ".google.com") {
-			return 2
-		}
-		return 1
-	}
 	best := make(map[string]string)
 	bestScore := make(map[string]int)
 	bestExpiry := make(map[string]int64)
@@ -871,7 +961,10 @@ func bestHeaderFromRows(rows []CookieRow) string {
 		if !essentialSet[r.Name] || r.Value == "" {
 			continue
 		}
-		s := score(r.Host)
+		s := cookieDomainScore(r.Name, r.Host)
+		if s == 0 {
+			continue
+		}
 		if s > bestScore[r.Name] || (s == bestScore[r.Name] && r.ExpiresAt > bestExpiry[r.Name]) {
 			best[r.Name] = r.Value
 			bestScore[r.Name] = s
@@ -903,10 +996,23 @@ func hasSAPISIDCookieRow(dbPath string) bool {
 	if strings.TrimSpace(dbPath) == "" {
 		return false
 	}
-	// immutable=1 keeps the probe lock-free while the browser is running; a
-	// stale snapshot is fine for a yes/no presence check.
-	dsn := "file:" + filepath.ToSlash(dbPath) + "?mode=ro&immutable=1"
-	db, err := sql.Open("sqlite", dsn)
+	// Open read-only with properly escaped file:// URI so WAL files are read when
+	// accessible; if the browser holds an exclusive lock or WAL recovery needs a
+	// writable directory, fall back to a temp copy including -wal/-shm/-journal.
+	if db, err := sql.Open("sqlite", sqliteFileURI(dbPath, "mode=ro")); err == nil {
+		var n int
+		qErr := db.QueryRow(`SELECT COUNT(*) FROM cookies WHERE name = 'SAPISID'`).Scan(&n)
+		_ = db.Close()
+		if qErr == nil {
+			return n > 0
+		}
+	}
+	tmpDir, tmpDB, err := copyCookieDBToTemp(dbPath)
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(tmpDir)
+	db, err := sql.Open("sqlite", sqliteFileURI(tmpDB, ""))
 	if err != nil {
 		return false
 	}
@@ -970,11 +1076,11 @@ func DetectActiveProfileLock(dbPath string) string {
 	return ""
 }
 
-// ReadChromeCookies reads and decrypts Google cookies from dbPath and returns the canonical Cookie header.
-func ReadChromeCookies(dbPath string) (string, error) {
-	res, err := ReadBrowserCookies(dbPath)
-	if err != nil {
-		return "", err
+// ValidateChromeReadResult extracts the canonical Cookie header from a ReadResult,
+// returning a diagnostic decryption error if all Google cookies failed to decrypt.
+func ValidateChromeReadResult(dbPath string, res *ReadResult) (string, error) {
+	if res == nil {
+		return "", fmt.Errorf("empty cookie read result for %s", dbPath)
 	}
 	if res.Header == "" && res.Failed > 0 && res.Decrypted == 0 && res.Plain == 0 {
 		hint := "if Chrome uses App-Bound (v20) encryption, export cookies via Cookie-Editor and use --import-cookie"
@@ -990,4 +1096,13 @@ func ReadChromeCookies(dbPath string) (string, error) {
 		return "", fmt.Errorf("failed to decrypt %d Google cookie(s) in %s (key_found=%v) — %s", res.Failed, dbPath, res.KeyFound, hint)
 	}
 	return res.Header, nil
+}
+
+// ReadChromeCookies reads and decrypts Google cookies from dbPath and returns the canonical Cookie header.
+func ReadChromeCookies(dbPath string) (string, error) {
+	res, err := ReadBrowserCookies(dbPath)
+	if err != nil {
+		return "", err
+	}
+	return ValidateChromeReadResult(dbPath, res)
 }

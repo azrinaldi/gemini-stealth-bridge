@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -27,14 +28,15 @@ type persistedSessionEntry struct {
 }
 
 func (s *Server) sessionCacheDiskPath() string {
-	if s.Cfg.HomeDir == "" {
+	homeDir := s.cfgSnapshot().HomeDir
+	if homeDir == "" {
 		return ""
 	}
-	st, err := os.Stat(s.Cfg.HomeDir)
+	st, err := os.Stat(homeDir)
 	if err != nil || !st.IsDir() {
 		return ""
 	}
-	return filepath.Join(s.Cfg.HomeDir, "session-cache.json")
+	return filepath.Join(homeDir, "session-cache.json")
 }
 
 func (s *Server) loadSessionCacheFromDisk() {
@@ -125,7 +127,13 @@ func (s *Server) flushSessionCacheToDisk() {
 	if !s.cacheFlushPending.CompareAndSwap(false, true) {
 		return
 	}
+	s.cacheFlushMu.Lock()
+	if !s.cacheFlushPending.Load() {
+		s.cacheFlushMu.Unlock()
+		return
+	}
 	s.cacheFlushWG.Add(1)
+	s.cacheFlushMu.Unlock()
 	go func() {
 		defer s.cacheFlushWG.Done()
 		s.flushSessionCacheLocked()
@@ -229,6 +237,26 @@ func (s *Server) deleteSessionCache(key string) {
 	s.flushSessionCacheToDisk()
 }
 
+// shouldEvictSessionCacheOnError reports whether a failed continuation attempt
+// means the cached Gemini conversation should be discarded so later turns do
+// not repeatedly hit a stalled or broken thread.
+func shouldEvictSessionCacheOnError(errCode string, errStatus int) bool {
+	switch errCode {
+	case "empty_upstream_response",
+		"incomplete_upstream_response",
+		"upstream_error_reply",
+		"upstream_error",
+		"upstream_stalled",
+		"upstream_timeout",
+		"tool_call_error":
+		return true
+	case "upstream_http_error":
+		return errStatus >= 400
+	default:
+		return false
+	}
+}
+
 func (s *Server) putSessionCache(key string, meta []any) {
 	if len(meta) == 0 {
 		return
@@ -262,7 +290,7 @@ func (s *Server) saveSessionContinuation(
 	oaCalls []toolbridge.OpenAIToolCall,
 	cid, rid, rcid, contextToken string,
 ) {
-	if !s.Cfg.SessionCache || cid == "" || rid == "" || rcid == "" {
+	if !s.cfgSnapshot().SessionCache || cid == "" || rid == "" || rcid == "" {
 		return
 	}
 	var replyMsg map[string]any
@@ -391,5 +419,28 @@ func (s *Server) putUploadCache(cacheKey string, uf gemini.UploadedFile) {
 		s.uploadOrder = append(s.uploadOrder, cacheKey)
 	}
 	s.uploadCache[cacheKey] = cachedUpload{File: uf, At: time.Now()}
+	s.mu.Unlock()
+}
+
+func (s *Server) evictUploadCacheForAccount(acctID string) {
+	if acctID == "" {
+		return
+	}
+	prefix := acctID + ":"
+	s.mu.Lock()
+	for k := range s.uploadCache {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.uploadCache, k)
+		}
+	}
+	if len(s.uploadOrder) > 0 {
+		kept := s.uploadOrder[:0]
+		for _, k := range s.uploadOrder {
+			if !strings.HasPrefix(k, prefix) {
+				kept = append(kept, k)
+			}
+		}
+		s.uploadOrder = kept
+	}
 	s.mu.Unlock()
 }

@@ -2,8 +2,8 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +15,7 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/webui"
 )
 
@@ -31,23 +32,20 @@ func clientRemoteHost(r *http.Request) string {
 	return host
 }
 
-// isDirectLoopbackRequest reports true only when the socket peer is a loopback
-// address AND no reverse-proxy forwarding header indicates an external client.
+// isDirectLoopbackRequest only permits unproxied browser or CLI traffic to a loopback authority.
 func isDirectLoopbackRequest(r *http.Request) bool {
-	host := clientRemoteHost(r)
-	if host != "" && !config.IsLoopbackHost(host) {
+	peer := net.ParseIP(clientRemoteHost(r))
+	host, _, ok := splitRequestAuthority(r.Host)
+	if peer == nil || !peer.IsLoopback() || !ok || !config.IsLoopbackHost(strings.ToLower(host)) || isCrossSiteRequest(r) {
 		return false
 	}
-	for _, hdr := range []string{"X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP", "Forwarded"} {
-		val := strings.TrimSpace(r.Header.Get(hdr))
-		if val == "" {
-			continue
+	for hdr := range r.Header {
+		key := strings.ToLower(hdr)
+		if strings.HasPrefix(key, "x-forwarded-") {
+			return false
 		}
-		first := strings.TrimSpace(strings.Split(val, ",")[0])
-		if strings.HasPrefix(strings.ToLower(first), "for=") {
-			first = strings.Trim(strings.TrimPrefix(first[4:], ""), "\"[]")
-		}
-		if !config.IsLoopbackHost(first) {
+		switch key {
+		case "forwarded", "x-forwarded", "x-real-ip", "cf-connecting-ip", "true-client-ip", "x-client-ip", "via":
 			return false
 		}
 	}
@@ -55,10 +53,9 @@ func isDirectLoopbackRequest(r *http.Request) bool {
 }
 
 func (s *Server) requiredAdminKey() (key string, mode string) {
-	s.mu.RLock()
-	adminKey := strings.TrimSpace(s.Cfg.AdminKey)
-	apiKey := strings.TrimSpace(s.Cfg.APIKey)
-	s.mu.RUnlock()
+	cfg := s.cfgSnapshot()
+	adminKey := strings.TrimSpace(cfg.AdminKey)
+	apiKey := strings.TrimSpace(cfg.APIKey)
 	if adminKey != "" {
 		return adminKey, "admin_key"
 	}
@@ -124,62 +121,37 @@ func (s *Server) clearAdminAuthFailures(ip string) {
 
 // authorizeAdminAPI enforces the VPS security model on /v1/admin/* routes.
 func (s *Server) authorizeAdminAPI(w http.ResponseWriter, r *http.Request) bool {
-	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
-		sendJSON(w, http.StatusForbidden, map[string]any{
-			"error": map[string]any{
-				"message": "cross-site admin requests are forbidden",
-				"type":    "AuthorizationError",
-				"code":    "cross_site_forbidden",
-			},
-		}, nil)
+	if isCrossSiteRequest(r) {
+		sendJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{"message": "cross-site admin requests are forbidden", "type": "AuthorizationError", "code": "cross_site_forbidden"}}, nil)
 		return false
 	}
-
 	reqKey, _ := s.requiredAdminKey()
 	loopback := isDirectLoopbackRequest(r)
 	if !loopback && reqKey == "" {
-		sendJSON(w, http.StatusForbidden, map[string]any{
-			"error": map[string]any{
-				"message": "remote access to the web control plane is locked while BRIDGE_API_KEY is 'public'; set BRIDGE_ADMIN_KEY or a non-public BRIDGE_API_KEY, or connect via SSH port forwarding (ssh -L 20133:127.0.0.1:20133)",
-				"type":    "AuthorizationError",
-				"code":    "remote_web_ui_locked",
-			},
-		}, nil)
+		sendJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
+			"message": "remote access to the web control plane is locked while BRIDGE_API_KEY is 'public'; set BRIDGE_ADMIN_KEY or a non-public BRIDGE_API_KEY, or connect via SSH port forwarding (ssh -L 20133:127.0.0.1:20133)",
+			"type":    "AuthorizationError",
+			"code":    "remote_web_ui_locked",
+		}}, nil)
 		return false
 	}
-
 	if reqKey == "" {
 		return true
 	}
-
 	ip := clientRemoteHost(r)
 	now := s.now()
 	if s.isAdminRateLimited(ip, now) {
-		sendJSON(w, http.StatusTooManyRequests, map[string]any{
-			"error": map[string]any{
-				"message": "too many failed authentication attempts; wait 60 seconds before retrying",
-				"type":    "RateLimitError",
-				"code":    "admin_auth_rate_limited",
-			},
-		}, nil)
+		sendJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "too many failed authentication attempts; wait 60 seconds before retrying", "type": "RateLimitError", "code": "admin_auth_rate_limited"}}, nil)
 		return false
 	}
-
 	token := extractAdminToken(r)
-	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(reqKey)) != 1 {
+	if !matchesSecret(token, reqKey) {
 		if token != "" {
 			s.recordAdminAuthFailure(ip, now)
 		}
-		sendJSON(w, http.StatusUnauthorized, map[string]any{
-			"error": map[string]any{
-				"message": "admin authentication required; supply BRIDGE_ADMIN_KEY or BRIDGE_API_KEY",
-				"type":    "authentication_error",
-				"code":    "admin_auth_required",
-			},
-		}, nil)
+		sendJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "admin authentication required; supply BRIDGE_ADMIN_KEY or BRIDGE_API_KEY", "type": "authentication_error", "code": "admin_auth_required"}}, nil)
 		return false
 	}
-
 	s.clearAdminAuthFailures(ip)
 	return true
 }
@@ -231,14 +203,12 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		}
 	}
 
-	s.mu.RLock()
-	cfg := s.Cfg
+	cfg := s.cfgSnapshot()
 	sources := make(map[string]string, len(cfg.FieldSources))
 	for k, v := range cfg.FieldSources {
 		sources[k] = v
 	}
 	prio := append([]string(nil), cfg.AccountPriority...)
-	s.mu.RUnlock()
 
 	defThink := ThinkingLevelName(cfg.DefaultThinking)
 	if defThink == "" {
@@ -260,6 +230,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		"authMode":     authMode,
 		"poolKey":      s.displayPoolKey(cfg.APIKey),
 		"rotateCursor": rotCursor,
+		"aliasesEnabled": (cfg.APIKey == "" || cfg.APIKey == "public") && len(cfg.AccountTokens) == 0,
 		// The live model ids, so the Web UI can show the connection copy chips
 		// from the same registry the API serves. A hardcoded list there went
 		// stale the moment upstream renamed a model.
@@ -348,6 +319,19 @@ func (s *Server) HandleAdmin(ctx context.Context, w http.ResponseWriter, r *http
 		if !ok {
 			return
 		}
+		if rawID, _ := body["id"].(string); strings.TrimSpace(rawID) != "" && !reSafeID.MatchString(strings.TrimSpace(rawID)) {
+			sendJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]any{"message": fmt.Sprintf("invalid account id %q", strings.TrimSpace(rawID)), "type": "invalid_request_error"},
+			}, nil)
+			return
+		}
+		if !s.browserLoginInFlight.CompareAndSwap(false, true) {
+			sendJSON(w, http.StatusConflict, map[string]any{
+				"error": map[string]any{"message": "another browser login is already in progress", "type": "invalid_request_error"},
+			}, nil)
+			return
+		}
+		defer s.browserLoginInFlight.Store(false)
 		loginCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		defer cancel()
 		res, err := cookies.RunIsolatedBrowserLogin(loginCtx, "")
@@ -413,7 +397,7 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 	envUpdates := make(map[string]string)
 
 	s.mu.Lock()
-	cfg := s.Cfg
+	cfg := s.cfgSnapshot().Clone()
 	if cfg.FieldSources == nil {
 		cfg.FieldSources = make(map[string]string)
 	}
@@ -552,21 +536,22 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 	for k := range envUpdates {
 		if persist {
 			cfg.FieldSources[k] = "file"
-		} else if cfg.FieldSources[k] == "" {
+		} else {
 			cfg.FieldSources[k] = "runtime"
 		}
 	}
-	s.Cfg = cfg
-	s.mu.Unlock()
 
 	if persist && len(envUpdates) > 0 {
 		if err := config.SaveEnvFile(envPath, envUpdates); err != nil {
+			s.mu.Unlock()
 			sendJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]any{"message": fmt.Sprintf("failed to save %s: %v", envPath, err), "type": "server_error"},
 			}, nil)
 			return
 		}
 	}
+	s.cfgPtr.Store(&cfg)
+	s.mu.Unlock()
 
 	payload := s.buildAdminConfigPayload()
 	payload["persisted"] = persist
@@ -645,12 +630,11 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 	proxyURL, _ := body["proxyUrl"].(string)
 	proxyURL = strings.TrimSpace(proxyURL)
 
-	s.mu.RLock()
-	acctsDir := s.Cfg.AccountsDir
-	locale := s.Cfg.Locale
-	blOverride := s.Cfg.BLOverride
-	protoMode := s.Cfg.ProtocolMode
-	s.mu.RUnlock()
+	cfg := s.cfgSnapshot()
+	acctsDir := cfg.AccountsDir
+	locale := cfg.Locale
+	blOverride := cfg.BLOverride
+	protoMode := cfg.ProtocolMode
 
 	if err := os.MkdirAll(acctsDir, 0o700); err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]any{
@@ -659,61 +643,133 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 		return
 	}
 
+	// A hidden staging directory keeps both credential writes and the probe's
+	// transport session off the existing account, even for explicit re-imports.
+	stageDir, err := os.MkdirTemp(acctsDir, ".import-")
+	if err != nil {
+		sendChatError(w, false, fmt.Errorf("stage imported credentials: %w", err))
+		return
+	}
+	defer os.RemoveAll(stageDir)
+	stagePath := filepath.Join(stageDir, "account.json")
+	now := s.now().UTC()
+	nowISO := now.Format(time.RFC3339)
+	initialRec := cookies.CredentialFile{
+		Kind: "gemini-web", Name: filepath.Base(stageDir), Cookies: hdr,
+		CapturedAt: nowISO, RotatedAt: nowISO, ImportedFrom: "web-ui",
+		ProfileID: "cookie-export", AccountGroup: acctGroup, ProxyURL: proxyURL,
+	}
+	if acctID != "" {
+		// Re-import into the same Google account slot; don't reuse stale auth tokens.
+		if prev, _, err := cookies.LoadAccountFile(filepath.Join(acctsDir, acctID+".json")); err == nil {
+			initialRec.AuthUser = prev.AuthUser
+			initialRec.Disabled = prev.Disabled
+			if acctGroup == "" {
+				acctGroup = prev.AccountGroup
+				initialRec.AccountGroup = acctGroup
+			}
+			if proxyURL == "" {
+				proxyURL = prev.ProxyURL
+				initialRec.ProxyURL = proxyURL
+			}
+		}
+	}
+	if _, err := cookies.SaveCredentialFile(stagePath, initialRec); err != nil {
+		sendChatError(w, false, fmt.Errorf("stage imported credentials: %w", err))
+		return
+	}
+	ac := gemini.NewAccountClient(initialRec.Name, hdr, stagePath, s.Pool, s.Rotator)
+	defer func() {
+		if s.Pool != nil {
+			s.Pool.Remove(initialRec.Name)
+		}
+		if s.Rotator != nil {
+			s.Rotator.Forget(initialRec.Name)
+		}
+	}()
+	ac.SetProvenance("web-ui", "cookie-export")
+	ac.SetAuthUser(initialRec.AuthUser)
+	ac.SetRuntimeOptions(locale, blOverride, protoMode, acctGroup, proxyURL)
+	candidate := &AccountState{ID: acctID, FilePath: stagePath, Client: ac, AccountGroup: acctGroup, ProxyURL: proxyURL, CapturedAt: now}
+	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	err = s.probeSingleAccount(probeCtx, candidate)
+	if err != nil && probeCtx.Err() == nil {
+		// Freshly captured browser cookies can hit a brief propagation delay on
+		// the first /app bootstrap or model listing; retry once before failing.
+		select {
+		case <-time.After(1200 * time.Millisecond):
+			err = s.probeSingleAccount(probeCtx, candidate)
+		case <-probeCtx.Done():
+		}
+	}
+	cancel()
+	if err != nil {
+		log.Printf("[admin] account import probe failed (id=%q): %v", acctID, err)
+		sendChatError(w, false, fmt.Errorf("probe with imported cookies failed: %w", err))
+		return
+	}
+	rec, _, err := cookies.LoadAccountFile(stagePath)
+	if err != nil {
+		sendChatError(w, false, fmt.Errorf("read probed credentials: %w", err))
+		return
+	}
+
+	s.adminImportMu.Lock()
+	defer s.adminImportMu.Unlock()
 	if acctID == "" {
-		// Bootstrap a temporary AccountClient first to discover the Google email and derive a clean ID.
-		tmpClient := gemini.NewAccountClient("pending", hdr, "", s.Pool, s.Rotator)
-		tmpClient.SetRuntimeOptions(locale, blOverride, protoMode, acctGroup, proxyURL)
-		bootCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		bootErr := tmpClient.Bootstrap(bootCtx)
-		cancel()
-		if bootErr != nil {
-			sendChatError(w, false, fmt.Errorf("bootstrap with imported cookies failed: %w", bootErr))
+		existing := s.Accounts()
+		entries, err := os.ReadDir(acctsDir)
+		if err != nil {
+			sendChatError(w, false, fmt.Errorf("list existing credentials: %w", err))
 			return
 		}
-		acctID = deriveAccountIDFromEmail(tmpClient.Email(), s.Accounts())
+		for _, e := range entries {
+			if id, ok := strings.CutSuffix(e.Name(), ".json"); ok {
+				existing = append(existing, &AccountState{ID: id})
+			}
+		}
+		acctID = deriveAccountIDFromEmail(candidate.Email, existing)
 	}
-
-	outPath := filepath.Join(acctsDir, acctID+".json")
-	ac := gemini.NewAccountClient(acctID, hdr, outPath, s.Pool, s.Rotator)
-	ac.SetProvenance("web-ui", "cookie-export")
-	ac.SetRuntimeOptions(locale, blOverride, protoMode, acctGroup, proxyURL)
-
-	// Persist initial credential file so custom clientFactory or live bootstrap can load it.
-	nowISO := s.now().UTC().Format(time.RFC3339)
-	initialRec := cookies.CredentialFile{
-		Kind:         "gemini-web",
-		Name:         acctID,
-		Cookies:      hdr,
-		CapturedAt:   nowISO,
-		RotatedAt:    nowISO,
-		ImportedFrom: "web-ui",
-		ProfileID:    "cookie-export",
-		AccountGroup: acctGroup,
-		ProxyURL:     proxyURL,
-	}
-	if _, err := cookies.SaveCredentialFile(outPath, initialRec); err != nil {
-		sendJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]any{"message": fmt.Sprintf("save credential file: %v", err), "type": "server_error"},
-		}, nil)
+	rec.Name = acctID
+	rec.Email = candidate.Email
+	rec.Surfaces = candidate.Surfaces
+	rec.Disabled = initialRec.Disabled
+	if _, err := cookies.SaveCredentialFile(stagePath, *rec); err != nil {
+		sendChatError(w, false, fmt.Errorf("prepare probed credentials: %w", err))
 		return
 	}
-
-	s.LoadCredentials()
+	outPath := filepath.Join(acctsDir, acctID+".json")
+	if err := retireCredentialState(s.findAccountByID(acctID), func() error { return os.Rename(stagePath, outPath) }); err != nil {
+		sendChatError(w, false, fmt.Errorf("commit imported credentials: %w", err))
+		return
+	}
+	s.loadCredentialsLocked()
 	acct := s.findAccountByID(acctID)
 	if acct == nil {
-		sendJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]any{"message": "account was saved but could not be loaded into pool", "type": "server_error"},
-		}, nil)
+		// Loading can coalesce multiple credential files for the same Google email.
+		for _, a := range s.Accounts() {
+			a.mu.RLock()
+			sameEmail := candidate.Email != "" && strings.EqualFold(a.Email, candidate.Email)
+			a.mu.RUnlock()
+			if sameEmail {
+				acct = a
+				break
+			}
+		}
+	}
+	if acct == nil {
+		sendChatError(w, false, fmt.Errorf("imported account could not be loaded into pool"))
 		return
 	}
-
-	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	if err := s.probeSingleAccount(probeCtx, acct); err != nil {
-		_ = os.Remove(outPath)
-		s.LoadCredentials()
-		sendChatError(w, false, fmt.Errorf("bootstrap with imported cookies failed: %w", err))
-		return
+	if acct.ID == acctID {
+		acct.mu.Lock()
+		acct.Models, acct.Capacity, acct.ModelsAt = candidate.Models, candidate.Capacity, candidate.ModelsAt
+		acct.ModelsError = nil
+		acct.Fails, acct.LastError, acct.LastFail = 0, "", time.Time{}
+		acct.mu.Unlock()
+		if len(candidate.Quota) > 0 {
+			s.mergeAccountQuota(acct, candidate.Quota)
+		}
 	}
 
 	sendJSON(w, http.StatusOK, map[string]any{
@@ -734,6 +790,9 @@ func (s *Server) probeSingleAccount(ctx context.Context, a *AccountState) error 
 		return err
 	}
 	res, err := c.AvailableModels(ctx, true)
+	if err == nil && (res == nil || res.Status != http.StatusOK || len(res.Models) == 0) {
+		err = transport.NewUpstreamError("invalid upstream model registry", http.StatusBadGateway, "model_discovery_error", nil, nil)
+	}
 	if err != nil {
 		a.mu.Lock()
 		a.ModelsError = err
@@ -751,6 +810,9 @@ func (s *Server) probeSingleAccount(ctx context.Context, a *AccountState) error 
 			a.Email = em
 		}
 	}
+	wasQuarantined := a.Quarantined
+	a.Quarantined = false
+	a.QuarantineReason = ""
 	a.Models = res.Models
 	a.Capacity = res.Capacity
 	a.ModelsAt = now
@@ -758,11 +820,30 @@ func (s *Server) probeSingleAccount(ctx context.Context, a *AccountState) error 
 	a.Fails = 0
 	a.LastError = ""
 	a.LastFail = time.Time{}
+	a.QuotaBackoffStep = 0
+	a.QuotaNextAllowAt = time.Time{}
+	clearSyntheticQuotaLocked(a)
 	if a.Surfaces == nil {
 		a.Surfaces = make(map[string]string)
 	}
 	a.Surfaces["geminiWeb"] = "ok"
+	filePath := a.FilePath
 	a.mu.Unlock()
+	if wasQuarantined {
+		if ac, ok := c.(*gemini.AccountClient); ok {
+			ac.SetQuarantined(false, "")
+		} else if filePath != "" {
+			if rec, _, loadErr := cookies.LoadAccountFile(filePath); loadErr == nil && rec != nil {
+				rec.Quarantined = false
+				rec.QuarantineReason = ""
+				if rec.Surfaces == nil {
+					rec.Surfaces = make(map[string]string)
+				}
+				rec.Surfaces["geminiWeb"] = "ok"
+				_, _ = cookies.SaveCredentialFile(filePath, *rec)
+			}
+		}
+	}
 	if len(quota) > 0 {
 		s.mergeAccountQuota(a, quota)
 	}
@@ -809,9 +890,22 @@ func (s *Server) handleAdminRotateAccount(ctx context.Context, w http.ResponseWr
 		return
 	}
 	now := s.now()
-	if res != nil && res.Rotated {
+	if res != nil && res.Status == 200 && res.Rotated {
 		acct.mu.Lock()
 		acct.RotatedAt = now
+		if looksLikeAuthFailure(acct.LastError) {
+			acct.LastError = ""
+			acct.LastFail = time.Time{}
+			acct.Fails = 0
+		}
+		if acct.ModelsError != nil && isModelsAuthError(acct.ModelsError) {
+			acct.ModelsError = nil
+		}
+		acct.mu.Unlock()
+	} else if res != nil && (res.Status == 401 || res.Status == 403) {
+		acct.mu.Lock()
+		acct.LastError = fmt.Sprintf("cookie rotation rejected (HTTP %d); session expired; run `gsb --login %s` to sign in again", res.Status, acct.ID)
+		acct.LastFail = now
 		acct.mu.Unlock()
 	}
 	out := map[string]any{
@@ -873,7 +967,28 @@ func (s *Server) handleAdminUnquarantineAccount(w http.ResponseWriter, acctID st
 	}, nil)
 }
 
+// Hold the account lock so a new dispatch cannot use this state after the
+// commit. In-flight requests may finish, but cannot persist stale credentials.
+func retireCredentialState(account *AccountState, commit func() error) error {
+	if account == nil {
+		return commit()
+	}
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	if client, ok := account.Client.(*gemini.AccountClient); ok {
+		if err := client.RetireCredentialWriter(commit); err != nil {
+			return err
+		}
+	} else if err := commit(); err != nil {
+		return err
+	}
+	account.retired = true
+	return nil
+}
+
 func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, acctID string) {
+	s.adminImportMu.Lock()
+	defer s.adminImportMu.Unlock()
 	acct := s.findAccountByID(acctID)
 	if acct == nil {
 		sendJSON(w, http.StatusNotFound, map[string]any{
@@ -886,15 +1001,21 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, acctID string) 
 	filePath := acct.FilePath
 	acct.mu.RUnlock()
 
-	if filePath != "" {
-		_ = os.Remove(filePath)
-	} else {
-		s.mu.RLock()
-		acctsDir := s.Cfg.AccountsDir
-		s.mu.RUnlock()
-		if acctsDir != "" {
-			_ = os.Remove(filepath.Join(acctsDir, acctID+".json"))
+	if filePath == "" && s.cfgSnapshot().AccountsDir != "" {
+		filePath = filepath.Join(s.cfgSnapshot().AccountsDir, acctID+".json")
+	}
+	if err := retireCredentialState(acct, func() error {
+		if filePath == "" {
+			return nil
 		}
+		err := os.Remove(filePath)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}); err != nil {
+		sendChatError(w, false, fmt.Errorf("remove account credentials: %w", err))
+		return
 	}
 
 	s.mu.Lock()
@@ -911,6 +1032,13 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, acctID string) 
 		}
 	}
 	s.mu.Unlock()
+	if s.Pool != nil {
+		s.Pool.Remove(acctID)
+	}
+	if s.Rotator != nil {
+		s.Rotator.Forget(acctID)
+	}
+	s.evictUploadCacheForAccount(acctID)
 
 	sendJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
@@ -937,7 +1065,17 @@ func deriveAccountIDFromEmail(email string, existing []*AccountState) string {
 	if base == "" || !reSafeID.MatchString(base) {
 		base = fmt.Sprintf("acct-%d", time.Now().Unix()%100000)
 	}
-	return base
+	used := make(map[string]bool, len(existing))
+	for _, account := range existing {
+		if account != nil {
+			used[strings.ToLower(account.ID)] = true
+		}
+	}
+	id := base
+	for i := 2; used[strings.ToLower(id)]; i++ {
+		id = base + "-" + strconv.Itoa(i)
+	}
+	return id
 }
 
 func (s *Server) handleAdminToggleAccount(w http.ResponseWriter, acctID string) {
@@ -1001,30 +1139,39 @@ func (s *Server) handleAdminMoveAccount(w http.ResponseWriter, acctID string, bo
 	if dir == "down" {
 		targetIdx = idx + 1
 	}
-	if targetIdx >= 0 && targetIdx < len(s.accounts) {
-		s.accounts[idx], s.accounts[targetIdx] = s.accounts[targetIdx], s.accounts[idx]
+	ordered := append([]*AccountState(nil), s.accounts...)
+	if targetIdx >= 0 && targetIdx < len(ordered) {
+		ordered[idx], ordered[targetIdx] = ordered[targetIdx], ordered[idx]
 	}
-	prio := make([]string, 0, len(s.accounts))
-	for _, a := range s.accounts {
+	prio := make([]string, 0, len(ordered))
+	for _, a := range ordered {
 		prio = append(prio, a.ID)
 	}
-	s.Cfg.AccountPriority = prio
-	if s.Cfg.FieldSources == nil {
-		s.Cfg.FieldSources = make(map[string]string)
+	cfg := s.cfgSnapshot().Clone()
+	cfg.AccountPriority = prio
+	if cfg.FieldSources == nil {
+		cfg.FieldSources = make(map[string]string)
 	}
-	s.Cfg.FieldSources["BRIDGE_ACCOUNT_PRIORITY"] = "file"
-	envPath := s.Cfg.EnvFile
-	if envPath == "" && s.Cfg.HomeDir != "" {
-		envPath = filepath.Join(s.Cfg.HomeDir, "config.env")
-		s.Cfg.EnvFile = envPath
+	envPath := cfg.EnvFile
+	if envPath == "" && cfg.HomeDir != "" {
+		envPath = filepath.Join(cfg.HomeDir, "config.env")
+		cfg.EnvFile = envPath
 	}
-	s.mu.Unlock()
-
 	if envPath != "" {
-		_ = config.SaveEnvFile(envPath, map[string]string{
+		if err := config.SaveEnvFile(envPath, map[string]string{
 			"BRIDGE_ACCOUNT_PRIORITY": strings.Join(prio, ","),
-		})
+		}); err != nil {
+			s.mu.Unlock()
+			sendChatError(w, false, fmt.Errorf("save account order: %w", err))
+			return
+		}
+		cfg.FieldSources["BRIDGE_ACCOUNT_PRIORITY"] = "file"
+	} else {
+		cfg.FieldSources["BRIDGE_ACCOUNT_PRIORITY"] = "runtime"
 	}
+	s.accounts = ordered
+	s.cfgPtr.Store(&cfg)
+	s.mu.Unlock()
 
 	sendJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
@@ -24,6 +26,7 @@ import (
 func (s *Server) SetAccounts(accts []*AccountState) {
 	s.mu.Lock()
 	s.accounts = accts
+	s.tokenToAcct = make(map[string]string, 2*len(accts))
 	for _, a := range accts {
 		if a != nil && a.ID != "" {
 			s.registerAccountTokensLocked(a.ID, a.ID)
@@ -32,15 +35,14 @@ func (s *Server) SetAccounts(accts []*AccountState) {
 	s.mu.Unlock()
 }
 
+// registerAccountTokensLocked records aliases only; the resolver decides when
+// these aliases are accepted and handles explicit configured tokens.
 func (s *Server) registerAccountTokensLocked(rawID, targetID string) {
 	if rawID == "" || targetID == "" {
 		return
 	}
-	for _, tok := range []string{"gsb-" + rawID, rawID} {
-		if _, explicit := s.Cfg.AccountTokens[tok]; !explicit {
-			s.tokenToAcct[tok] = targetID
-		}
-	}
+	s.tokenToAcct["gsb-"+rawID] = targetID
+	s.tokenToAcct[rawID] = targetID
 }
 
 // Accounts returns a snapshot of the loaded accounts.
@@ -62,6 +64,9 @@ func (s *Server) scopedAccounts(scope AuthScope) []*AccountState {
 	}
 	var out []*AccountState
 	for _, a := range accts {
+		if a == nil {
+			continue
+		}
 		if scope.AccountID != "" {
 			if a.ID == scope.AccountID {
 				out = append(out, a)
@@ -81,10 +86,17 @@ func (s *Server) scopedAccounts(scope AuthScope) []*AccountState {
 // LoadCredentials loads and deduplicates account JSON files from AccountsDir and CredFile,
 // falling back to live Chrome SQLite decryption if no saved files exist.
 func (s *Server) LoadCredentials() int {
+	s.adminImportMu.Lock()
+	defer s.adminImportMu.Unlock()
+	return s.loadCredentialsLocked()
+}
+
+func (s *Server) loadCredentialsLocked() int {
+	cfg := s.cfgSnapshot()
 	var rawList []*AccountState
 
-	credFile := filepath.Join(s.Cfg.HomeDir, "web-credentials.json")
-	if entries, err := os.ReadDir(s.Cfg.AccountsDir); err == nil {
+	credFile := filepath.Join(cfg.HomeDir, "web-credentials.json")
+	if entries, err := os.ReadDir(cfg.AccountsDir); err == nil {
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
 			if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
@@ -97,7 +109,7 @@ func (s *Server) LoadCredentials() int {
 			if !reSafeID.MatchString(id) {
 				continue
 			}
-			fullPath := filepath.Join(s.Cfg.AccountsDir, fn)
+			fullPath := filepath.Join(cfg.AccountsDir, fn)
 			if st, err := s.loadAccountStateFromFile(id, fullPath); err == nil {
 				rawList = append(rawList, st)
 			}
@@ -108,8 +120,8 @@ func (s *Server) LoadCredentials() int {
 		rawList = append(rawList, st)
 	}
 
-	if len(rawList) == 0 && s.Cfg.CookieDB != "" {
-		if dbPath := cookies.FindChromeCookieDB(s.Cfg.CookieDB); dbPath != "" {
+	if len(rawList) == 0 && cfg.CookieDB != "" {
+		if dbPath := cookies.FindChromeCookieDB(cfg.CookieDB); dbPath != "" {
 			if hdr, err := cookies.ReadChromeCookies(dbPath); err == nil && cookies.ExtractSAPISID(hdr) != "" {
 				ac := gemini.NewAccountClient("chrome-live", hdr, "", s.Pool, s.Rotator)
 				rawList = append(rawList, &AccountState{
@@ -130,12 +142,18 @@ func (s *Server) LoadCredentials() int {
 			existingByID[a.ID] = a
 		}
 	}
+	keptPrev := make(map[*AccountState]bool, len(deduped))
 	for i, st := range deduped {
 		prev, ok := existingByID[st.ID]
-		if !ok || prev == nil || !strings.EqualFold(prev.Email, st.Email) {
+		if !ok || prev == nil {
 			continue
 		}
 		prev.mu.Lock()
+		if prev.retired || !strings.EqualFold(prev.Email, st.Email) {
+			prev.mu.Unlock()
+			continue
+		}
+		keptPrev[prev] = true
 		recaptured := (!st.CapturedAt.IsZero() && st.CapturedAt.After(prev.CapturedAt)) ||
 			(prev.Quarantined && !st.Quarantined)
 		prev.FilePath = st.FilePath
@@ -165,25 +183,30 @@ func (s *Server) LoadCredentials() int {
 			prev.ModelsError = nil
 			clearSyntheticQuotaLocked(prev)
 		}
+		client := prev.Client
 		prev.mu.Unlock()
-		if ac, ok := prev.Client.(*gemini.AccountClient); ok {
+		if ac, ok := client.(*gemini.AccountClient); ok {
 			ac.ReloadFromDiskIfNewer()
-			ac.SetRuntimeOptions(s.Cfg.Locale, s.Cfg.BLOverride, s.Cfg.ProtocolMode, st.AccountGroup, st.ProxyURL)
+			ac.SetRuntimeOptions(cfg.Locale, cfg.BLOverride, cfg.ProtocolMode, st.AccountGroup, st.ProxyURL)
 		}
 		deduped[i] = prev
 	}
-	if len(s.Cfg.AccountPriority) > 0 {
+	if len(cfg.AccountPriority) > 0 {
 		ranks := s.accountRanks(deduped)
 		sort.SliceStable(deduped, func(i, j int) bool {
 			return ranks[deduped[i].ID] < ranks[deduped[j].ID]
 		})
 	}
 	s.accounts = deduped
+	s.tokenToAcct = make(map[string]string, 2*len(rawList))
 	byEmail := make(map[string]string, len(deduped))
 	for _, a := range deduped {
 		s.registerAccountTokensLocked(a.ID, a.ID)
-		if a.Email != "" {
-			byEmail[strings.ToLower(strings.TrimSpace(a.Email))] = a.ID
+		a.mu.RLock()
+		email := strings.ToLower(strings.TrimSpace(a.Email))
+		a.mu.RUnlock()
+		if email != "" {
+			byEmail[email] = a.ID
 		}
 	}
 	for _, raw := range rawList {
@@ -192,7 +215,42 @@ func (s *Server) LoadCredentials() int {
 		}
 	}
 	s.mu.Unlock()
+
+	for _, prev := range existingByID {
+		if prev == nil || keptPrev[prev] {
+			continue
+		}
+		prev.mu.Lock()
+		prev.retired = true
+		client := prev.Client
+		prevID := prev.ID
+		prev.mu.Unlock()
+		if ac, ok := client.(*gemini.AccountClient); ok {
+			_ = ac.RetireCredentialWriter(func() error { return nil })
+		}
+		if _, stillPresent := s.findAccountByIDLocked(prevID); !stillPresent {
+			if s.Pool != nil {
+				s.Pool.Remove(prevID)
+			}
+			if s.Rotator != nil {
+				s.Rotator.Forget(prevID)
+			}
+			s.evictUploadCacheForAccount(prevID)
+		}
+	}
+	s.ScheduleAccountTimers(s.now())
 	return len(deduped)
+}
+
+func (s *Server) findAccountByIDLocked(id string) (*AccountState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.accounts {
+		if a != nil && a.ID == id {
+			return a, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error) {
@@ -223,16 +281,17 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 			surfaces[k] = v
 		}
 	}
-	if g, ok := s.Cfg.AccountGroups[id]; ok && g != "" {
+	cfg := s.cfgSnapshot()
+	if g, ok := cfg.AccountGroups[id]; ok && g != "" {
 		acctGroup = g
 	}
 	proxyURL := ""
-	if p, ok := s.Cfg.EgressPerAccount[id]; ok && p != "" {
+	if p, ok := cfg.EgressPerAccount[id]; ok && p != "" {
 		proxyURL = p
 	} else if rec != nil && rec.ProxyURL != "" {
 		proxyURL = rec.ProxyURL
 	}
-	ac.SetRuntimeOptions(s.Cfg.Locale, s.Cfg.BLOverride, s.Cfg.ProtocolMode, acctGroup, proxyURL)
+	ac.SetRuntimeOptions(cfg.Locale, cfg.BLOverride, cfg.ProtocolMode, acctGroup, proxyURL)
 
 	return &AccountState{
 		ID:               id,
@@ -320,6 +379,14 @@ func (s *Server) clientFor(a *AccountState) UpstreamClient {
 	return ac
 }
 
+// shouldClearTransientFailure reports whether a recorded failure is the kind a
+// healthy registry read proves gone. A stall, a timeout or a transport hiccup is
+// evidence about one request; a rejected session or a restricted account is a
+// verdict that a successful model listing does not overturn.
+func shouldClearTransientFailure(lastError string) bool {
+	return !looksLikeAuthFailure(lastError) && !looksLikeAccountBan(lastError)
+}
+
 // RefreshAccount refreshes the live model list and quota for a single account,
 // preserving the last known good state on failure.
 func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool) *AccountState {
@@ -340,6 +407,10 @@ func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool
 		a.mu.Lock()
 		a.ModelsError = err
 		a.mu.Unlock()
+		var ue *transport.UpstreamError
+		if errors.As(err, &ue) && ue != nil && ue.Code == "account_banned" {
+			s.markAccountQuarantined(a, err.Error())
+		}
 		return a
 	}
 
@@ -350,6 +421,21 @@ func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool
 	a.Capacity = am.Capacity
 	a.ModelsAt = time.Now()
 	a.ModelsError = nil
+	// A successful registry read is proof the account is reachable and
+	// authenticated right now. Without this, a transient failure leaves the
+	// account labelled degraded with nothing that ever clears it: only a served
+	// request resets the failure counters, and the scheduler - the one component
+	// that touches every account on a timer - never serves a request. The label
+	// then outlives the condition it described until an operator presses Refresh.
+	// Only transient evidence is cleared. A rejected session or a restricted
+	// account is not disproved by a registry read, so those keep their own
+	// record and their own remedy; clearing them here would hide the very
+	// condition the operator needs to see.
+	if shouldClearTransientFailure(a.LastError) {
+		a.Fails = 0
+		a.LastFail = time.Time{}
+		a.LastError = ""
+	}
 	a.mu.Unlock()
 	if len(quota) > 0 {
 		s.mergeAccountQuota(a, quota)
@@ -445,10 +531,14 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 	if a == nil {
 		return nil
 	}
+	cfg := s.cfgSnapshot()
 	now := s.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if s.Cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= s.Cfg.MaxConcurrentPerAccount {
+	if err := accountBlockedErrorLocked(a); err != nil {
+		return err
+	}
+	if cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= cfg.MaxConcurrentPerAccount {
 		return transport.NewUpstreamError("account concurrent stream limit reached", 429, "rate_limit_error", map[string]string{"retry-after": "2"}, nil)
 	}
 	cutoff := now.Add(-60 * time.Second)
@@ -459,13 +549,13 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 		}
 	}
 	a.reqTimestamps = kept
-	if s.Cfg.MaxRPMPerAccount > 0 && len(a.reqTimestamps) >= s.Cfg.MaxRPMPerAccount {
+	if cfg.MaxRPMPerAccount > 0 && len(a.reqTimestamps) >= cfg.MaxRPMPerAccount {
 		waitSec := int(math.Ceil(a.reqTimestamps[0].Add(60 * time.Second).Sub(now).Seconds()))
 		if waitSec < 1 {
 			waitSec = 1
 		}
 		return transport.NewUpstreamError(
-			fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, s.Cfg.MaxRPMPerAccount),
+			fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, cfg.MaxRPMPerAccount),
 			429,
 			"rate_limit_error",
 			map[string]string{"retry-after": strconv.Itoa(waitSec)},
@@ -480,6 +570,22 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 	return nil
 }
 
+func accountBlockedError(a *AccountState) error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return accountBlockedErrorLocked(a)
+}
+
+func accountBlockedErrorLocked(a *AccountState) error {
+	if a.Quarantined {
+		return transport.NewUpstreamError(fmt.Sprintf("account %s is quarantined: %s", a.ID, a.QuarantineReason), 403, "account_banned", nil, nil)
+	}
+	if a.Disabled || a.retired {
+		return transport.NewUpstreamError(fmt.Sprintf("account %s is disabled", a.ID), 403, "account_disabled", nil, nil)
+	}
+	return nil
+}
+
 func (s *Server) checkPreFlightQuota(a *AccountState, model gemini.ModelInfo, mid string) error {
 	return s.checkPreFlightQuotaInternal(a, model, mid, false)
 }
@@ -488,63 +594,28 @@ func (s *Server) checkPreFlightQuotaInternal(a *AccountState, model gemini.Model
 	if a == nil {
 		return nil
 	}
-	a.mu.RLock()
-	quarantined := a.Quarantined
-	qReason := a.QuarantineReason
-	quota := a.Quota
-	a.mu.RUnlock()
-	if quarantined {
-		return transport.NewUpstreamError(fmt.Sprintf("account %s is quarantined: %s", a.ID, qReason), 403, "account_banned", nil, nil)
+	cfg := s.cfgSnapshot()
+	if err := accountBlockedError(a); err != nil {
+		return err
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(s.Cfg.QuotaPreflight))
+	mode := strings.ToLower(strings.TrimSpace(cfg.QuotaPreflight))
 	if mode == "off" {
 		return nil
 	}
-	if !s.Cfg.RejectDowngrade && (mode == "" || mode == "strict") {
+	if !cfg.RejectDowngrade && (mode == "" || mode == "strict") {
 		return nil
 	}
 	name := strings.ToLower(model.ModelName)
 	if strings.Contains(name, "lite") {
 		return nil
 	}
-	if len(quota) == 0 {
-		return nil
-	}
 	now := s.now()
-	family := modelFamilyTokens(name)
-	var spent []gemini.QuotaBucket
-	for _, q := range quota {
-		if q.Unlimited || q.Total <= 0 || q.Remaining > 0 || q.ResetAt == "" {
-			continue
-		}
-		if t, err := time.Parse(time.RFC3339, q.ResetAt); err == nil && t.After(now) {
-			spent = append(spent, q)
-		}
-	}
-	if len(spent) == 0 {
+	a.mu.RLock()
+	activeSpent := spentQuotaForModel(a.Quota, name, now, false)
+	a.mu.RUnlock()
+	if len(activeSpent) == 0 {
 		return nil
-	}
-	var related []gemini.QuotaBucket
-	for _, q := range spent {
-		if q.ID == "5h" || q.ID == "weekly" {
-			related = append(related, q)
-			continue
-		}
-		lbl := strings.ToLower(q.Label)
-		for _, tok := range family {
-			if strings.Contains(lbl, tok) {
-				related = append(related, q)
-				break
-			}
-		}
-	}
-	if len(family) > 0 && len(related) == 0 {
-		return nil
-	}
-	activeSpent := spent
-	if len(related) > 0 {
-		activeSpent = related
 	}
 	if mode == "advisory" && !forSelection {
 		log.Printf("[quota] advisory preflight warning: model %s appears exhausted on account %s", mid, a.ID)
@@ -603,16 +674,20 @@ func (s *Server) poolAvailabilityError(accts []*AccountState, requested string, 
 		return fallback
 	}
 
-	exhausted, substitution, cooling, rateLimited, busy, modelUnavailable, quarantined, ready := 0, 0, 0, 0, 0, 0, 0, 0
+	exhausted, substitution, cooling, rateLimited, modelUnavailable, quarantined, disabled, ready := 0, 0, 0, 0, 0, 0, 0, 0
 	for _, a := range accts {
 		if a == nil {
 			continue
 		}
 		a.mu.RLock()
-		isQuarantined := a.Quarantined
+		isQuarantined, isDisabled := a.Quarantined, a.Disabled
 		a.mu.RUnlock()
 		if isQuarantined {
 			quarantined++
+			continue
+		}
+		if isDisabled {
+			disabled++
 			continue
 		}
 		model := resolveModelOnAccount(a, requested)
@@ -636,10 +711,6 @@ func (s *Server) poolAvailabilityError(accts []*AccountState, requested string, 
 			rateLimited++
 			continue
 		}
-		if s.isAccountBusy(a.ID) {
-			busy++
-			continue
-		}
 		ready++
 	}
 	if ready > 0 {
@@ -659,14 +730,14 @@ func (s *Server) poolAvailabilityError(accts []*AccountState, requested string, 
 	if rateLimited > 0 {
 		details = append(details, fmt.Sprintf("rate_limited=%d", rateLimited))
 	}
-	if busy > 0 {
-		details = append(details, fmt.Sprintf("busy=%d", busy))
-	}
 	if modelUnavailable > 0 {
 		details = append(details, fmt.Sprintf("model_unavailable=%d", modelUnavailable))
 	}
 	if quarantined > 0 {
 		details = append(details, fmt.Sprintf("quarantined=%d", quarantined))
+	}
+	if disabled > 0 {
+		details = append(details, fmt.Sprintf("disabled=%d", disabled))
 	}
 	if len(details) == 0 {
 		return fallback
@@ -684,62 +755,23 @@ func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName s
 	quota := c.GetQuota(qCtx)
 	cancel()
 	if len(quota) > 0 {
-		s.mergeAccountQuota(a, quota)
-	} else {
-		a.mu.RLock()
-		quota = a.Quota
-		a.mu.RUnlock()
+		quota = s.mergeAccountQuota(a, quota)
 	}
-	var spent []gemini.QuotaBucket
-	for _, q := range quota {
-		if !q.Unlimited && q.Total > 0 && q.Remaining <= 0 {
-			spent = append(spent, q)
-		}
+	a.mu.RLock()
+	if len(quota) == 0 {
+		quota = cloneQuotaBuckets(a.Quota)
 	}
-	if len(spent) > 0 {
-		family := modelFamilyTokens(modelName)
-		var related []gemini.QuotaBucket
-		for _, q := range spent {
-			lbl := strings.ToLower(q.Label)
-			for _, tok := range family {
-				if strings.Contains(lbl, tok) {
-					related = append(related, q)
-					break
-				}
-			}
-		}
-		if len(family) > 0 && len(related) == 0 {
-			return transport.NewUpstreamError("empty upstream response", 502, "empty_upstream_response", nil, nil)
-		}
-		chosen := spent
-		if len(related) > 0 {
-			chosen = related
-		}
+	email := a.Email
+	a.mu.RUnlock()
+	now := s.now()
+	chosen := spentQuotaForModel(quota, modelName, now, true)
+	if len(chosen) > 0 {
 		labels := make([]string, 0, len(chosen))
-		var earliest time.Time
-		now := time.Now()
 		for _, q := range chosen {
 			labels = append(labels, q.Label)
-			if q.ResetAt != "" {
-				if t, err := time.Parse(time.RFC3339, q.ResetAt); err == nil && t.After(now) {
-					if earliest.IsZero() || t.Before(earliest) {
-						earliest = t
-					}
-				}
-			}
 		}
-		var hdrs map[string]string
-		if !earliest.IsZero() {
-			retrySec := int(math.Ceil(earliest.Sub(now).Seconds()))
-			if retrySec < 1 {
-				retrySec = 1
-			}
-			hdrs = map[string]string{
-				"retry-after": strconv.Itoa(retrySec),
-				"x-resets-at": earliest.UTC().Format(time.RFC3339),
-			}
-		}
-		ident := a.Email
+		hdrs := quotaResetHeaders(chosen, now)
+		ident := email
 		if ident == "" {
 			ident = a.ID
 		}
@@ -752,6 +784,45 @@ func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName s
 		)
 	}
 	return transport.NewUpstreamError("empty upstream response", 502, "empty_upstream_response", nil, nil)
+}
+
+// spentQuotaForModel includes account-wide windows alongside model-family
+// buckets. Unknown resets may explain an empty response, but only a future
+// reset should block preflight or tell clients when to retry.
+func spentQuotaForModel(quota []gemini.QuotaBucket, modelName string, now time.Time, allowUnknownReset bool) []gemini.QuotaBucket {
+	family := modelFamilyTokens(modelName)
+	lite := strings.Contains(strings.ToLower(modelName), "lite")
+	var spent []gemini.QuotaBucket
+	for _, q := range quota {
+		if q.Unlimited || q.Total <= 0 || q.Remaining > 0 {
+			continue
+		}
+		if reset, err := time.Parse(time.RFC3339, q.ResetAt); err == nil {
+			if !reset.After(now) {
+				continue
+			}
+		} else if !allowUnknownReset || q.Synthetic || strings.HasPrefix(q.ID, "sub:") {
+			continue
+		}
+		if q.ID == "5h" || q.ID == "weekly" {
+			if !lite {
+				spent = append(spent, q)
+			}
+			continue
+		}
+		if len(family) == 0 {
+			spent = append(spent, q)
+			continue
+		}
+		label := strings.ToLower(q.Label)
+		for _, token := range family {
+			if strings.Contains(label, token) {
+				spent = append(spent, q)
+				break
+			}
+		}
+	}
+	return spent
 }
 
 func modelFamilyTokens(modelName string) []string {
@@ -831,13 +902,20 @@ func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 		Synthetic: true,
 		Strikes:   strikes,
 	}
-	for i, q := range a.Quota {
+	next := make([]gemini.QuotaBucket, 0, len(a.Quota)+1)
+	replaced := false
+	for _, q := range a.Quota {
 		if q.ID == subID {
-			a.Quota[i] = bucket
-			return
+			next = append(next, bucket)
+			replaced = true
+		} else {
+			next = append(next, q)
 		}
 	}
-	a.Quota = append(a.Quota, bucket)
+	if !replaced {
+		next = append(next, bucket)
+	}
+	a.Quota = next
 }
 
 func (s *Server) clearModelExhausted(a *AccountState, modelName string) {
@@ -853,7 +931,17 @@ func (s *Server) clearModelExhausted(a *AccountState, modelName string) {
 	if len(a.Quota) == 0 {
 		return
 	}
-	kept := a.Quota[:0]
+	found := false
+	for _, q := range a.Quota {
+		if q.ID == subID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	kept := make([]gemini.QuotaBucket, 0, len(a.Quota)-1)
 	for _, q := range a.Quota {
 		if q.ID == subID {
 			continue
@@ -954,7 +1042,7 @@ func (s *Server) mergeAccountQuota(a *AccountState, fresh []gemini.QuotaBucket) 
 	a.QuotaAt = now
 	a.QuotaBackoffStep = 0
 	a.QuotaNextAllowAt = time.Time{}
-	return a.Quota
+	return cloneQuotaBuckets(a.Quota)
 }
 
 func (s *Server) isAccountBusy(acctID string) bool {
@@ -968,7 +1056,7 @@ func (s *Server) isAccountBusy(acctID string) bool {
 }
 
 func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *prompt.HistoryHasher) bool {
-	if !s.Cfg.SessionCache || a == nil || modelName == "" || hasher == nil || hasher.Len() < 3 {
+	if !s.cfgSnapshot().SessionCache || a == nil || modelName == "" || hasher == nil || hasher.Len() < 3 {
 		return false
 	}
 	for split := hasher.Len() - 1; split >= 2; split-- {
@@ -983,7 +1071,7 @@ func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *p
 // the newest matching prefix. This prevents one request from counting a miss for
 // every older prefix it probes and promotes only the continuation actually used.
 func (s *Server) consumeSessionCacheForGeneration(accountID, modelName string, hasher *prompt.HistoryHasher) (string, []any, int) {
-	if !s.Cfg.SessionCache || accountID == "" || modelName == "" || hasher == nil || hasher.Len() < 3 {
+	if !s.cfgSnapshot().SessionCache || accountID == "" || modelName == "" || hasher == nil || hasher.Len() < 3 {
 		return "", nil, 0
 	}
 	for split := hasher.Len() - 1; split >= 2; split-- {
@@ -1001,120 +1089,105 @@ func (s *Server) consumeSessionCacheForGeneration(accountID, modelName string, h
 	return "", nil, 0
 }
 
+// pickFallbackAccount selects an eligible replacement and records one request
+// on it. A candidate that loses the admission race is skipped, not retried.
 func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]bool, originGroup string, requested string, hasher *prompt.HistoryHasher) (*AccountState, *gemini.ModelInfo) {
 	if s.rotate() {
 		return s.pickRotateFallback(accts, tried, originGroup, requested)
 	}
-	var idleCand *AccountState
-	var idleModel *gemini.ModelInfo
-	var busyCand *AccountState
-	var busyModel *gemini.ModelInfo
-	candidates := accts
-	fillFirst := s.fillFirst()
+	var rejected map[string]bool
+	skip := func(a *AccountState) bool {
+		return rejected[a.ID] || !canTryFallback(a, tried, originGroup)
+	}
+	for {
+		a, m := s.rankedReadyAccount(accts, requested, hasher, skip)
+		if a == nil {
+			return nil, nil
+		}
+		if s.checkAccountRateLimit(a) == nil {
+			return a, m
+		}
+		if rejected == nil {
+			rejected = make(map[string]bool)
+		}
+		rejected[a.ID] = true
+	}
+}
+
+func canTryFallback(a *AccountState, tried map[string]bool, originGroup string) bool {
+	if a == nil || tried[a.ID] {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.AccountGroup == originGroup
+}
+
+func (s *Server) rankedReadyAccount(accts []*AccountState, requested string, hasher *prompt.HistoryHasher, skip func(*AccountState) bool) (*AccountState, *gemini.ModelInfo) {
+	var best *AccountState
+	var bestModel *gemini.ModelInfo
+	var bestBusy, bestCache bool
+	var bestFails int
+	var bestUsed time.Time
 	var ranks map[string]int
-	if fillFirst {
+	if s.fillFirst() {
 		ranks = s.accountRanks(accts)
-		candidates = make([]*AccountState, len(accts))
-		copy(candidates, accts)
-		sort.SliceStable(candidates, func(i, j int) bool { return ranks[candidates[i].ID] < ranks[candidates[j].ID] })
 	}
-	for _, cand := range candidates {
-		if tried[cand.ID] {
+	for _, a := range accts {
+		if a == nil || (skip != nil && skip(a)) {
 			continue
 		}
-		cand.mu.RLock()
-		qState := cand.Quarantined || cand.Disabled
-		cGroup := cand.AccountGroup
-		cand.mu.RUnlock()
-		if qState {
+		m, ok := s.accountReady(a, requested)
+		if !ok {
 			continue
 		}
-		if (originGroup != "" || cGroup != "") && cGroup != originGroup {
+		busy := s.isAccountBusy(a.ID)
+		if best != nil && !bestBusy && busy {
 			continue
 		}
-		m := resolveModelOnAccount(cand, requested)
-		if m == nil {
-			continue
+		cached := s.hasSessionCacheHit(a, m.ModelName, hasher)
+		var fails int
+		var used time.Time
+		if ranks == nil {
+			a.mu.RLock()
+			fails, used = a.Fails, a.LastUsed
+			a.mu.RUnlock()
 		}
-		if err := s.checkPreFlightQuotaInternal(cand, *m, m.ModelName, true); err != nil {
-			continue
-		}
-		if !s.isAccountBusy(cand.ID) {
-			if s.hasSessionCacheHit(cand, m.ModelName, hasher) {
-				return cand, m
-			}
-			if idleCand == nil {
-				idleCand = cand
-				idleModel = m
-			} else if fillFirst {
-				// Keep the highest-ranked candidate; a recent failure demotes only
-				// until its cooldown expires.
-				cCooling := s.accountCooling(cand)
-				iCooling := s.accountCooling(idleCand)
-				if cCooling != iCooling {
-					if !cCooling {
-						idleCand = cand
-						idleModel = m
-					}
-				} else if ranks[cand.ID] < ranks[idleCand.ID] {
-					idleCand = cand
-					idleModel = m
+		if best != nil && busy == bestBusy {
+			switch {
+			case cached != bestCache:
+				if !cached {
+					continue
 				}
-			} else {
-				cand.mu.RLock()
-				cFails := cand.Fails
-				cand.mu.RUnlock()
-				idleCand.mu.RLock()
-				iFails := idleCand.Fails
-				idleCand.mu.RUnlock()
-				if cFails < iFails {
-					idleCand = cand
-					idleModel = m
+			case ranks != nil:
+				if ranks[a.ID] >= ranks[best.ID] {
+					continue
+				}
+			case fails != bestFails:
+				if fails > bestFails {
+					continue
+				}
+			default:
+				if !used.Before(bestUsed) {
+					continue
 				}
 			}
-			continue
 		}
-		if busyCand == nil {
-			busyCand = cand
-			busyModel = m
-		}
+		best, bestModel = a, m
+		bestBusy, bestCache, bestFails, bestUsed = busy, cached, fails, used
 	}
-	if idleCand != nil {
-		return idleCand, idleModel
-	}
-	return busyCand, busyModel
+	return best, bestModel
 }
 
 func (s *Server) lookupQuotaResetHeaders(_ context.Context, a *AccountState, modelName string) map[string]string {
-	a.mu.RLock()
-	quota := a.Quota
-	a.mu.RUnlock()
-	if len(quota) == 0 {
-		return nil
-	}
-
-	family := modelFamilyTokens(modelName)
-	var spent []gemini.QuotaBucket
-	for _, q := range quota {
-		if !q.Unlimited && q.Total > 0 && q.Remaining <= 0 {
-			spent = append(spent, q)
-		}
-	}
-	var related []gemini.QuotaBucket
-	for _, q := range spent {
-		lbl := strings.ToLower(q.Label)
-		for _, tok := range family {
-			if strings.Contains(lbl, tok) {
-				related = append(related, q)
-				break
-			}
-		}
-	}
-	chosen := spent
-	if len(related) > 0 {
-		chosen = related
-	}
 	now := s.now()
+	a.mu.RLock()
+	spent := spentQuotaForModel(a.Quota, modelName, now, false)
+	a.mu.RUnlock()
+	return quotaResetHeaders(spent, now)
+}
+
+func quotaResetHeaders(chosen []gemini.QuotaBucket, now time.Time) map[string]string {
 	var earliestReal time.Time
 	sawSynthetic := false
 	for _, q := range chosen {
@@ -1153,12 +1226,134 @@ func (s *Server) lookupQuotaResetHeaders(_ context.Context, a *AccountState, mod
 	return out
 }
 
+type accountFailureSnapshot struct {
+	account       *AccountState
+	markedAt      time.Time
+	markedError   string
+	prevFails     int
+	prevLastFail  time.Time
+	prevLastError string
+	prevNextRefAt time.Time
+}
+
 func (s *Server) markAccountFailure(a *AccountState, msg string) {
+	s.markAccountFailureSnapshot(a, msg)
+}
+
+func (s *Server) markAccountFailureSnapshot(a *AccountState, msg string) accountFailureSnapshot {
+	now := s.now()
 	a.mu.Lock()
+	snap := accountFailureSnapshot{
+		account:       a,
+		markedAt:      now,
+		markedError:   msg,
+		prevFails:     a.Fails,
+		prevLastFail:  a.LastFail,
+		prevLastError: a.LastError,
+		prevNextRefAt: a.NextModelRefAt,
+	}
 	a.Fails++
-	a.LastFail = s.now()
+	a.LastFail = now
 	a.LastError = msg
+	// Pull the next model refresh forward. The refresh is the probe that clears a
+	// transient failure, and the account may have been scheduled for the slow
+	// cadence before this failure existed: without this, the shortened interval
+	// only ever applies to accounts that were already failing when their timer
+	// was last set, which is never the account that just broke.
+	recheck := failureRecheckInterval + randDuration(failureRecheckInterval/5)
+	if due := now.Add(recheck); a.NextModelRefAt.IsZero() || a.NextModelRefAt.After(due) {
+		a.NextModelRefAt = due
+	}
 	a.mu.Unlock()
+	return snap
+}
+
+// rollbackAccountFailure undoes a failure recorded by markAccountFailureSnapshot
+// if the account still holds that exact transient failure (neither cleared by a
+// later success nor overwritten by another failure).
+func (s *Server) rollbackAccountFailure(snap accountFailureSnapshot) {
+	if snap.account == nil {
+		return
+	}
+	a := snap.account
+	a.mu.Lock()
+	if a.Fails > 0 && a.LastFail.Equal(snap.markedAt) && a.LastError == snap.markedError {
+		a.Fails--
+		a.LastFail = snap.prevLastFail
+		a.LastError = snap.prevLastError
+		if a.Fails == 0 {
+			a.NextModelRefAt = snap.prevNextRefAt
+		}
+	}
+	a.mu.Unlock()
+}
+
+// requestStallTracker tracks per-request upstream stall penalties across
+// accounts. When a single request stalls on two distinct accounts (or stalls on
+// one account and then receives upstream_error_reply on another), the fault is
+// likely payload- or globally upstream-induced rather than a broken account, so
+// previously recorded stall penalties for this request are rolled back and
+// further stalls on this request do not penalize healthy accounts.
+type requestStallTracker struct {
+	stalledAccounts map[string]bool
+	snaps           []accountFailureSnapshot
+	poisoned        bool
+}
+
+func (t *requestStallTracker) recordError(s *Server, a *AccountState, errCode, msg string) bool {
+	if a == nil {
+		return false
+	}
+	if errCode == "upstream_error_reply" {
+		if len(t.snaps) > 0 && !t.stalledAccounts[a.ID] {
+			t.poisoned = true
+			t.rollbackAll(s)
+		}
+		return false
+	}
+	if errCode != "upstream_stalled" && errCode != "upstream_timeout" {
+		return false
+	}
+	if t.stalledAccounts == nil {
+		t.stalledAccounts = make(map[string]bool, 2)
+	}
+	t.stalledAccounts[a.ID] = true
+	if t.poisoned || len(t.stalledAccounts) >= 2 {
+		t.poisoned = true
+		t.rollbackAll(s)
+		return true
+	}
+	t.snaps = append(t.snaps, s.markAccountFailureSnapshot(a, msg))
+	return true
+}
+
+func (t *requestStallTracker) rollbackAll(s *Server) {
+	for _, snap := range t.snaps {
+		s.rollbackAccountFailure(snap)
+	}
+	t.snaps = nil
+}
+
+// noFrameTimeoutForAttempt returns the first-frame watchdog deadline for an
+// attempt. An explicit BRIDGE_NO_FRAME_TIMEOUT_MS always wins verbatim; under
+// the default 75s ceiling, low-effort calls use a shorter deadline so stalled
+// fast turns fail over sooner without clipping medium/high thinking turns.
+func noFrameTimeoutForAttempt(cfg config.Config, model gemini.ModelInfo, effort string) time.Duration {
+	if cfg.NoFrameTimeout <= 0 {
+		return 0
+	}
+	if cfg.NoFrameTimeoutExplicit || effort != "low" {
+		return cfg.NoFrameTimeout
+	}
+	name := strings.ToLower(model.ModelName + " " + model.ModelID)
+	capDur := 45 * time.Second
+	if strings.Contains(name, "hydrogen") || strings.Contains(name, "flash") || strings.Contains(name, "lite") || strings.Contains(name, "adapts") || strings.Contains(name, "auto") {
+		capDur = 30 * time.Second
+	}
+	if cfg.NoFrameTimeout > capDur {
+		return capDur
+	}
+	return cfg.NoFrameTimeout
 }
 
 // fillFirstFailCooldown temporarily demotes an account that just failed so a
@@ -1184,12 +1379,15 @@ func (s *Server) accountCooling(a *AccountState) bool {
 // in BRIDGE_ACCOUNT_PRIORITY keep the caller's order; the rest follow their load
 // order so fill-first stays deterministic without extra configuration.
 func (s *Server) accountRanks(accts []*AccountState) map[string]int {
+	prio := s.cfgSnapshot().AccountPriority
 	ranks := make(map[string]int, len(accts))
-	base := len(s.Cfg.AccountPriority)
+	base := len(prio)
 	for i, a := range accts {
-		ranks[a.ID] = base + i
+		if a != nil {
+			ranks[a.ID] = base + i
+		}
 	}
-	for i, id := range s.Cfg.AccountPriority {
+	for i, id := range prio {
 		if _, ok := ranks[id]; ok {
 			ranks[id] = i
 		}
@@ -1198,11 +1396,11 @@ func (s *Server) accountRanks(accts []*AccountState) map[string]int {
 }
 
 func (s *Server) fillFirst() bool {
-	return strings.EqualFold(strings.TrimSpace(s.Cfg.AccountStrategy), "fill-first")
+	return strings.EqualFold(strings.TrimSpace(s.cfgSnapshot().AccountStrategy), "fill-first")
 }
 
 func (s *Server) rotate() bool {
-	return strings.EqualFold(strings.TrimSpace(s.Cfg.AccountStrategy), "rotate")
+	return strings.EqualFold(strings.TrimSpace(s.cfgSnapshot().AccountStrategy), "rotate")
 }
 
 // rotateIndex returns the position of the sticky rotation cursor, or 0 when the
@@ -1212,7 +1410,7 @@ func (s *Server) rotateIndex(accts []*AccountState) int {
 	cur := s.rotateCursor
 	s.rotateMu.Unlock()
 	for i, a := range accts {
-		if a.ID == cur {
+		if a != nil && a.ID == cur {
 			return i
 		}
 	}
@@ -1232,38 +1430,40 @@ func (s *Server) accountRateLimited(a *AccountState) bool {
 	if a == nil {
 		return false
 	}
-	if s.Cfg.MaxConcurrentPerAccount <= 0 && s.Cfg.MaxRPMPerAccount <= 0 {
+	cfg := s.cfgSnapshot()
+	if cfg.MaxConcurrentPerAccount <= 0 && cfg.MaxRPMPerAccount <= 0 {
 		return false
 	}
 	cutoff := s.now().Add(-60 * time.Second)
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if s.Cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= s.Cfg.MaxConcurrentPerAccount {
+	if cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= cfg.MaxConcurrentPerAccount {
 		return true
 	}
-	if s.Cfg.MaxRPMPerAccount > 0 {
+	if cfg.MaxRPMPerAccount > 0 {
 		n := 0
 		for _, ts := range a.reqTimestamps {
 			if ts.After(cutoff) {
 				n++
 			}
 		}
-		if n >= s.Cfg.MaxRPMPerAccount {
+		if n >= cfg.MaxRPMPerAccount {
 			return true
 		}
 	}
 	return false
 }
 
-// accountReady reports whether an account can serve the requested model right
-// now: not quarantined, model available, quota not exhausted, and not cooling
-// down after a recent failure.
+// accountReady is the shared pool eligibility check. Session busy state is a
+// scheduling preference, unlike a configured per-account concurrency limit.
 func (s *Server) accountReady(a *AccountState, requested string) (*gemini.ModelInfo, bool) {
 	if a == nil {
 		return nil, false
 	}
 	a.mu.RLock()
-	qState := a.Quarantined || a.Disabled
+	qState := a.Quarantined || a.Disabled || a.retired ||
+		looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) ||
+		looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError)
 	a.mu.RUnlock()
 	if qState {
 		return nil, false
@@ -1296,7 +1496,7 @@ func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, h
 	at := func(i int) *AccountState { return accts[(start+i)%len(accts)] }
 
 	// Prefer the account that already holds this conversation's continuation.
-	if s.Cfg.SessionCache && hasher != nil && hasher.Len() >= 3 {
+	if s.cfgSnapshot().SessionCache && hasher != nil && hasher.Len() >= 3 {
 		for i := 0; i < len(accts); i++ {
 			a := at(i)
 			m, ok := s.accountReady(a, requested)
@@ -1326,30 +1526,7 @@ func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, h
 		}
 	}
 
-	// Nothing is ready. Prefer an account that can at least serve the model so the
-	// caller receives an accurate quota error rather than model_not_found.
-	for i := range len(accts) {
-		a := at(i)
-		a.mu.RLock()
-		qState := a.Quarantined || a.Disabled
-		a.mu.RUnlock()
-		if qState {
-			continue
-		}
-		if resolveModelOnAccount(a, requested) != nil {
-			return a
-		}
-	}
-	for i := range len(accts) {
-		a := at(i)
-		a.mu.RLock()
-		qState := a.Quarantined || a.Disabled
-		a.mu.RUnlock()
-		if !qState {
-			return a
-		}
-	}
-	return nil
+	return diagnosticChatAccount(accts, requested, start)
 }
 
 // pickRotateFallback advances the rotation from the failed account to the next
@@ -1363,13 +1540,7 @@ func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool
 	for pass := 0; pass < 2; pass++ {
 		for i := 1; i <= len(accts); i++ {
 			cand := at(i)
-			if tried[cand.ID] {
-				continue
-			}
-			cand.mu.RLock()
-			cGroup := cand.AccountGroup
-			cand.mu.RUnlock()
-			if (originGroup != "" || cGroup != "") && cGroup != originGroup {
+			if !canTryFallback(cand, tried, originGroup) {
 				continue
 			}
 			m, ok := s.accountReady(cand, requested)
@@ -1377,6 +1548,9 @@ func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool
 				continue
 			}
 			if pass == 0 && s.isAccountBusy(cand.ID) {
+				continue
+			}
+			if s.checkAccountRateLimit(cand) != nil {
 				continue
 			}
 			s.setRotateCursor(cand.ID)
@@ -1389,7 +1563,7 @@ func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
 	if scope.AccountID != "" {
 		for _, a := range accts {
-			if a.ID == scope.AccountID {
+			if a != nil && a.ID == scope.AccountID {
 				return a
 			}
 		}
@@ -1400,6 +1574,9 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		// keeps normal failover inside that group instead of the whole pool.
 		grouped := make([]*AccountState, 0, len(accts))
 		for _, a := range accts {
+			if a == nil {
+				continue
+			}
 			a.mu.RLock()
 			group := a.AccountGroup
 			a.mu.RUnlock()
@@ -1413,9 +1590,7 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		accts = grouped
 	}
 	if !scope.Admin && scope.Group == "" {
-		s.mu.RLock()
-		explicitTokens := len(s.Cfg.AccountTokens) > 0
-		s.mu.RUnlock()
+		explicitTokens := len(s.cfgSnapshot().AccountTokens) > 0
 		if explicitTokens {
 			return nil
 		}
@@ -1423,115 +1598,45 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 	if s.rotate() {
 		return s.resolveRotateAccount(accts, requested, hasher)
 	}
-	var best *AccountState
-	bestBusy := false
-	bestHasCache := false
-	bestQuotaOK := false
-	fillFirst := s.fillFirst()
-	ranks := map[string]int(nil)
-	if fillFirst {
-		ranks = s.accountRanks(accts)
+	if a, _ := s.rankedReadyAccount(accts, requested, hasher, nil); a != nil {
+		return a
 	}
-	for _, a := range accts {
-		a.mu.RLock()
-		qState := a.Quarantined || a.Disabled
-		a.mu.RUnlock()
-		if qState {
-			continue
-		}
-		aBusy := s.isAccountBusy(a.ID)
-		aHasCache := false
-		aQuotaOK := true
-		if m := resolveModelOnAccount(a, requested); m != nil {
-			if s.checkPreFlightQuotaInternal(a, *m, m.ModelName, true) == nil {
-				aHasCache = s.hasSessionCacheHit(a, m.ModelName, hasher)
-			} else {
-				aQuotaOK = false
-			}
-		}
-		if best == nil {
-			best = a
-			bestBusy = aBusy
-			bestHasCache = aHasCache
-			bestQuotaOK = aQuotaOK
-			continue
-		}
-		if aQuotaOK && !bestQuotaOK {
-			best = a
-			bestBusy = aBusy
-			bestHasCache = aHasCache
-			bestQuotaOK = true
-			continue
-		}
-		if bestQuotaOK && !aQuotaOK {
-			continue
-		}
-		if bestBusy && !aBusy {
-			best = a
-			bestBusy = false
-			bestHasCache = aHasCache
-			bestQuotaOK = aQuotaOK
-			continue
-		}
-		if !bestBusy && aBusy {
-			continue
-		}
-		if aHasCache && !bestHasCache {
-			best = a
-			bestBusy = aBusy
-			bestHasCache = true
-			bestQuotaOK = aQuotaOK
-			continue
-		}
-		if bestHasCache && !aHasCache {
-			continue
-		}
-		if fillFirst {
-			// Rank decides; a recent failure only demotes for a bounded cooldown so
-			// the account can reclaim its rank instead of being stuck behind a
-			// healthy lower-ranked account forever.
-			aCooling := s.accountCooling(a)
-			bCooling := s.accountCooling(best)
-			if aCooling != bCooling {
-				if !aCooling {
-					best = a
-					bestBusy = aBusy
-					bestHasCache = aHasCache
-					bestQuotaOK = aQuotaOK
-				}
-				continue
-			}
-			if ranks[a.ID] < ranks[best.ID] {
-				best = a
-				bestBusy = aBusy
-				bestHasCache = aHasCache
-				bestQuotaOK = aQuotaOK
-			}
+	return diagnosticChatAccount(accts, requested, 0)
+}
+
+// With no ready account, prefer a model-capable account so preflight can
+// return its specific 429 instead of reporting an unrelated missing model.
+// An unprobed account may still discover the model; discard blocked accounts.
+func diagnosticChatAccount(accts []*AccountState, requested string, start int) *AccountState {
+	var unprobed, missing *AccountState
+	for i := range len(accts) {
+		a := accts[(start+i)%len(accts)]
+		if a == nil {
 			continue
 		}
 		a.mu.RLock()
-		aFails, aUsed := a.Fails, a.LastUsed
+		blocked := a.Quarantined || a.Disabled || a.retired ||
+			looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) ||
+			looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError)
+		hasModels := len(a.Models) > 0
 		a.mu.RUnlock()
-		best.mu.RLock()
-		bFails, bUsed := best.Fails, best.LastUsed
-		best.mu.RUnlock()
-		if aFails != bFails {
-			if aFails < bFails {
-				best = a
-				bestBusy = aBusy
-				bestHasCache = aHasCache
-				bestQuotaOK = aQuotaOK
-			}
+		if blocked {
 			continue
 		}
-		if aUsed.Before(bUsed) {
-			best = a
-			bestBusy = aBusy
-			bestHasCache = aHasCache
-			bestQuotaOK = aQuotaOK
+		if resolveModelOnAccount(a, requested) != nil {
+			return a
+		}
+		if !hasModels && unprobed == nil {
+			unprobed = a
+		}
+		if missing == nil {
+			missing = a
 		}
 	}
-	return best
+	if unprobed != nil {
+		return unprobed
+	}
+	return missing
 }
 
 const quotaRefreshCooldown = 45 * time.Second
@@ -1627,6 +1732,10 @@ type preparedGeneration struct {
 	// cacheSplit is the message index at which the cached continuation was
 	// selected. It is zero when no continuation was used.
 	cacheSplit int
+	// limits are the OpenAI controls Gemini Web cannot express: output budget,
+	// stop sequences, and structured-output intent. They are enforced on the
+	// assembled answer in the request handler.
+	limits answerLimits
 }
 
 func (s *Server) prepareGeneration(
@@ -1652,21 +1761,147 @@ func (s *Server) prepareGeneration(
 		toolsRaw = toolbridge.AugmentToolsWithMediaGenerator(toolsRaw, toolChoiceRaw)
 	}
 
+	cfg := s.cfgSnapshot()
 	var hasher *prompt.HistoryHasher
-	if s.Cfg.SessionCache && len(messages) >= 3 {
+	if cfg.SessionCache && len(messages) >= 3 {
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
 	}
 
-	account := s.resolveChatAccount(accts, scope, requested, hasher)
-	if account == nil {
+	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	candidatePool := accts
+	if scope.AccountID == "" && scope.Group != "" {
+		grouped := make([]*AccountState, 0, len(accts))
 		for _, a := range accts {
+			if a == nil {
+				continue
+			}
+			a.mu.RLock()
+			g := a.AccountGroup
+			a.mu.RUnlock()
+			if g == scope.Group {
+				grouped = append(grouped, a)
+			}
+		}
+		candidatePool = grouped
+	}
+
+	var (
+		account *AccountState
+		model   *gemini.ModelInfo
+		mid     string
+		lastErr error
+	)
+	rejected := make(map[string]bool, len(candidatePool))
+	maxTries := 1
+	if scope.AccountID == "" && len(candidatePool) > 1 {
+		maxTries = len(candidatePool)
+	}
+	for tryIdx := 0; tryIdx < maxTries; tryIdx++ {
+		var poolSlice []*AccountState
+		if len(rejected) == 0 {
+			poolSlice = accts
+		} else {
+			poolSlice = make([]*AccountState, 0, len(accts))
+			for _, a := range accts {
+				if a != nil && !rejected[a.ID] {
+					poolSlice = append(poolSlice, a)
+				}
+			}
+		}
+		cand := s.resolveChatAccount(poolSlice, scope, requested, hasher)
+		if cand == nil {
+			break
+		}
+		rejected[cand.ID] = true
+		if bErr := accountBlockedError(cand); bErr != nil {
+			lastErr = bErr
+			if scope.AccountID != "" {
+				return nil, bErr
+			}
+			continue
+		}
+		cand.mu.RLock()
+		hasModels := len(cand.Models) > 0
+		cand.mu.RUnlock()
+		if !hasModels {
+			s.RefreshAccount(ctx, cand, false)
+		}
+		cand.mu.RLock()
+		hasModels = len(cand.Models) > 0
+		mErr := cand.ModelsError
+		cand.mu.RUnlock()
+		if !hasModels && mErr != nil {
+			lastErr = mErr
+			if scope.AccountID != "" {
+				return nil, mErr
+			}
+			continue
+		}
+		m := resolveModelOnAccount(cand, requested)
+		if m == nil {
+			reqLabel := requested
+			if reqLabel == "" {
+				reqLabel = "(unspecified)"
+			}
+			notFoundErr := transport.NewUpstreamError(fmt.Sprintf("account %s cannot serve model %s", cand.ID, reqLabel), 404, "model_not_found", nil, nil)
+			if lastErr == nil {
+				lastErr = notFoundErr
+			}
+			if scope.AccountID != "" {
+				return nil, notFoundErr
+			}
+			continue
+		}
+		if qErr := s.checkPreFlightQuota(cand, *m, m.ModelName); qErr != nil {
+			lastErr = qErr
+			if scope.AccountID != "" {
+				return nil, qErr
+			}
+			continue
+		}
+		if rErr := s.checkAccountRateLimit(cand); rErr != nil {
+			lastErr = rErr
+			if scope.AccountID != "" {
+				return nil, rErr
+			}
+			continue
+		}
+		account = cand
+		model = m
+		mid = m.ModelName
+		break
+	}
+
+	if account == nil {
+		if lastErr != nil {
+			if scope.AccountID == "" {
+				var ue *transport.UpstreamError
+				if errors.As(lastErr, &ue) && ue != nil && (ue.StatusCode == 429 || ue.Code == "rate_limit_error") {
+					return nil, s.poolAvailabilityError(accts, requested, lastErr)
+				}
+			}
+			return nil, lastErr
+		}
+		disabled := false
+		for _, a := range accts {
+			if a == nil {
+				continue
+			}
 			a.mu.RLock()
 			q := a.Quarantined
 			r := a.QuarantineReason
+			disabled = disabled || a.Disabled
 			a.mu.RUnlock()
 			if q {
 				return nil, transport.NewUpstreamError(fmt.Sprintf("all accounts are quarantined (last: %s)", r), 403, "account_banned", nil, nil)
 			}
+		}
+		if disabled {
+			return nil, transport.NewUpstreamError("no usable account: accounts are disabled", 403, "account_disabled", nil, nil)
 		}
 		msg := "this endpoint requires a pool key (BRIDGE_API_KEY), a group key, or an account key; no usable account is loaded for this request"
 		if scope.AccountID != "" {
@@ -1677,55 +1912,11 @@ func (s *Server) prepareGeneration(
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
 	}
 
-	if err := s.checkAccountRateLimit(account); err != nil {
-		if scope.AccountID == "" {
-			return nil, s.poolAvailabilityError(accts, requested, err)
-		}
-		return nil, err
-	}
-
-	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
-	if err != nil {
-		return nil, err
-	}
-
-	account.mu.RLock()
-	hasModels := len(account.Models) > 0
-	account.mu.RUnlock()
-	if !hasModels {
-		s.RefreshAccount(ctx, account, false)
-	}
-
-	account.mu.RLock()
-	hasModels = len(account.Models) > 0
-	mErr := account.ModelsError
-	account.mu.RUnlock()
-	if !hasModels && mErr != nil {
-		return nil, mErr
-	}
-
-	model := resolveModelOnAccount(account, requested)
-	if model == nil {
-		reqLabel := requested
-		if reqLabel == "" {
-			reqLabel = "(unspecified)"
-		}
-		return nil, transport.NewUpstreamError(fmt.Sprintf("account %s cannot serve model %s", account.ID, reqLabel), 404, "model_not_found", nil, nil)
-	}
-	mid := model.ModelName
-
-	if err := s.checkPreFlightQuota(account, *model, mid); err != nil {
-		if scope.AccountID == "" {
-			return nil, s.poolAvailabilityError(accts, mid, err)
-		}
-		return nil, err
-	}
-
 	fullPrompt, overflowParts, flattenStats, err := prompt.FlattenMessagesWithStats(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 		StartIndex:      0,
-		MaxPromptChars:  s.Cfg.MaxPromptChars,
-		MaxOldToolChars: s.Cfg.MaxOldToolChars,
-		AllowOverflow:   s.Cfg.HistoryOffload,
+		MaxPromptChars:  cfg.MaxPromptChars,
+		MaxOldToolChars: cfg.MaxOldToolChars,
+		AllowOverflow:   cfg.HistoryOffload,
 	})
 	if err != nil {
 		return nil, err
@@ -1739,8 +1930,8 @@ func (s *Server) prepareGeneration(
 
 	hasTools := len(contract.Tools) > 0 && contract.ChoiceMode != "none"
 	stream, _ := body["stream"].(bool)
-	buffered := s.Cfg.RejectDowngrade || hasTools
-	if strings.EqualFold(s.Cfg.StreamBufferMode, "eager") {
+	buffered := cfg.RejectDowngrade || hasTools
+	if strings.EqualFold(cfg.StreamBufferMode, "eager") {
 		buffered = hasTools
 	}
 
@@ -1753,7 +1944,7 @@ func (s *Server) prepareGeneration(
 		effortVal = "low"
 		tempReq = true
 	}
-	thinkLvl := gemini.ThinkingLevelForModel(effortVal, *model, strconv.Itoa(s.Cfg.DefaultThinking))
+	thinkLvl := gemini.ThinkingLevelForModel(effortVal, *model, strconv.Itoa(cfg.DefaultThinking))
 	effortStr := "low"
 	switch thinkLvl {
 	case 4:
@@ -1764,18 +1955,19 @@ func (s *Server) prepareGeneration(
 	opts := gemini.StreamOptions{
 		Model:           model,
 		ThinkingLevel:   thinkLvl,
-		Temporary:       tempReq || s.Cfg.Temporary,
-		Language:        s.Cfg.Locale,
+		Temporary:       tempReq || cfg.Temporary,
+		Language:        cfg.Locale,
 		DisableTools:    false,
 		HasTools:        hasTools,
-		ProtocolMode:    s.Cfg.ProtocolMode,
-		PersonalContext: s.Cfg.PersonalContext,
+		ProtocolMode:    cfg.ProtocolMode,
+		PersonalContext: cfg.PersonalContext,
+		NoFrameTimeout:  noFrameTimeoutForAttempt(cfg, *model, effortStr),
 	}
 
 	curPrompt := fullPrompt
 	cacheKey := ""
 	cacheSplit := 0
-	if s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
+	if cfg.SessionCache && !opts.Temporary && hasher != nil {
 		selectedKey, cachedMeta, split := s.consumeSessionCacheForGeneration(account.ID, mid, hasher)
 		if len(cachedMeta) > 0 {
 			opts.Metadata = cachedMeta
@@ -1783,8 +1975,8 @@ func (s *Server) prepareGeneration(
 			cacheSplit = split
 			deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 				StartIndex:      split,
-				MaxPromptChars:  s.Cfg.MaxPromptChars,
-				MaxOldToolChars: s.Cfg.MaxOldToolChars,
+				MaxPromptChars:  cfg.MaxPromptChars,
+				MaxOldToolChars: cfg.MaxOldToolChars,
 				AllowOverflow:   false,
 			})
 			if dErr == nil {
@@ -1822,6 +2014,7 @@ func (s *Server) prepareGeneration(
 		hasher:              hasher,
 		cacheKey:            cacheKey,
 		cacheSplit:          cacheSplit,
+		limits:              parseAnswerLimits(body),
 	}, nil
 }
 

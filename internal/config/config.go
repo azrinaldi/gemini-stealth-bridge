@@ -3,13 +3,16 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,6 +46,8 @@ type Config struct {
 	StreamTimeout           time.Duration
 	FirstByteTimeout        time.Duration
 	StallTimeout            time.Duration
+	NoFrameTimeout          time.Duration
+	NoFrameTimeoutExplicit  bool
 	IdleSessionTimeout      time.Duration
 	MaxSessions             int
 	MaxQueueDepth           int
@@ -95,6 +100,19 @@ type Config struct {
 	// Reporting is the default because rejecting would take the renamed tier
 	// offline; strict deployments can opt in.
 	RejectLabelMismatch bool
+}
+
+// Clone returns a deep copy of c with independent slices and maps so published
+// server config snapshots are safe for lock-free concurrent readers.
+func (c Config) Clone() Config {
+	c.AccountTokens = maps.Clone(c.AccountTokens)
+	c.GroupTokens = maps.Clone(c.GroupTokens)
+	c.AccountGroups = maps.Clone(c.AccountGroups)
+	c.AccountPriority = slices.Clone(c.AccountPriority)
+	c.EgressPerAccount = maps.Clone(c.EgressPerAccount)
+	c.FieldSources = maps.Clone(c.FieldSources)
+	c.Warnings = slices.Clone(c.Warnings)
+	return c
 }
 
 // ThinkingLevels maps Gemini Web's 3 thinking levels ("low", "medium", "high") to
@@ -311,6 +329,8 @@ func FromEnv() *Config {
 		StreamTimeout:           time.Duration(lookupPositiveInt("BRIDGE_STREAM_TIMEOUT_MS", 600000, 1000)) * time.Millisecond,
 		FirstByteTimeout:        time.Duration(lookupPositiveInt("BRIDGE_FIRST_BYTE_TIMEOUT_MS", 60000, 1000)) * time.Millisecond,
 		StallTimeout:            time.Duration(lookupPositiveInt("BRIDGE_STALL_TIMEOUT_MS", 90000, 1000)) * time.Millisecond,
+		NoFrameTimeout:          time.Duration(lookupPositiveInt("BRIDGE_NO_FRAME_TIMEOUT_MS", 75000, 1000)) * time.Millisecond,
+		NoFrameTimeoutExplicit:  lookup("BRIDGE_NO_FRAME_TIMEOUT_MS") != "",
 		IdleSessionTimeout:      time.Duration(lookupPositiveInt("BRIDGE_IDLE_SESSION_MS", 180000, 1000)) * time.Millisecond,
 		MaxSessions:             lookupPositiveInt("BRIDGE_MAX_SESSIONS", 16, 1),
 		MaxQueueDepth:           lookupPositiveInt("BRIDGE_MAX_QUEUE", 4, 1),
@@ -638,11 +658,15 @@ func LoadEnvFile(path string) map[string]string {
 	return out
 }
 
-// SaveEnvFile merges updates into path atomically with 0600 permissions.
+var envFileMu sync.Mutex
+
+// SaveEnvFile serializes merges within the process and atomically replaces path with 0600 permissions.
 func SaveEnvFile(path string, updates map[string]string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("empty config.env path")
 	}
+	envFileMu.Lock()
+	defer envFileMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -669,8 +693,21 @@ func SaveEnvFile(path string, updates map[string]string) error {
 		b.WriteString(val)
 		b.WriteByte('\n')
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(b.String()), 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.env.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, path)

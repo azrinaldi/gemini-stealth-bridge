@@ -12,7 +12,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,13 +108,22 @@ func TestDualPathCookieRotator(t *testing.T) {
 	if !res.Rotated || res.Status != 200 || !strings.Contains(res.CookieHeader, "__Secure-1PSIDTS=fresh_psidts") {
 		t.Fatalf("expected primary PSIDTS rotation, got: %+v", res)
 	}
-	// Call 2 within 60s falls back to 658 iframe path
+	// Call 2 within 60s returns early without hitting /RotateCookies or fallback 658.
 	res2, err := rot.RotateAccount(context.Background(), "acct1", res.CookieHeader, sc)
+	if err != nil {
+		t.Fatalf("RotateAccount cooldown call failed: %v", err)
+	}
+	if res2.Rotated || res2.Status != 0 || len(seenBodies) != 1 {
+		t.Fatalf("expected cooldown early return with no second POST, got res2=%+v seenBodies=%v", res2, seenBodies)
+	}
+	// After Forget(), if primary subset is empty, rotation falls back to the 658 iframe path.
+	rot.Forget("acct1")
+	res3, err := rot.RotateAccount(context.Background(), "acct1", "", sc)
 	if err != nil {
 		t.Fatalf("RotateAccount fallback failed: %v", err)
 	}
-	if !res2.Rotated || !strings.Contains(res2.CookieHeader, "__Secure-1PSIDCC=fresh_psidcc") {
-		t.Fatalf("expected fallback PSIDCC rotation, got: %+v", res2)
+	if !res3.Rotated || !strings.Contains(res3.CookieHeader, "__Secure-1PSIDCC=fresh_psidcc") {
+		t.Fatalf("expected fallback PSIDCC rotation when primary skipped, got: %+v", res3)
 	}
 	if len(seenBodies) != 2 || seenBodies[0] != `[000,"-0000000000000000000"]` || seenBodies[1] != `[658,"rot_id_999"]` {
 		t.Fatalf("unexpected RotateCookies POST bodies: %v", seenBodies)
@@ -140,7 +152,7 @@ func TestSaveAndLoadAccountFile(t *testing.T) {
 		t.Fatalf("unexpected loaded record: %+v", loaded)
 	}
 	st, _ := os.Stat(path)
-	if st.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("expected mode 0600, got %o", st.Mode().Perm())
 	}
 }
@@ -555,5 +567,560 @@ func TestFindChromeCookieDB_PrefersSignedInProfile(t *testing.T) {
 	}
 	if got := FindChromeCookieDB(""); got != arcDB {
 		t.Fatalf("FindChromeCookieDB auto-detect = %q, want signed-in Arc profile %q", got, arcDB)
+	}
+}
+
+func TestRotateAccount_NoDoublePOSTOnTerminalStatus(t *testing.T) {
+	for _, status := range []int{200, 401, 403, 429} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var postCount, pageCount atomic.Int32
+			doer := &stubCookieDoer{
+				fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+						pageCount.Add(1)
+						return &fhttp.Response{
+							StatusCode: 200,
+							Header:     fhttp.Header{},
+							Body:       io.NopCloser(strings.NewReader(`<script>init('rot_id', 1, 540)</script>`)),
+						}, nil
+					}
+					postCount.Add(1)
+					return &fhttp.Response{
+						StatusCode: status,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader("[]")),
+					}, nil
+				},
+			}
+			sc, err := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+			if err != nil {
+				t.Fatalf("NewStealthClient: %v", err)
+			}
+			rot := NewRotator()
+			res, err := rot.RotateAccount(context.Background(), "acct-term", "SAPISID=sap; __Secure-1PSID=psid; __Secure-1PSIDTS=ts", sc)
+			if err != nil {
+				t.Fatalf("RotateAccount: %v", err)
+			}
+			if res.Status != status {
+				t.Fatalf("res.Status = %d, want %d (must not be masked by second POST)", res.Status, status)
+			}
+			if postCount.Load() != 1 || pageCount.Load() != 0 {
+				t.Fatalf("expected exactly 1 POST and 0 RotateCookiesPage GETs, got post=%d page=%d", postCount.Load(), pageCount.Load())
+			}
+		})
+	}
+}
+
+func TestRotateAccount_FallbackOn5xxOrErrorAndConcurrentRaceFree(t *testing.T) {
+	t.Run("500_falls_back_to_iframe", func(t *testing.T) {
+		var postCount, pageCount atomic.Int32
+		doer := &stubCookieDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+					pageCount.Add(1)
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader(`<script>init('rot_id_fb', 1, 540)</script>`)),
+					}, nil
+				}
+				n := postCount.Add(1)
+				if n == 1 {
+					return &fhttp.Response{StatusCode: 500, Header: fhttp.Header{}, Body: io.NopCloser(strings.NewReader("err"))}, nil
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"SIDCC=fb_sidcc; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			},
+		}
+		sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+		res, err := NewRotator().RotateAccount(context.Background(), "acct-500", "SAPISID=sap; __Secure-1PSID=psid", sc)
+		if err != nil {
+			t.Fatalf("RotateAccount: %v", err)
+		}
+		if !res.Rotated || res.Status != 200 || !strings.Contains(res.CookieHeader, "SIDCC=fb_sidcc") {
+			t.Fatalf("expected fallback rotation to succeed, got %+v", res)
+		}
+		if postCount.Load() != 2 || pageCount.Load() != 1 {
+			t.Fatalf("expected 2 POSTs + 1 page GET, got post=%d page=%d", postCount.Load(), pageCount.Load())
+		}
+	})
+
+	t.Run("network_error_falls_back_to_iframe", func(t *testing.T) {
+		var postCount atomic.Int32
+		doer := &stubCookieDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader(`<script>init('rot_id_err', 1, 540)</script>`)),
+					}, nil
+				}
+				if postCount.Add(1) == 1 {
+					return nil, fmt.Errorf("transient dial error")
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDCC=fb_cc; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			},
+		}
+		sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+		res, err := NewRotator().RotateAccount(context.Background(), "acct-err", "SAPISID=sap; __Secure-1PSID=psid", sc)
+		if err != nil || !res.Rotated {
+			t.Fatalf("expected fallback rotation after error, got res=%+v err=%v", res, err)
+		}
+	})
+
+	t.Run("concurrent_rotate_race_free", func(t *testing.T) {
+		doer := &stubCookieDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+					return &fhttp.Response{
+						StatusCode: 200,
+						Header:     fhttp.Header{},
+						Body:       io.NopCloser(strings.NewReader(`<script>init('rot_race', 1, 540)</script>`)),
+					}, nil
+				}
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=ts_ok; Path=/; Secure"}},
+					Body:       io.NopCloser(strings.NewReader("[]")),
+				}, nil
+			},
+		}
+		sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+		rot := NewRotator()
+		var wg sync.WaitGroup
+		for i := range 6 {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for range 10 {
+					_, _ = rot.RotateAccount(context.Background(), fmt.Sprintf("acct-%d", id%2), "SAPISID=sap; __Secure-1PSID=psid", sc)
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+	t.Run("subsecond_fallback_interval_clamps_to_60s", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			sec  string
+			want time.Duration
+		}{
+			{"half_second", "0.5", 60 * time.Second},
+			{"tiny_fraction", "0.0000000001", 60 * time.Second},
+			{"huge_overflow", "99999999999999999", 3600 * time.Second},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				doer := &stubCookieDoer{
+					fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+						if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+							return &fhttp.Response{
+								StatusCode: 200,
+								Header:     fhttp.Header{},
+								Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`<script>init('rot_clamp', 1, %s)</script>`, tc.sec))),
+							}, nil
+						}
+						return &fhttp.Response{
+							StatusCode: 502,
+							Header:     fhttp.Header{},
+							Body:       io.NopCloser(strings.NewReader("bad gateway")),
+						}, nil
+					},
+				}
+				sc, err := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+				if err != nil {
+					t.Fatalf("NewStealthClient: %v", err)
+				}
+				res, err := NewRotator().RotateAccount(context.Background(), "acct-clamp-"+tc.name, "SAPISID=sap; __Secure-1PSID=psid", sc)
+				if err != nil {
+					t.Fatalf("RotateAccount: %v", err)
+				}
+				if res.NextInterval != tc.want {
+					t.Fatalf("init(..., %s): NextInterval = %v, want %v", tc.sec, res.NextInterval, tc.want)
+				}
+			})
+		}
+	})
+}
+
+func TestSaveCredentialFilePreservesAuthUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secondary.json")
+	if _, err := SaveCredentialFile(path, CredentialFile{
+		Name:     "secondary",
+		Email:    "sec@example.com",
+		Cookies:  "SAPISID=s1",
+		AuthUser: 2,
+	}); err != nil {
+		t.Fatalf("initial SaveCredentialFile: %v", err)
+	}
+	if _, err := SaveCredentialFile(path, CredentialFile{
+		Name:    "secondary",
+		Email:   "sec@example.com",
+		Cookies: "SAPISID=s2",
+	}); err != nil {
+		t.Fatalf("overwrite SaveCredentialFile: %v", err)
+	}
+	loaded, _, err := LoadAccountFile(path)
+	if err != nil {
+		t.Fatalf("LoadAccountFile: %v", err)
+	}
+	if loaded.AuthUser != 2 || loaded.Cookies != "SAPISID=s2" {
+		t.Fatalf("expected AuthUser=2 preserved and Cookies updated, got %+v", loaded)
+	}
+}
+
+func TestExpandPercentEnv_SinglePass(t *testing.T) {
+	t.Setenv("SELF_LOOP", "%SELF_LOOP%")
+	t.Setenv("MUT_A", "%MUT_B%")
+	t.Setenv("MUT_B", "%MUT_A%")
+	t.Setenv("DIR_VAR", "/tmp/%NESTED%")
+	t.Setenv("NESTED", "should_not_expand")
+	t.Setenv("GOOD_VAR", "ok")
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"%SELF_LOOP%/Cookies", "%SELF_LOOP%/Cookies"},
+		{"%MUT_A%/Cookies", "%MUT_B%/Cookies"},
+		{"%DIR_VAR%/Cookies", "/tmp/%NESTED%/Cookies"},
+		{"100%%/%GOOD_VAR%", "100%%/" + "ok"},
+		{"%MISSING_VAR%/%GOOD_VAR%", "%MISSING_VAR%/ok"},
+		{"%UNCLOSED", "%UNCLOSED"},
+	}
+	for _, tc := range cases {
+		if got := expandPercentEnv(tc.in); got != tc.want {
+			t.Errorf("expandPercentEnv(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func encryptAES128CBCForTest(key128, plain []byte) []byte {
+	block, err := aes.NewCipher(key128)
+	if err != nil {
+		panic(err)
+	}
+	padLen := aes.BlockSize - (len(plain) % aes.BlockSize)
+	padded := make([]byte, len(plain)+padLen)
+	copy(padded, plain)
+	for i := len(plain); i < len(padded); i++ {
+		padded[i] = byte(padLen)
+	}
+	iv := bytes.Repeat([]byte{0x20}, aes.BlockSize)
+	ct := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, padded)
+	return append([]byte("v10"), ct...)
+}
+
+func TestDecryptCookieBytes_AES128CBC_CookieOctetAndChrome130Prefix(t *testing.T) {
+	trueKey := bytes.Repeat([]byte{0x11}, 16)
+	wrongKey := bytes.Repeat([]byte{0x22}, 16)
+
+	// 1. Valid ASCII cookie passes.
+	validCT := encryptAES128CBCForTest(trueKey, []byte("valid_cookie_123"))
+	if got := decryptCookieBytesForHost(validCT, nil, trueKey, ".google.com"); string(got) != "valid_cookie_123" {
+		t.Fatalf("expected valid cookie decrypted, got %q", got)
+	}
+
+	// 2. Binary garbage ending in valid PKCS#7 padding (0x01) under wrongKey must be rejected (nil).
+	garbagePlain := append(bytes.Repeat([]byte{0x00, 0x80, 0xff}, 5), 0x01)
+	garbagePlain = garbagePlain[:16]
+	garbagePlain[15] = 0x01 // valid 1-byte PKCS#7 padding
+	// Encrypt garbagePlain with wrongKey so decrypting with wrongKey produces garbagePlain!
+	block, _ := aes.NewCipher(wrongKey)
+	iv := bytes.Repeat([]byte{0x20}, aes.BlockSize)
+	ctBuf := make([]byte, 16)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ctBuf, garbagePlain)
+	fakeV10 := append([]byte("v10"), ctBuf...)
+	if got := decryptCookieBytesForHost(fakeV10, nil, wrongKey, ".google.com"); got != nil {
+		t.Fatalf("expected binary garbage with accidental PKCS#7 padding to be rejected, got %x", got)
+	}
+
+	// 3. Chrome 130+ sha256(host) + valid ASCII cookie passes when host is supplied.
+	hostHash := sha256.Sum256([]byte(".google.com"))
+	prefixedPlain := append(hostHash[:], []byte("sap_cbc_130")...)
+	prefixedCT := encryptAES128CBCForTest(trueKey, prefixedPlain)
+	dec := decryptCookieBytesForHost(prefixedCT, nil, trueKey, ".google.com")
+	if dec == nil {
+		t.Fatal("expected Chrome 130+ prefixed AES-128-CBC cookie to decrypt cleanly when host is supplied")
+	}
+	stripped, bound := stripDomainPrefix(dec, ".google.com")
+	if !bound || string(stripped) != "sap_cbc_130" {
+		t.Fatalf("unexpected stripped cookie: bound=%v val=%q", bound, stripped)
+	}
+}
+
+func TestKeyringCommandTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell script test not applicable on Windows")
+	}
+	binDir := t.TempDir()
+	cmdName := "secret-tool"
+	if runtime.GOOS == "darwin" {
+		cmdName = "security"
+	}
+	scriptPath := filepath.Join(binDir, cmdName)
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CHROME_PASS", "")
+
+	origTimeout := keyringCmdTimeout
+	keyringCmdTimeout = 100 * time.Millisecond
+	defer func() { keyringCmdTimeout = origTimeout }()
+
+	start := time.Now()
+	passes := candidatePasswords("")
+	elapsed := time.Since(start)
+	if elapsed >= time.Second {
+		t.Fatalf("candidatePasswords took %v, expected < 1s on hung keyring", elapsed)
+	}
+	foundPeanuts := false
+	for _, p := range passes {
+		if p == "peanuts" {
+			foundPeanuts = true
+		}
+	}
+	if !foundPeanuts {
+		t.Fatalf("expected fallback 'peanuts' in candidatePasswords, got %v", passes)
+	}
+}
+
+func TestRotateAccount_Non200IgnoresSetCookieAndDeletions(t *testing.T) {
+	initial := "SID=s1; SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1; SIDCC=cc1"
+	for _, status := range []int{401, 403, 429} {
+		t.Run(fmt.Sprintf("primary_%d", status), func(t *testing.T) {
+			doer := &stubCookieDoer{
+				fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					return &fhttp.Response{
+						StatusCode: status,
+						Header: fhttp.Header{
+							"Set-Cookie": []string{
+								"__Secure-1PSIDTS=; Max-Age=0; Path=/; Secure",
+								"SIDCC=deleted; Path=/",
+							},
+						},
+						Body: io.NopCloser(strings.NewReader("[]")),
+					}, nil
+				},
+			}
+			sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+			res, err := NewRotator().RotateAccount(context.Background(), "acct-non200", initial, sc)
+			if err != nil {
+				t.Fatalf("RotateAccount: %v", err)
+			}
+			if res.Status != status || res.Rotated || len(res.SetCookies) != 0 {
+				t.Fatalf("expected Status=%d Rotated=false SetCookies=nil, got %+v", status, res)
+			}
+			if res.CookieHeader != initial {
+				t.Fatalf("essential cookies modified on %d: got %q", status, res.CookieHeader)
+			}
+		})
+
+		t.Run(fmt.Sprintf("fallback_post_%d", status), func(t *testing.T) {
+			var posts atomic.Int32
+			doer := &stubCookieDoer{
+				fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+						return &fhttp.Response{
+							StatusCode: 200,
+							Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDCC=page_cc; Path=/; Secure"}},
+							Body:       io.NopCloser(strings.NewReader(`<script>init('rot_fb', 1, 540)</script>`)),
+						}, nil
+					}
+					if posts.Add(1) == 1 {
+						return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("err"))}, nil
+					}
+					return &fhttp.Response{
+						StatusCode: status,
+						Header: fhttp.Header{
+							"Set-Cookie": []string{"__Secure-1PSIDTS=; Max-Age=0; Path=/; Secure"},
+						},
+						Body: io.NopCloser(strings.NewReader("[]")),
+					}, nil
+				},
+			}
+			sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+			res, err := NewRotator().RotateAccount(context.Background(), "acct-fb-non200", initial, sc)
+			if err != nil {
+				t.Fatalf("RotateAccount: %v", err)
+			}
+			if res.Status != status || res.Rotated || len(res.SetCookies) != 0 || res.CookieHeader != initial {
+				t.Fatalf("expected fallback non-200 not to absorb/rotate, got %+v", res)
+			}
+		})
+	}
+}
+
+func TestRotateAccount_200DeletionOnlyNotRotated(t *testing.T) {
+	initial := "SID=s1; SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1; SIDCC=cc1"
+	doer := &stubCookieDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{"Set-Cookie": []string{"SIDCC=; Max-Age=0; Path=/; Secure"}},
+				Body:       io.NopCloser(strings.NewReader("[]")),
+			}, nil
+		},
+	}
+	sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+	res, err := NewRotator().RotateAccount(context.Background(), "acct-del200", initial, sc)
+	if err != nil {
+		t.Fatalf("RotateAccount: %v", err)
+	}
+	if res.Rotated {
+		t.Fatalf("deletion-only 200 must not report Rotated=true: %+v", res)
+	}
+}
+
+func TestRotateAccount_FallbackPostErrorAndPage401Status(t *testing.T) {
+	t.Run("fallback_post_error_returned", func(t *testing.T) {
+		var posts atomic.Int32
+		doer := &stubCookieDoer{
+			fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+				if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+					return &fhttp.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(strings.NewReader(`<script>init('rot_err', 1, 540)</script>`)),
+					}, nil
+				}
+				if posts.Add(1) == 1 {
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("err"))}, nil
+				}
+				return nil, fmt.Errorf("fallback post dial failure")
+			},
+		}
+		sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+		_, err := NewRotator().RotateAccount(context.Background(), "acct-posterr", "SAPISID=sap", sc)
+		if err == nil || !strings.Contains(err.Error(), "fallback post dial failure") {
+			t.Fatalf("expected fallback postErr returned, got %v", err)
+		}
+	})
+
+	for _, pageStatus := range []int{401, 403} {
+		t.Run(fmt.Sprintf("fallback_page_%d_updates_status", pageStatus), func(t *testing.T) {
+			doer := &stubCookieDoer{
+				fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+					if strings.Contains(req.URL.Path, "RotateCookiesPage") {
+						return &fhttp.Response{
+							StatusCode: pageStatus,
+							Header:     fhttp.Header{"Set-Cookie": []string{"__Secure-1PSIDTS=; Max-Age=0"}},
+							Body:       io.NopCloser(strings.NewReader("denied")),
+						}, nil
+					}
+					return &fhttp.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("err"))}, nil
+				},
+			}
+			sc, _ := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+			res, err := NewRotator().RotateAccount(context.Background(), "acct-pageauth", "SAPISID=sap; __Secure-1PSIDTS=ts1", sc)
+			if err != nil {
+				t.Fatalf("RotateAccount: %v", err)
+			}
+			if res.Status != pageStatus || res.Rotated {
+				t.Fatalf("expected Status=%d Rotated=false, got %+v", pageStatus, res)
+			}
+		})
+	}
+}
+
+func TestDomainScoringAndNonGoogleFilter(t *testing.T) {
+	payload := `[
+		{"name":"SAPISID","value":"evil_sap","domain":".evilgoogle.com"},
+		{"name":"SAPISID","value":"sub_sap","domain":"accounts.google.com"},
+		{"name":"SAPISID","value":"root_sap","domain":".google.com"},
+		{"name":"OSID","value":"root_osid","domain":".google.com"},
+		{"name":"OSID","value":"gemini_osid","domain":"gemini.google.com"},
+		{"name":"__Secure-OSID","value":"gemini_sosid","domain":"gemini.google.com"},
+		{"name":"__Secure-OSID","value":"root_sosid","domain":".google.com"},
+		{"name":"LSID","value":"root_lsid","domain":".google.com"},
+		{"name":"LSID","value":"acct_lsid","domain":"accounts.google.com"},
+		{"name":"__Host-1PLSID","value":"acct_1plsid","domain":"accounts.google.com"},
+		{"name":"ACCOUNT_CHOOSER","value":"acct_chooser","domain":"accounts.google.com"},
+		{"name":"SID","value":"evil_sid","domain":"notgoogle.com"}
+	]`
+	hdr, _, err := ParseImportPayload(payload)
+	if err != nil {
+		t.Fatalf("ParseImportPayload: %v", err)
+	}
+	m := ParseHeader(hdr)
+	if m["SAPISID"] != "root_sap" {
+		t.Fatalf("expected .google.com SAPISID, got %q", m["SAPISID"])
+	}
+	if m["OSID"] != "gemini_osid" || m["__Secure-OSID"] != "gemini_sosid" {
+		t.Fatalf("expected gemini.google.com OSID/__Secure-OSID, got OSID=%q __Secure-OSID=%q", m["OSID"], m["__Secure-OSID"])
+	}
+	if m["LSID"] != "acct_lsid" || m["__Host-1PLSID"] != "acct_1plsid" || m["ACCOUNT_CHOOSER"] != "acct_chooser" {
+		t.Fatalf("expected accounts.google.com LSID/__Host-1PLSID/ACCOUNT_CHOOSER, got %+v", m)
+	}
+	if m["SID"] != "" {
+		t.Fatalf("expected non-.google.com SID skipped, got %q", m["SID"])
+	}
+}
+
+func TestIsCookieDeletion_DateLayouts(t *testing.T) {
+	now := time.Now()
+	for _, exp := range []string{
+		"Thu, 01-Jan-1970 00:00:00 GMT",
+		"Thursday, 01-Jan-1970 00:00:00 GMT",
+		"Thu, 01-Jan-70 00:00:00 GMT",
+		`"Thu, 01-Jan-1970 00:00:00 GMT"`,
+	} {
+		if !isCookieDeletion("val", "Expires="+exp+"; Path=/", now) {
+			t.Errorf("expected Expires=%s to be detected as deletion", exp)
+		}
+	}
+	future := now.Add(24 * time.Hour).UTC().Format("Mon, 02-Jan-2006 15:04:05 MST")
+	if isCookieDeletion("val", "Expires="+future+"; Path=/", now) {
+		t.Errorf("expected future Expires=%s NOT to be deletion", future)
+	}
+}
+
+func TestSQLiteWALAndURISpecialChars(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "dir#with?special%chars and spaces")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(base, "Cookies")
+	db, err := sql.Open("sqlite", sqliteFileURI(dbPath, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB, value TEXT, has_expires INTEGER, expires_utc INTEGER, is_persistent INTEGER)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	// Checkpoint schema, then keep SAPISID row in the uncheckpointed WAL.
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO cookies VALUES ('.google.com', 'SAPISID', X'', 'wal_sap_123', 0, 0, 0)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	// Hold db open so WAL is not auto-checkpointed on close.
+	defer db.Close()
+
+	if !hasSAPISIDCookieRow(dbPath) {
+		t.Fatal("expected hasSAPISIDCookieRow to detect uncheckpointed WAL row in special-char path")
+	}
+	res, err := ReadBrowserCookies(dbPath)
+	if err != nil {
+		t.Fatalf("ReadBrowserCookies: %v", err)
+	}
+	if ExtractSAPISID(res.Header) != "wal_sap_123" {
+		t.Fatalf("expected wal_sap_123 from uncheckpointed WAL, got %q", res.Header)
 	}
 }

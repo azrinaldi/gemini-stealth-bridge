@@ -53,10 +53,20 @@ type LineParseResult struct {
 	AnsweredModelLabel string
 	AsyncVideoCID      string
 	AsyncVideoStatus   string
-	MediaToolActive    bool
-	StreamEnd          bool
-	Frames             []Frame
-	GroundingSources   []GroundingSource
+	VideoToolActive    bool
+	// Activity is the upstream's own display text for the current tool phase
+	// (pj[6][0], e.g. "Searching the web"). It is forwarded verbatim; no label is
+	// synthesized when the field is absent.
+	Activity string
+	// AsyncVideoRefCID is the conversation id named by an explicit reference
+	// field (pj[45]), when upstream sent one. It is reported separately so the
+	// stream can prefer it even when the reference and the video-tool signal
+	// arrive in different envelopes, in either order.
+	AsyncVideoRefCID string
+	MediaToolActive  bool
+	StreamEnd        bool
+	Frames           []Frame
+	GroundingSources []GroundingSource
 }
 
 var (
@@ -129,10 +139,17 @@ var (
 			`i\s+(?:can't|cannot)\s+help[^\n]*because\s+(?:i'm|i\s+am)\s+(?:only|just|a)\s+(?:a\s+)?language\s+model` +
 			`)[.!]?$`,
 	)
-	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
-	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
-	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
+	hex16Re             = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
+	googleUserContentRe = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
+	imageSizeSuffixRe   = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	// Placeholder links Gemini leaves in reply text where a rendered attachment
+	// belongs. The path can carry several segments - a web image search returns
+	// `image_collection/image_retrieval/<id>` - so a single-segment pattern left
+	// the placeholder visible in the answer. The real media hosts are
+	// `lh3.googleusercontent.com` (handled separately), so a path on the bare
+	// host is always a placeholder.
+	cardContentRe                 = regexp.MustCompile(`(?i)^https?://googleusercontent\.com/card_content/\d+$`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:[\w-]+/)+[\w-]+`)
 	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe              = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe              = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -783,22 +800,31 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelLabel = answeredLabel
 		}
 
-		// Check for async video_generation trigger in pj[6] ("7" in 1-based sparse dictionary) or pj[45] ("46").
-		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) >= 2 {
-			if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
-				toolName, _ := toolMeta[0].(string)
-				if toolName == "video_generation" {
-					res.MediaToolActive = true
-					if res.CID != "" {
-						res.AsyncVideoCID = res.CID
-					}
-					if msg, _ := toolStatus[0].(string); msg != "" {
-						res.AsyncVideoStatus = msg
-					}
-				} else if len(toolMeta) > 1 {
-					if labelArr, ok := toolMeta[1].([]any); ok && len(labelArr) > 2 {
-						if lbl, _ := labelArr[2].(string); strings.Contains(strings.ToLower(lbl), "image") {
-							res.MediaToolActive = true
+		// pj[6] ("7" in the 1-based sparse dictionary) carries the current tool
+		// phase: [displayText, [toolName, [.., .., label]]]. The display text is
+		// upstream's own wording for what it is doing, so it is surfaced verbatim
+		// and never synthesized locally.
+		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) > 0 {
+			if activity, _ := toolStatus[0].(string); activity != "" {
+				res.Activity = activity
+			}
+			if len(toolStatus) >= 2 {
+				if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
+					toolName, _ := toolMeta[0].(string)
+					if toolName == "video_generation" {
+						res.VideoToolActive = true
+						res.MediaToolActive = true
+						if res.CID != "" {
+							res.AsyncVideoCID = res.CID
+						}
+						if msg, _ := toolStatus[0].(string); msg != "" {
+							res.AsyncVideoStatus = msg
+						}
+					} else if len(toolMeta) > 1 {
+						if labelArr, ok := toolMeta[1].([]any); ok && len(labelArr) > 2 {
+							if lbl, _ := labelArr[2].(string); strings.Contains(strings.ToLower(lbl), "image") {
+								res.MediaToolActive = true
+							}
 						}
 					}
 				}
@@ -810,9 +836,15 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelID = ""
 			res.AnsweredModelLabel = ""
 		}
+		// pj[45] is an explicit reference to the conversation that owns the async
+		// media. It is reported even when the video-tool signal arrived in another
+		// envelope, so the stream can prefer this CID over the ambient one.
 		if asyncRef, ok := jspbField(pj, 45).([]any); ok && len(asyncRef) > 0 {
-			if refCID, _ := asyncRef[0].(string); strings.HasPrefix(refCID, "c_") && res.AsyncVideoCID != "" {
-				res.AsyncVideoCID = refCID
+			if refCID, _ := asyncRef[0].(string); strings.HasPrefix(refCID, "c_") {
+				res.AsyncVideoRefCID = refCID
+				if res.AsyncVideoCID != "" {
+					res.AsyncVideoCID = refCID
+				}
 			}
 		}
 
@@ -883,7 +915,24 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
-	if googleGenContentPlaceholderRe.MatchString(text) {
+	// A card reply puts nothing but a card_content link in the text slot; the
+	// actual answer sits in field 22. Stripping the link alone would deliver an
+	// empty answer, so the card body replaces it. When field 22 is empty the link
+	// is kept: a visible link the client can follow beats a silently empty reply,
+	// and the caller already treats an empty candidate as a retryable failure.
+	keepCardLink := false
+	if cardContentRe.MatchString(strings.TrimSpace(text)) {
+		if alt, ok := jspbField(c, 22).([]any); ok && len(alt) > 0 {
+			if s, _ := alt[0].(string); strings.TrimSpace(s) != "" {
+				text = s
+			} else {
+				keepCardLink = true
+			}
+		} else {
+			keepCardLink = true
+		}
+	}
+	if !keepCardLink && googleGenContentPlaceholderRe.MatchString(text) {
 		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
 	}
 
@@ -1128,6 +1177,15 @@ func extractGeneratedVideos(c []any) []GeneratedVideo {
 				if len(urls) > 2 {
 					streamURL, _ = urls[2].(string)
 				}
+				if _, ok := mediaURL(downloadURL, nil); !ok {
+					downloadURL = ""
+				}
+				if _, ok := mediaURL(streamURL, nil); !ok {
+					streamURL = ""
+				}
+				if _, ok := mediaURL(thumbURL, nil); !ok {
+					thumbURL = ""
+				}
 				primary := downloadURL
 				if primary == "" {
 					primary = streamURL
@@ -1207,6 +1265,22 @@ func classifyRPCErrorCode(code int, raw any) error {
 		snippet = snippet[:200]
 	}
 	switch code {
+	case 1014:
+		return transport.NewUpstreamError(
+			"upstream error code 1014: access is temporarily restricted; retrying later usually succeeds",
+			503,
+			"upstream_degraded",
+			nil,
+			nil,
+		)
+	case 1016:
+		return transport.NewUpstreamError(
+			"upstream error code 1016: session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again",
+			401,
+			"upstream_auth_error",
+			nil,
+			nil,
+		)
 	case 1037:
 		return transport.NewUpstreamError(
 			"upstream error code 1037",
@@ -1232,6 +1306,17 @@ func classifyRPCErrorCode(code int, raw any) error {
 			fmt.Sprintf("upstream error code 1185: Gemini Web failed the turn upstream; retrying on another account usually succeeds: %s", snippet),
 			502,
 			"upstream_degraded",
+			nil,
+			nil,
+		)
+	case 1013:
+		// Raised at random when generating with certain models and gone on the
+		// next attempt. It is not a quota or auth signal, so it must be retried
+		// rather than presented to the caller as a generic upstream failure.
+		return transport.NewUpstreamError(
+			"upstream error code 1013: Gemini reported a temporary model error; retrying usually succeeds",
+			503,
+			"upstream_transient",
 			nil,
 			nil,
 		)

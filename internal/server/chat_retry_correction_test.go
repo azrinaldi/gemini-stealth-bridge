@@ -13,7 +13,7 @@ func TestAppendToolErrorCorrectionTargetsInventedBudget(t *testing.T) {
 	base := "HISTORIAL...\n\nAssistant:"
 
 	refusal := appendToolErrorCorrection(base, "tool_call_error: "+toolbridge.ToolProtocolRefusalError)
-	if !strings.Contains(refusal, "NO tool-call or search budget") {
+	if !strings.Contains(refusal, "no per-turn tool limit") {
 		t.Fatalf("retry note must deny the invented budget, got %q", refusal)
 	}
 	if strings.Contains(refusal, "failed tool validation") {
@@ -27,7 +27,7 @@ func TestAppendToolErrorCorrectionTargetsInventedBudget(t *testing.T) {
 	if !strings.Contains(schema, "failed tool validation") {
 		t.Fatalf("schema failure must keep the generic note, got %q", schema)
 	}
-	if strings.Contains(schema, "NO tool-call or search budget") {
+	if strings.Contains(schema, "no per-turn tool limit") {
 		t.Fatal("schema failure must not claim there is no tool budget")
 	}
 
@@ -54,4 +54,3 @@ func TestRemainingStreamTailToleratesMidStreamCitationLinkRewrite(t *testing.T) 
 		t.Fatalf("expected remaining tail to include trailing content, got ok=%v tail=%q", ok, tail)
 	}
 }
-

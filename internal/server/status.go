@@ -2,10 +2,12 @@ package server
 
 import (
 	"strconv"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 // Account status values reported by /v1/accounts and `gsb --accounts`.
@@ -41,47 +43,62 @@ const (
 // It is exported so the CLI can report the same status the HTTP API does, instead
 // of reimplementing the rules and drifting from them.
 func AccountStatus(a *AccountState, now time.Time) (status string, reason string) {
+	if a == nil {
+		return StatusUnknown, "account unavailable"
+	}
 	// Best-effort cleanup: status evaluation is a natural point to drop expired
-	// synthetic cooldowns and their strike counters. Callers such as the accounts
-	// endpoint already hold a read lock, so TryLock simply skips mutation there;
-	// the read-only view below still ignores the expired entries.
+	// synthetic cooldowns and their strike counters. If TryLock succeeds, prune
+	// and evaluate under that single write lock; otherwise fall back to a single
+	// RLock (the read-only evaluator ignores expired entries).
 	if a.mu.TryLock() {
 		pruneExpiredSyntheticLocked(a, now)
+		status, reason = accountStatusLocked(a, now)
 		a.mu.Unlock()
+		return status, reason
 	}
 	a.mu.RLock()
-	quarantined := a.Quarantined
-	qReason := a.QuarantineReason
-	disabled := a.Disabled
-	lastError := a.LastError
-	lastFail := a.LastFail
-	fails := a.Fails
-	quota := append([]gemini.QuotaBucket(nil), a.Quota...)
-	subStrikes := make(map[string]int, len(a.subStrikes))
-	for k, v := range a.subStrikes {
-		subStrikes[k] = v
-	}
-	modelsError := a.ModelsError
+	status, reason = accountStatusLocked(a, now)
 	a.mu.RUnlock()
+	return status, reason
+}
 
-	if disabled {
+// accountStatusLocked evaluates status and reason for a with a.mu already held
+// (read or write). It must never acquire or release any lock and never mutate a.
+func accountStatusLocked(a *AccountState, now time.Time) (status string, reason string) {
+	if a == nil {
+		return StatusUnknown, "account unavailable"
+	}
+	if a.Disabled {
 		return StatusDisabled, "paused by operator"
 	}
-	if quarantined {
-		if strings.TrimSpace(qReason) == "" {
+	if a.Quarantined {
+		if strings.TrimSpace(a.QuarantineReason) == "" {
 			return StatusQuarantined, "restricted upstream"
 		}
-		return StatusQuarantined, qReason
+		return StatusQuarantined, a.QuarantineReason
+	}
+	if looksLikeAccountBan(a.LastError) || isModelsBanError(a.ModelsError) {
+		reason := strings.TrimSpace(a.QuarantineReason)
+		if reason == "" && a.ModelsError != nil {
+			reason = a.ModelsError.Error()
+		}
+		if reason == "" {
+			reason = truncateReason(a.LastError)
+		}
+		if reason == "" {
+			reason = "restricted upstream"
+		}
+		return StatusQuarantined, reason
 	}
 
 	// An auth failure means the saved session cannot be used at all until a new
 	// login, which is more severe than a quota problem and should not be hidden
 	// behind one.
-	if looksLikeAuthFailure(lastError) || (modelsError != nil && looksLikeAuthFailure(modelsError.Error())) {
+	if looksLikeAuthFailure(a.LastError) || isModelsAuthError(a.ModelsError) {
 		return StatusExpired, "session expired; run `gsb --login <name>`"
 	}
 
-	if label, resetAt, ok := exhaustedBucket(quota, now); ok {
+	if label, resetAt, ok := exhaustedBucket(a.Quota, now); ok {
 		if resetAt.IsZero() {
 			return StatusExhausted, label + " quota spent"
 		}
@@ -92,12 +109,12 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 	// is the signal that this is the weekly window rather than the 5-hour one.
 	// Only an active synthetic bucket justifies reporting exhausted: once its
 	// ResetAt has passed, the strike counter is stale state, not a live limit.
-	for subID, strikes := range subStrikes {
+	for subID, strikes := range a.subStrikes {
 		if strikes < 3 {
 			continue
 		}
 		active := false
-		for _, q := range quota {
+		for _, q := range a.Quota {
 			if q.ID == subID && syntheticCooldownActive(q, now) {
 				active = true
 				break
@@ -110,15 +127,15 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 		return StatusExhausted, name + " still exhausted after " + strconv.Itoa(strikes) + " retries"
 	}
 
-	if !lastFail.IsZero() && now.Sub(lastFail) < fillFirstFailCooldown {
-		return StatusCooling, "recent failure: " + truncateReason(lastError)
+	if !a.LastFail.IsZero() && now.Sub(a.LastFail) < fillFirstFailCooldown {
+		return StatusCooling, "recent failure: " + truncateReason(a.LastError)
 	}
 
-	if fails > 0 {
-		return StatusDegraded, truncateReason(lastError)
+	if a.Fails > 0 {
+		return StatusDegraded, truncateReason(a.LastError)
 	}
 
-	if len(quota) == 0 {
+	if len(a.Quota) == 0 {
 		return StatusUnknown, "no quota check yet; run with --accounts-live or query /v1/accounts on the running daemon"
 	}
 
@@ -168,6 +185,50 @@ func exhaustedBucket(quota []gemini.QuotaBucket, now time.Time) (label string, r
 	return "", time.Time{}, false
 }
 
+// looksLikeAccountBan reports whether a recorded failure was upstream restricting
+// the account itself. Such a verdict survives a healthy registry read: the account
+// can list models and still be refused for every generation.
+func isModelsBanError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil && ue.Code == "account_banned" {
+		return true
+	}
+	return looksLikeAccountBan(err.Error())
+}
+
+func isModelsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil && (ue.Code == "upstream_auth_error" || ue.Code == "auth_redirect") {
+		return true
+	}
+	return looksLikeAuthFailure(err.Error())
+}
+
+func looksLikeAccountBan(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if m == "" {
+		return false
+	}
+	for _, needle := range []string{
+		"account_banned",
+		"tos_violation",
+		"permission_denied",
+		"quarantin",
+		"upstream rejected this account (code ",
+	} {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func looksLikeAuthFailure(msg string) bool {
 	m := strings.ToLower(strings.TrimSpace(msg))
 	if m == "" {
@@ -176,13 +237,19 @@ func looksLikeAuthFailure(msg string) bool {
 	for _, needle := range []string{
 		"upstream_auth_error",
 		"auth_redirect",
+		"redirected to google sign-in",
 		"code 1016",
-		"1016",
 		"session is unauthenticated",
 		"session expired",
 		"snlm0e",
 		"sign in again",
 		"invalid api key",
+		"upstream http 401",
+		"upstream http 403",
+		"file upload failed with http 401",
+		"file upload failed with http 403",
+		"cookie rotation rejected (http 401)",
+		"cookie rotation rejected (http 403)",
 	} {
 		if strings.Contains(m, needle) {
 			return true
@@ -202,6 +269,21 @@ func truncateReason(s string) string {
 	return s
 }
 
+func cloneQuotaBuckets(src []gemini.QuotaBucket) []gemini.QuotaBucket {
+	if src == nil {
+		return nil
+	}
+	out := make([]gemini.QuotaBucket, len(src))
+	copy(out, src)
+	for i := range out {
+		if out[i].UsagePercentage != nil {
+			v := *out[i].UsagePercentage
+			out[i].UsagePercentage = &v
+		}
+	}
+	return out
+}
+
 // AccountSnapshot returns the fields the CLI needs, copied under the account lock.
 // Exposing a snapshot instead of the lock keeps the mutex private while letting
 // other packages read consistent values.
@@ -211,5 +293,5 @@ func AccountSnapshot(a *AccountState) (email string, quota []gemini.QuotaBucket)
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.Email, append([]gemini.QuotaBucket(nil), a.Quota...)
+	return a.Email, cloneQuotaBuckets(a.Quota)
 }

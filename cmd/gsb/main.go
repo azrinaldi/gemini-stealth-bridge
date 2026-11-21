@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,8 +45,8 @@ func init() {
 		fmt.Fprint(out, "  gsb --web                           start daemon + Web Control Plane at http://127.0.0.1:20133/ui\n")
 		fmt.Fprint(out, "  ./start.sh                          build (if needed) and start daemon with Web UI enabled\n\n")
 		fmt.Fprint(out, "Remote VPS / Headless login:\n")
-		fmt.Fprint(out, "  On laptop: ssh -L 20133:127.0.0.1:20133 user@vps  (and optionally `gsb --login-helper`)\n")
-		fmt.Fprint(out, "  Open http://127.0.0.1:20133/ui -> '+ Add Account' -> paste Incognito cookies or launch isolated browser.\n\n")
+		fmt.Fprint(out, "  On desktop: ssh -L 20133:127.0.0.1:20133 user@vps\n")
+		fmt.Fprint(out, "  Desktop UI setup: see Remote VPS and headless servers in README.md.\n\n")
 		fmt.Fprint(out, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -67,14 +70,21 @@ func main() {
 		captureRef       = flag.Bool("capture-reference", false, "Capture reference headers from local Chrome login profile via CDP or dump instructions")
 		listAccounts     = flag.Bool("accounts", false, "Print a status table for every loaded account and exit")
 		accountsLive     = flag.Bool("accounts-live", false, "With --accounts, query upstream for fresh models and quota before printing")
-		enableWebUI      = flag.Bool("web", false, "Enable the opt-in web configuration UI at /ui and /v1/admin/* (or set BRIDGE_WEB_UI=1)")
+		enableWebUI      = flag.Bool("web", false, "Enable the opt-in Web Control Plane at /ui and /v1/admin/* (or set BRIDGE_WEB_UI=1)")
 		runHealthcheck   = flag.Bool("healthcheck", false, "Probe local /health endpoint and exit 0 if healthy (for container healthchecks)")
 		loginHelper      = flag.Bool("login-helper", false, "Run local desktop isolated-browser login helper on 127.0.0.1:20134 for remote VPS Web UI")
+		desktopUI        = flag.Bool("desktop-ui", false, "Serve desktop control plane and local API proxy on 127.0.0.1:20133 using a private SSH socket at $XDG_RUNTIME_DIR/gsb-desktop/bridge.sock")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("gsb %s (%s/%s, %s)\n", config.Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return
+	}
+	if *desktopUI {
+		if err := runDesktopUI(); err != nil {
+			log.Fatalf("[desktop-ui] %v", err)
+		}
 		return
 	}
 
@@ -258,14 +268,6 @@ func main() {
 				log.Printf("  WARNING:   remote access to /ui and /v1/admin/* is locked until BRIDGE_ADMIN_KEY or a non-public BRIDGE_API_KEY is configured")
 			}
 		}
-		if loaded > 0 {
-			poolDesc := cfg.APIKey
-			if cfg.APIKey == "public" {
-				poolDesc = "public (no auth)"
-			}
-			log.Printf("  keys:      pool=%s across %d account(s), strategy=%s", poolDesc, loaded, cfg.AccountStrategy)
-			log.Printf("             account keys gsb-<name> pin a single account")
-		}
 		if loaded == 0 {
 			if cfg.WebUI {
 				log.Printf("  onboarding: no accounts yet — open http://%s/ui and click '+ Add Account', or run `gsb --login <name>`", addr)
@@ -283,7 +285,29 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	srv.FlushSessionCacheNow()
 	srv.Pool.Reset()
+}
+
+func stageAndPersistAccountImport(
+	cfg config.Config,
+	acctName, hdr, cookieDB, profileHint string,
+	bootstrapFn func(context.Context, *gemini.AccountClient) error,
+) (string, *gemini.AccountClient, error) {
+	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
+	srv := server.New(cfg)
+	ac := gemini.NewAccountClient(acctName, hdr, "", srv.Pool, srv.Rotator)
+	if prev, _, loadErr := cookies.LoadAccountFile(outPath); loadErr == nil && prev != nil && prev.AuthUser > 0 {
+		ac.SetAuthUser(prev.AuthUser)
+	}
+	ac.SetProvenance(cookieDB, profileHint)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := bootstrapFn(ctx, ac); err != nil {
+		return outPath, nil, fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	}
+	ac.SaveToFile(outPath)
+	return outPath, ac, nil
 }
 
 func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
@@ -315,27 +339,33 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	if lockPath := cookies.DetectActiveProfileLock(dbPath); lockPath != "" {
 		fmt.Printf("Note: Browser profile lock detected (%s); concurrent browser and bridge rotation on the same session can cause __Secure-1PSIDTS conflicts.\n", filepath.Base(lockPath))
 	}
-	hdr, err := cookies.ReadChromeCookies(dbPath)
+	// Chrome 127+ can bind the session to a hardware key (Device Bound Session
+	// Credentials). Cookies captured from such a profile expire within hours and
+	// `--rotate` cannot renew them, so say it here rather than letting the
+	// operator discover it as a 401 later.
+	if isChromiumFamilyDB(dbPath) {
+		fmt.Println("Note: Chromium-family profiles may use Device Bound Session Credentials (DBSC), which keeps imported cookies valid for only a few hours and blocks renewal. gsb --login uses a disposable profile and avoids this; a Firefox profile is the other safe source.")
+	}
+	readRes, err := cookies.ReadBrowserCookies(dbPath)
+	if err != nil {
+		return err
+	}
+	hdr, err := cookies.ValidateChromeReadResult(dbPath, readRes)
 	if err != nil {
 		return err
 	}
 	if cookies.ExtractSAPISID(hdr) == "" {
 		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first (e.g. `gsb --login %s`), then try again", dbPath, acctName)
 	}
-	if res, resErr := cookies.ReadBrowserCookies(dbPath); resErr == nil {
-		if hint := cookies.SessionCookieHint(res, 7*24*time.Hour); hint != "" {
-			fmt.Printf("Warning: %s in this browser profile. A profile that is not signed in to Gemini Web produces cookies that expire almost immediately.\n", hint)
-			fmt.Printf("         Prefer `gsb --login %s` so you sign in first and the session is captured afterwards.\n", acctName)
-		}
+	if hint := cookies.SessionCookieHint(readRes, 7*24*time.Hour); hint != "" {
+		fmt.Printf("Warning: %s in this browser profile. A profile that is not signed in to Gemini Web produces cookies that expire almost immediately.\n", hint)
+		fmt.Printf("         Prefer `gsb --login %s` so you sign in first and the session is captured afterwards.\n", acctName)
 	}
-	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
-	srv := server.New(cfg)
-	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	ac.SetProvenance(dbPath, explicitDB)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	if err := ac.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	outPath, ac, err := stageAndPersistAccountImport(cfg, acctName, hdr, dbPath, explicitDB, func(ctx context.Context, ac *gemini.AccountClient) error {
+		return ac.Bootstrap(ctx)
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)
 	printStandaloneConnectionInfo(cfg, acctName)
@@ -367,14 +397,11 @@ func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error
 	if cookies.ExtractSAPISID(hdr) == "" {
 		return fmt.Errorf("cookie payload does not contain SAPISID")
 	}
-	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
-	srv := server.New(cfg)
-	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	ac.SetProvenance(filePath, "cookie-export")
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	if err := ac.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
+	outPath, ac, err := stageAndPersistAccountImport(cfg, acctName, hdr, filePath, "cookie-export", func(ctx context.Context, ac *gemini.AccountClient) error {
+		return ac.Bootstrap(ctx)
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)
 	printStandaloneConnectionInfo(cfg, acctName)
@@ -420,31 +447,130 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	return runImportChrome(cfg, acctName, explicitDB)
 }
 
-func runLocalLoginHelper() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/browser-login", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+const (
+	loginHelperAddr     = "127.0.0.1:20134"
+	loginHelperHeader   = "X-GSB-Helper-Token"
+	loginHelperDeadline = 4 * time.Minute
+)
+
+func loopbackHelperHost(host string) bool {
+	switch host {
+	case "127.0.0.1:20134", "localhost:20134", "[::1]:20134":
+		return true
+	}
+	return false
+}
+
+func allowedHelperOrigin(origin string) bool {
+	switch origin {
+	case "http://127.0.0.1:20133", "http://localhost:20133", "http://[::1]:20133":
+		return true
+	}
+	return false
+}
+
+func validHelperPreflight(r *http.Request) bool {
+	methods := r.Header.Values("Access-Control-Request-Method")
+	if len(methods) != 1 || methods[0] != http.MethodPost {
+		return false
+	}
+	for _, value := range r.Header.Values("Access-Control-Request-Headers") {
+		for _, header := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(header)) {
+			case "content-type", "x-gsb-helper-token":
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func helperToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate helper token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func displayHelperToken(token string) error {
+	name := "/dev/tty"
+	if runtime.GOOS == "windows" {
+		name = "CONOUT$"
+	}
+	tty, err := os.OpenFile(name, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("login helper requires interactive terminal for token display: %w", err)
+	}
+	defer tty.Close()
+	_, err = fmt.Fprintf(tty, "gsb login-helper token (enter in local Web UI; do not share): %s\n", token)
+	if err != nil {
+		return fmt.Errorf("display login helper token: %w", err)
+	}
+	return nil
+}
+
+func loginHelperHandler(token string, login func(context.Context) (*cookies.IsolatedLoginResult, error)) http.Handler {
+	loginMu := make(chan struct{}, 1)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+		if r.URL.Path != "/browser-login" || r.URL.RawQuery != "" || r.URL.ForceQuery {
+			http.NotFound(w, r)
+			return
+		}
+		peer, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(peer).IsLoopback() || !loopbackHelperHost(r.Host) {
+			http.Error(w, "loopback connection required", http.StatusForbidden)
+			return
+		}
+		origins := r.Header.Values("Origin")
+		if len(origins) != 1 || !allowedHelperOrigin(origins[0]) {
+			http.Error(w, "browser origin not allowed", http.StatusForbidden)
+			return
 		}
 		if r.Method == http.MethodOptions {
+			if !validHelperPreflight(r) {
+				http.Error(w, "preflight not allowed", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origins[0])
+			w.Header().Set("Access-Control-Allow-Methods", "POST")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, "+loginHelperHeader)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		w.Header().Set("Access-Control-Allow-Origin", origins[0])
 		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST, OPTIONS")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		tokens := r.Header.Values(loginHelperHeader)
+		if len(tokens) != 1 || subtle.ConstantTimeCompare([]byte(tokens[0]), []byte(token)) != 1 {
+			http.Error(w, "helper authentication required", http.StatusUnauthorized)
+			return
+		}
+		select {
+		case loginMu <- struct{}{}:
+			defer func() { <-loginMu }()
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "A sign-in window is already open."},
+			})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), loginHelperDeadline)
 		defer cancel()
-		res, err := cookies.RunIsolatedBrowserLogin(ctx, "")
+		res, err := login(ctx)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": map[string]any{"message": err.Error()},
+				"error": map[string]any{"message": "Local browser sign-in failed. Check that a supported desktop browser and GUI are available, then retry."},
 			})
 			return
 		}
@@ -453,8 +579,53 @@ func runLocalLoginHelper() error {
 			"userAgent": res.UserAgent,
 		})
 	})
-	log.Printf("[login-helper] listening on http://127.0.0.1:20134 for isolated desktop browser login")
-	return http.ListenAndServe("127.0.0.1:20134", mux)
+}
+
+func runLocalLoginHelper() error {
+	return serveLocalLoginHelper(displayHelperToken, func(ctx context.Context) (*cookies.IsolatedLoginResult, error) {
+		return cookies.RunIsolatedBrowserLogin(ctx, "")
+	})
+}
+
+func serveLocalLoginHelper(display func(string) error, login func(context.Context) (*cookies.IsolatedLoginResult, error)) error {
+	token, err := helperToken()
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", loginHelperAddr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	if err := display(token); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	httpSrv := &http.Server{
+		Handler:           loginHelperHandler(token, login),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      loginHelperDeadline + 15*time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+	log.Printf("[login-helper] listening on http://%s for isolated desktop browser login", loginHelperAddr)
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpSrv.Serve(ln) }()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			_ = httpSrv.Close()
+			return err
+		}
+		return nil
+	}
 }
 
 // findBrowserBinary delegates to cookies.FindBrowserBinary.
@@ -509,15 +680,8 @@ func openBrowserURL(url, browser, profileDir string) {
 }
 
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
-	fmt.Printf("  base url    : http://%s:%d/v1\n", cfg.Host, cfg.Port)
-	fmt.Printf("  pool key    : %s", cfg.APIKey)
-	if cfg.APIKey == "public" {
-		fmt.Print("  (default; no auth, routes across every loaded account)")
-	} else {
-		fmt.Print("  (routes across every loaded account)")
-	}
-	fmt.Println()
-	fmt.Printf("  account key : gsb-%s (or %s)  (pins this account only, no failover)\n", acctName, acctName)
+	fmt.Printf("  base url    : http://%s/v1\n", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
+	fmt.Println("  API keys    : not printed; use your configured key or authorized Web UI")
 	fmt.Println("  note        : this session was captured from an already-signed-in browser.")
 	fmt.Println("                If Gemini later rejects it, run `gsb --login " + acctName + "` to sign in again")
 	fmt.Println("                instead of copying cookies from a browser that was never signed in.")
@@ -545,6 +709,85 @@ func runUnquarantine(cfg config.Config, acctID string) error {
 	return nil
 }
 
+func offlineFallbackModels() []gemini.ModelInfo {
+	// Offline fallback: the live registry is unreachable, so these are the
+	// tiers the web client advertised on 2026-11-13 with the attributes the
+	// otAQ7b registry reported for them. ThinkingLevels is set explicitly so
+	// the payload does not fall back to the name heuristic, which marks
+	// Flash-Lite as non-reasoning while the registry gives it all three levels.
+	levels := []string{"low", "medium", "high"}
+	return []gemini.ModelInfo{
+		{
+			ModelID:             "fbb127bbb056c959",
+			ModelName:           "gemini-4-hydrogen",
+			DisplayName:         "Everyday help",
+			Aliases:             []string{"gemini-everyday-help"},
+			Description:         "4 Hydrogen",
+			Capacity:            2,
+			ModelNumber:         1,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "5bf011840784117a",
+			ModelName:           "gemini-4-hydrogen-thinking",
+			DisplayName:         "Solves complex problems",
+			Aliases:             []string{"gemini-hydrogen-thinking", "gemini-solves-complex-problems"},
+			Description:         "4 Hydrogen Thinking",
+			Capacity:            2,
+			ModelNumber:         5,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "9d8ca3786ebdfbea",
+			ModelName:           "gemini-3.1-pro",
+			DisplayName:         "Detailed research",
+			Aliases:             []string{"gemini-pro", "gemini-detailed-research"},
+			Description:         "3.1 Pro",
+			Capacity:            2,
+			ModelNumber:         3,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "8c46e95b1a07cecc",
+			ModelName:           "gemini-3.5-flash-lite",
+			DisplayName:         "Quick answers",
+			Aliases:             []string{"gemini-flash-lite", "gemini-quick-answers"},
+			Description:         "3.5 Flash-Lite",
+			Capacity:            2,
+			ModelNumber:         6,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			// Router tier: the backend picks a model per request, so its
+			// thinking policy belongs to whichever model it selects.
+			ModelID:             "cf41b0e0dd7d53e5",
+			ModelName:           "gemini-auto",
+			DisplayName:         "Auto",
+			Aliases:             []string{"gemini-adapts-to-your-needs"},
+			Description:         "Adapts to your needs",
+			Capacity:            1,
+			ModelNumber:         2,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+		{
+			ModelID:             "95a4c0abcba24364",
+			ModelName:           "gemini-4-carbon",
+			DisplayName:         "Most complex work",
+			Aliases:             []string{"gemini-carbon", "gemini-most-complex-work"},
+			Description:         "4 Carbon",
+			Capacity:            2,
+			ModelNumber:         8,
+			ThinkingLevels:      levels,
+			ThinkingPolicyKnown: true,
+		},
+	}
+}
+
 func runModelsJSON(cfg config.Config) {
 	srv := server.New(cfg)
 	_ = srv.LoadCredentials()
@@ -555,82 +798,7 @@ func runModelsJSON(cfg config.Config) {
 		}
 	}
 	if len(models) == 0 {
-		// Offline fallback: the live registry is unreachable, so these are the
-		// tiers the web client advertised on 2026-11-13 with the attributes the
-		// otAQ7b registry reported for them. ThinkingLevels is set explicitly so
-		// the payload does not fall back to the name heuristic, which marks
-		// Flash-Lite as non-reasoning while the registry gives it all three levels.
-		levels := []string{"low", "medium", "high"}
-		models = []gemini.ModelInfo{
-			{
-				ModelID:             "fbb127bbb056c959",
-				ModelName:           "gemini-4-hydrogen",
-				DisplayName:         "Everyday help",
-				Aliases:             []string{"gemini-everyday-help"},
-				Description:         "4 Hydrogen",
-				Capacity:            2,
-				ModelNumber:         1,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "5bf011840784117a",
-				ModelName:           "gemini-hydrogen-thinking",
-				DisplayName:         "Solves complex problems",
-				Aliases:             []string{"gemini-solves-complex-problems"},
-				Description:         "4 Hydrogen Thinking",
-				Capacity:            2,
-				ModelNumber:         5,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "9d8ca3786ebdfbea",
-				ModelName:           "gemini-pro",
-				DisplayName:         "Detailed research",
-				Aliases:             []string{"gemini-detailed-research"},
-				Description:         "3.1 Pro",
-				Capacity:            2,
-				ModelNumber:         3,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "8c46e95b1a07cecc",
-				ModelName:           "gemini-flash-lite",
-				DisplayName:         "Quick answers",
-				Aliases:             []string{"gemini-quick-answers"},
-				Description:         "3.5 Flash-Lite",
-				Capacity:            2,
-				ModelNumber:         6,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				// Router tier: the backend picks a model per request, so its
-				// thinking policy belongs to whichever model it selects.
-				ModelID:             "cf41b0e0dd7d53e5",
-				ModelName:           "gemini-auto",
-				DisplayName:         "Auto",
-				Aliases:             []string{"gemini-adapts-to-your-needs"},
-				Description:         "Adapts to your needs",
-				Capacity:            1,
-				ModelNumber:         2,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-			{
-				ModelID:             "95a4c0abcba24364",
-				ModelName:           "gemini-carbon",
-				DisplayName:         "Most complex work",
-				Aliases:             []string{"gemini-4-carbon"},
-				Description:         "4 Carbon",
-				Capacity:            2,
-				ModelNumber:         8,
-				ThinkingLevels:      levels,
-				ThinkingPolicyKnown: true,
-			},
-		}
+		models = offlineFallbackModels()
 	}
 	payload := srv.BuildModelsPayload(models)
 	b, _ := json.MarshalIndent(payload, "", "  ")
@@ -784,4 +952,20 @@ func runCaptureReference(cfg config.Config, explicitProfile string) error {
 	fmt.Printf("Wrote Chrome reference fingerprint (%s) -> %s\n", explicitProfile, outPath)
 	fmt.Printf("Compare against a live dump with:\n  BRIDGE_DUMP_REQUEST=/tmp/gsb-dumps ./gsb --probe\n  ./scripts/diff-fingerprint.sh /tmp/gsb-dumps/req-*.json %s\n", outPath)
 	return nil
+}
+
+// isChromiumFamilyDB reports whether the Cookies database belongs to a browser
+// that can enable Device Bound Session Credentials. Firefox has no equivalent,
+// so the warning would only be noise there.
+func isChromiumFamilyDB(dbPath string) bool {
+	p := strings.ToLower(dbPath)
+	if strings.Contains(p, "firefox") || strings.HasSuffix(p, ".sqlite") {
+		return false
+	}
+	for _, name := range []string{"chrome", "chromium", "brave", "edge", "vivaldi", "arc", "opera"} {
+		if strings.Contains(p, name) {
+			return true
+		}
+	}
+	return false
 }

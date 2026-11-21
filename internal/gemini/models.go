@@ -82,12 +82,9 @@ func DocumentedModelKeys(m ModelInfo) []string {
 	seen := make(map[string]bool, 3)
 	keys := make([]string, 0, 3)
 	for _, raw := range []string{m.Description, m.DisplayName, m.ModelName} {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		name = strings.TrimPrefix(name, "gemini-")
-		slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
+		name := strings.ToLower(strings.TrimSpace(raw))
+		slug := whitespaceRe.ReplaceAllString(name, "-")
+		slug = strings.TrimLeft(strings.TrimPrefix(slug, "gemini"), "-")
 		if slug == "" {
 			continue
 		}
@@ -623,16 +620,25 @@ func ThinkingLevelForModel(rawEffort any, m ModelInfo, defaultEffort string) int
 		// caller asked for would be a request upstream cannot represent.
 		return 1
 	}
-	want := ""
-	if rawEffort != nil {
-		if s, ok := rawEffort.(string); ok {
-			want = strings.ToLower(strings.TrimSpace(s))
+	var level string
+	switch v := rawEffort.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			level = defaultEffortOf(caps, defaultEffort)
+		} else {
+			level = normalizeEffortKey(v)
 		}
+	case int:
+		level = numericEffortKey(float64(v))
+	case float64:
+		level = numericEffortKey(v)
+	case json.Number:
+		if n, err := v.Float64(); err == nil {
+			level = numericEffortKey(n)
+		}
+	default:
+		level = defaultEffortOf(caps, defaultEffort)
 	}
-	if want == "" {
-		want = strings.ToLower(strings.TrimSpace(defaultEffortOf(caps, defaultEffort)))
-	}
-	level := normalizeEffortKey(want)
 	for _, advertised := range caps.EffortLevels {
 		if advertised == level {
 			return ThinkingLevels[advertised]
@@ -649,6 +655,19 @@ func ThinkingLevelForModel(rawEffort any, m ModelInfo, defaultEffort string) int
 		return lvl
 	}
 	return 1
+}
+
+func numericEffortKey(n float64) string {
+	switch n {
+	case 0, 1:
+		return "low"
+	case 4:
+		return "medium"
+	case 2:
+		return "high"
+	default:
+		return ""
+	}
 }
 
 // defaultEffortOf prefers the daemon default when the model offers it, else the

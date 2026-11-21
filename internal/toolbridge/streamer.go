@@ -2,6 +2,7 @@ package toolbridge
 
 import (
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -9,6 +10,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
+)
+
+var (
+	genericClosedFenceRe = regexp.MustCompile("(?s)```[\\s\\S]*?```")
+	fenceOpenerRe        = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|<(?:tool_call|tool_calls|function_call|function_calls)>)")
 )
 
 var callSeq atomic.Uint64
@@ -329,15 +335,12 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 		return nil
 	}
 	pos := arrStart
-	for idx := 0; ; idx++ {
+	visibleIdx := 0
+	for {
+		idx := visibleIdx
 		pos = skipJSONWSAndCommas(text, pos)
 		if pos >= len(text) || text[pos] == ']' {
-			for j := idx; j < len(s.states); j++ {
-				if s.states[j].emittedAny() {
-					return s.revision(j, &s.states[j], "was removed after it was streamed")
-				}
-			}
-			return nil
+			return s.checkRemovedCalls(idx)
 		}
 		if text[pos] != '{' {
 			return s.abortOrRevision(idx, "regressed to a malformed tool-call object")
@@ -351,23 +354,19 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 			}
 			normCalls, err := normaliseCalls(map[string]any{"tool_calls": []any{parsed}}, s.allow)
 			if err != nil {
-				if idx < len(s.states) && s.states[idx].emittedAny() {
-					return s.revision(idx, &s.states[idx], "changed to an invalid completed call")
-				}
-				s.aborted = true
-				s.err = err
-				return err
+				return s.abortOrRevision(idx, "changed to an invalid completed call")
 			}
 			if len(normCalls) != 1 {
 				return s.abortOrRevision(idx, "regressed to an empty completed call")
 			}
 			call := normCalls[0]
 			if call.Name == BuiltinMediaToolName {
-				// Server-side intercepted tool: hold back from client SSE stream.
+				// Intercepted media does not occupy a client call slot.
 				pos = objEnd
 				continue
 			}
-			if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && call.Name != s.contract.ForcedFunction {
+			visibleIdx++
+			if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && call.Name != s.contract.ForcedFunction {
 				return s.abortOrRevision(idx, "changed to a function that is not forced")
 			}
 			st := s.ensureState(idx)
@@ -433,26 +432,20 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 			return nil
 		}
 		if name == BuiltinMediaToolName {
-			return nil
+			return s.checkRemovedCalls(idx)
 		}
 		if _, allowed := s.allow[name]; !allowed {
-			if idx < len(s.states) && s.states[idx].emittedAny() {
-				return s.revision(idx, &s.states[idx], "changed to a tool that is not allowed")
-			}
-			return nil
+			return s.abortOrRevision(idx, "changed to a tool that is not allowed")
 		}
-		if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && name != s.contract.ForcedFunction {
-			if idx < len(s.states) && s.states[idx].emittedAny() {
-				return s.revision(idx, &s.states[idx], "changed to a function that is not forced")
-			}
-			return nil
+		if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && name != s.contract.ForcedFunction {
+			return s.abortOrRevision(idx, "changed to a function that is not forced")
 		}
 		partialArgs := partialObj[argsOffset:]
-		if argsEnd := findSingleBalancedObjectEnd(partialArgs, 0); argsEnd >= 0 && strings.Contains(partialArgs[argsEnd:], "{") {
-			if idx < len(s.states) && s.states[idx].emittedAny() {
-				return s.revision(idx, &s.states[idx], "appended a second JSON object to partial arguments")
+		if argsEnd := findSingleBalancedObjectEnd(partialArgs, 0); argsEnd > 0 {
+			if strings.Contains(partialArgs[argsEnd:], "{") {
+				return s.abortOrRevision(idx, "appended a second JSON object to partial arguments")
 			}
-			return nil
+			partialArgs = partialArgs[:argsEnd]
 		}
 		st := s.ensureState(idx)
 		if st.invalid {
@@ -475,7 +468,7 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 		if prefix != "" && (len(partialArgs) < len(prefix) || !strings.HasPrefix(partialArgs, prefix)) {
 			return s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
 		}
-		headerOK, safeLen := verifyPartialArgsForLiveStream(partialArgs, s.allow[name])
+		headerOK, safeLen := verifyPartialArgsForLiveStream(partialArgs, s.allow[name], len(prefix))
 		if !headerOK {
 			if prefix != "" {
 				return s.revision(idx, st, "partial arguments are no longer schema-safe")
@@ -500,26 +493,13 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 	}
 }
 
-func rawArgsForCallIndex(text string, target int) string {
-	arrStart := findToolCallsArrayStart(text)
-	if arrStart < 0 {
-		return ""
+func (s *LiveToolCallStreamer) checkRemovedCalls(firstMissing int) error {
+	for idx := firstMissing; idx < len(s.states); idx++ {
+		if st := &s.states[idx]; st.emittedAny() {
+			return s.revision(idx, st, "was removed after it was streamed")
+		}
 	}
-	pos := arrStart
-	for idx := 0; ; idx++ {
-		pos = skipJSONWSAndCommas(text, pos)
-		if pos >= len(text) || text[pos] == ']' || text[pos] != '{' {
-			return ""
-		}
-		objEnd := findSingleBalancedObjectEnd(text, pos)
-		if objEnd <= pos {
-			return ""
-		}
-		if idx == target {
-			return extractRawArgumentsObject(text[pos:objEnd])
-		}
-		pos = objEnd
-	}
+	return nil
 }
 
 func (s *LiveToolCallStreamer) authoritativeToolCalls(calls []Call) []OpenAIToolCall {
@@ -558,9 +538,9 @@ func (s *LiveToolCallStreamer) Finalize(calls []Call, fullText string) []OpenAIT
 }
 
 // FinalizeError is Finalize with terminal revision errors reported to the caller.
-// Completed calls are authoritative: a streamed call whose name or parsed arguments
-// changed after any part was emitted yields an upstream_revision error instead of stale
-// argument bytes.
+// The caller supplies validated calls in client-visible order, excluding intercepted
+// server-side calls. Changes to an emitted call yield an upstream_revision error
+// instead of returning stale argument bytes.
 func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]OpenAIToolCall, error) {
 	if s != nil {
 		if fullText != "" {
@@ -621,21 +601,16 @@ func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]O
 					st.headerSent = true
 					emitToolCallHeader(s.emit, idx, callID, c.Name)
 				}
-				if st.sentArgs != "" {
-					completed, ok := completeStreamedArgs(st, rawArgsForCallIndex(fullText, idx), argsStr, c.Arguments)
-					if !ok {
-						return nil, s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
-					}
-					if tail := completed[len(st.sentArgs):]; tail != "" {
-						emitArgumentStringChunks(s.emit, idx, tail)
-					}
-					st.sentArgs = completed
-					st.finalArgs = completed
-				} else {
-					emitArgumentStringChunks(s.emit, idx, argsStr)
-					st.sentArgs = argsStr
-					st.finalArgs = argsStr
+				// PushError already finished every complete raw call. Any pending
+				// prefix must match the authoritative encoding before we append it.
+				if !strings.HasPrefix(argsStr, st.sentArgs) {
+					return nil, s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
 				}
+				if tail := argsStr[len(st.sentArgs):]; tail != "" {
+					emitArgumentStringChunks(s.emit, idx, tail)
+				}
+				st.sentArgs = argsStr
+				st.finalArgs = argsStr
 				st.doneArgs = c.Arguments
 				st.done = true
 			}
@@ -668,27 +643,123 @@ func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]O
 }
 
 func findToolCallsArrayStart(s string) int {
-	idx := strings.Index(s, `"tool_calls"`)
-	if idx < 0 {
-		return -1
+	for offset := 0; offset < len(s); {
+		rel := strings.Index(s[offset:], `"tool_calls"`)
+		if rel < 0 {
+			return -1
+		}
+		idx := offset + rel
+		offset = idx + len(`"tool_calls"`)
+
+		prev := idx - 1
+		for prev >= 0 && (s[prev] == ' ' || s[prev] == '\t' || s[prev] == '\r' || s[prev] == '\n') {
+			prev--
+		}
+		if prev < 0 || (s[prev] != '{' && s[prev] != ',') {
+			continue
+		}
+		pos := offset
+		pos = skipJSONWS(s, pos)
+		if pos >= len(s) || s[pos] != ':' {
+			continue
+		}
+		pos = skipJSONWS(s, pos+1)
+		if pos >= len(s) || s[pos] != '[' {
+			continue
+		}
+
+		envStart := prev
+		if s[prev] == ',' {
+			envStart = findEnclosingObjectStart(s, prev)
+			if envStart < 0 {
+				continue
+			}
+		}
+		if !isToolCallsEnvelopeContextValid(s, envStart) {
+			continue
+		}
+		return pos + 1
 	}
-	prev := idx - 1
-	for prev >= 0 && (s[prev] == ' ' || s[prev] == '\t' || s[prev] == '\r' || s[prev] == '\n') {
-		prev--
+	return -1
+}
+
+func findEnclosingObjectStart(s string, pos int) int {
+	depth := 0
+	inStr := false
+	for i := pos - 1; i >= 0; i-- {
+		ch := s[i]
+		if ch == '"' {
+			bs := 0
+			for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				bs++
+			}
+			if bs%2 == 0 {
+				inStr = !inStr
+			}
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if ch == '}' {
+			depth++
+		} else if ch == '{' {
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
 	}
-	if prev < 0 || (s[prev] != '{' && s[prev] != ',') {
-		return -1
+	return -1
+}
+
+func insideIgnoredFence(s string, envStart int) bool {
+	scanFrom := 0
+	for _, loc := range fencedBlockRe.FindAllStringSubmatchIndex(s, -1) {
+		if loc[0] <= envStart && envStart < loc[1] {
+			return exampleIntroRe.MatchString(s[:loc[0]]) || !isStandaloneSpan(s, loc[0], loc[1])
+		}
+		if loc[1] <= envStart && loc[1] > scanFrom {
+			scanFrom = loc[1]
+		}
 	}
-	pos := idx + len(`"tool_calls"`)
-	pos = skipJSONWS(s, pos)
-	if pos >= len(s) || s[pos] != ':' {
-		return -1
+	if locs := genericClosedFenceRe.FindAllStringIndex(s[scanFrom:envStart], -1); len(locs) > 0 {
+		scanFrom += locs[len(locs)-1][1]
 	}
-	pos = skipJSONWS(s, pos+1)
-	if pos >= len(s) || s[pos] != '[' {
-		return -1
+	if loc := fenceOpenerRe.FindStringIndex(s[scanFrom:envStart]); loc != nil {
+		absStart := scanFrom + loc[0]
+		if exampleIntroRe.MatchString(s[:absStart]) {
+			return true
+		}
+		lineStart := strings.LastIndexByte(s[:absStart], '\n') + 1
+		beforeOnLine := strings.TrimSpace(s[lineStart:absStart])
+		if beforeOnLine != "" && !(strings.IndexByte(s[absStart:], '\n') >= 0 && strings.HasSuffix(beforeOnLine, ".")) {
+			return true
+		}
 	}
-	return pos + 1
+	return false
+}
+
+func isToolCallsEnvelopeContextValid(s string, envStart int) bool {
+	if insideIgnoredFence(s, envStart) {
+		return false
+	}
+	before := s[:envStart]
+	if exampleIntroRe.MatchString(before) {
+		return false
+	}
+	if stripped := trailingTagRe.ReplaceAllString(before, ""); stripped != before && exampleIntroRe.MatchString(stripped) {
+		return false
+	}
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	beforeOnLine := strings.TrimSpace(before[lineStart:])
+	if beforeOnLine != "" && !standaloneBeforeRe.MatchString(before) {
+		return false
+	}
+	if envEnd := findSingleBalancedObjectEnd(s, envStart); envEnd > envStart {
+		return isStandaloneSpan(s, envStart, envEnd)
+	}
+	return true
 }
 
 func skipJSONWS(s string, pos int) int {
@@ -918,12 +989,16 @@ func extractRawArgumentsObject(rawObj string) string {
 	return ""
 }
 
-func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any) (headerOK bool, safeLen int) {
+func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any, sentLen int) (headerOK bool, safeLen int) {
 	if len(partialArgs) < 2 || partialArgs[0] != '{' {
 		return false, 0
 	}
-	if strings.Contains(partialArgs, " |>") {
-		return false, 0
+	pipeLimit := -1
+	if loc := sanitizedPipeRe.FindStringIndex(partialArgs); loc != nil {
+		if sentLen == 0 || loc[0] < sentLen {
+			return false, 0
+		}
+		pipeLimit = loc[0]
 	}
 	props, _ := schema["properties"].(map[string]any)
 	reqList := extractStringSlice(schema["required"])
@@ -982,13 +1057,26 @@ func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any) (
 					i = len(partialArgs)
 					break
 				}
+				var propSchema any
+				hasPropSchema := false
 				if props != nil {
-					propSchema, exists := props[key]
-					if !exists {
-						return false, 0
-					}
+					propSchema, hasPropSchema = props[key]
+				}
+				if hasPropSchema {
 					if !isValueTokenCompatibleWithSchema(partialArgs[valPos], propSchema) {
 						return false, 0
+					}
+				} else if schema != nil {
+					if addProps, hasAdd := schema["additionalProperties"]; hasAdd {
+						if b, isBool := addProps.(bool); isBool {
+							if !b {
+								return false, 0
+							}
+						} else if addSchema, isMap := addProps.(map[string]any); isMap {
+							if !isValueTokenCompatibleWithSchema(partialArgs[valPos], addSchema) {
+								return false, 0
+							}
+						}
 					}
 				}
 				seenKeys[key] = true
@@ -1017,6 +1105,9 @@ func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any) (
 		}
 	}
 	cut := len(partialArgs) - 8
+	if pipeLimit >= 0 && pipeLimit < cut {
+		cut = pipeLimit
+	}
 	for cut > 0 && !utf8.RuneStart(partialArgs[cut]) {
 		cut--
 	}
@@ -1036,26 +1127,53 @@ func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any) (
 }
 
 func isValueTokenCompatibleWithSchema(firstByte byte, propSchema any) bool {
+	if b, ok := propSchema.(bool); ok {
+		return b
+	}
 	pm, ok := propSchema.(map[string]any)
 	if !ok || pm == nil {
 		return firstByte != 'n'
 	}
-	tStr, _ := pm["type"].(string)
-	if tStr == "" {
-		return firstByte != 'n'
-	}
-	switch tStr {
-	case "string":
-		return firstByte == '"'
-	case "object":
-		return firstByte == '{'
-	case "array":
-		return firstByte == '['
-	case "boolean":
-		return firstByte == 't' || firstByte == 'f'
-	case "number", "integer":
-		return firstByte == '-' || (firstByte >= '0' && firstByte <= '9')
-	default:
+	nullable, _ := pm["nullable"].(bool)
+	if firstByte == 'n' && nullable {
 		return true
 	}
+	types := extractStringSlice(pm["type"])
+	if tStr, ok := pm["type"].(string); ok && tStr != "" {
+		types = []string{tStr}
+	}
+	if len(types) == 0 {
+		return firstByte != 'n'
+	}
+	for _, t := range types {
+		switch t {
+		case "null":
+			if firstByte == 'n' {
+				return true
+			}
+		case "string":
+			if firstByte == '"' {
+				return true
+			}
+		case "object":
+			if firstByte == '{' {
+				return true
+			}
+		case "array":
+			if firstByte == '[' {
+				return true
+			}
+		case "boolean":
+			if firstByte == 't' || firstByte == 'f' {
+				return true
+			}
+		case "number", "integer":
+			if firstByte == '-' || (firstByte >= '0' && firstByte <= '9') {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
 }

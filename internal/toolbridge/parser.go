@@ -12,7 +12,7 @@ var (
 	fencedBlockRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*([\\s\\S]*?)```|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*([\\s\\S]*?)</(?:tool_call|tool_calls|function_call|function_calls)>)")
 	standaloneAfterRe               = regexp.MustCompile("(?is)^[}\\]\\s]*(?:(?:</(?:tool_call|tool_calls|function_call|function_calls)>|```)[}\\]\\s]*)?$")
 	standaloneBeforeRe              = regexp.MustCompile("(?is)(?:^|\\n)\\s*(?:<(?:tool_call|tool_calls|function_call|function_calls)>|```(?:json|tool_call|tool_calls|function_call|function_calls)?)\\s*$")
-	exampleIntroRe                  = regexp.MustCompile(`(?is)(?:\bdo\s+not\s+execute\b|\bdon't\s+execute\b|\bfor\s+example\b|\be\.g\.\b|\bexample\s*(?:json|call|payload|envelope|output|response|format)?\s*:\s*|\bformat\s+is\s*:\s*)\s*$`)
+	exampleIntroRe                  = regexp.MustCompile(`(?is)(?:\b(?:do\s+not|don't)\s+execute\b\s*:?|\bfor\s+example\b(?:[^.:\n]{0,80}:)?|\be\.g\.\s*(?:,|[^.:\n]{0,60}:)?|\b(?:example|sample)\s*(?:json|call|payload|envelope|output|response|format|tool\s*call)?\s*:|\bformat\s+is\s*:)\s*$`)
 	truncatedEnvRe                  = regexp.MustCompile("(?is)(?:(?:^|[\\r\\n]\\s*|```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*)\\{\\s*\"\\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\\s*\"\\s*:|(?:```(?:json|tool_call|tool_calls|function_call|function_calls)|<(?:tool_call|tool_calls|function_call|function_calls)>)\\s*\\{\\s*\"\\s*(?:name|tool|tool_name)\\s*\"\\s*:)")
 	gapFenceRe                      = regexp.MustCompile("(?is)^(?:\\s|```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)*$")
 	trailingTagRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)\\s*$")
@@ -39,6 +39,49 @@ var (
 	// scarcity noun next to a tool noun, an exhaustion word next to a tool noun,
 	// or a zero/remaining marker instead.
 	toolBudgetClaimRe = regexp.MustCompile(`(?i)(?:(?:cupo|cuota|l[íi]mite|limite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|tool\s+budget|tool\s+limit|quota|allowance)[^.\n]{0,60}(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|search\s+calls?|tools?)[^.\n]{0,40}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up|(?:en|a)\s+0\b|\b0\s+(?:restantes?|disponibles?|remaining))|(?:agot[óo]|alcanz[óo]|excedi[óo]|super[óo]|bloque[óo])\s+(?:el\s+|la\s+)?(?:cupo|cuota|l[íi]mite|presupuesto|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+|de\s+)?)?(?:herramientas?|funciones?|b[úu]squedas?)|(?:herramientas?|funciones?|b[úu]squedas?|tool[- ]?calls?|function[- ]?calls?|tools?)\b[^.\n]{0,60}(?:agotad[oa]s?|alcanzad[oa]s?|excedid[oa]s?|superad[oa]s?|bloquead[oa]s?|no\s+disponibles?|exhausted|exceeded|depleted|used\s+up)|(?:bloquead[oa]s?|restringid[oa]s?)\s+(?:en\s+|por\s+)?[^.\n]{0,40}(?:llamadas?|herramientas?)|\(\s*\b(?:0|zero|cero)\s+remaining\s*\)|\b(?:0|cero|zero)\s+(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)|(?:llamadas?|tool[- ]?calls?|calls?|b[úu]squedas?)\s+(?:restantes|disponibles|remaining)\s*[:=]?\s*\b(?:0|cero|zero)\b|(?:sin|no\s+(?:hay|quedan|tiene|tenemos))\s+(?:m[áa]s\s+)?(?:cupo|llamadas?\s+(?:de\s+|a\s+)?(?:herramientas?|funciones?)))`)
+	// toolProtocolRefusalPatterns detects an invented refusal of the
+	// tool-calling protocol. It is a list of named, separately testable phrases
+	// rather than one expression: the model produces this refusal in many
+	// shapes (a hallucinated budget, a "tools unavailable this turn" claim, an
+	// accusation of prompt injection), and a single alternation could not be
+	// extended without risking an accidental precedence bug.
+	toolProtocolRefusalPatterns = []struct {
+		name string
+		re   *regexp.Regexp
+	}{
+		// Budget/limit claims in English: "exhausted my tool-call budget".
+		{"budget-exhausted-en", regexp.MustCompile(`(?i)\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b`)},
+		{"budget-reached-en", regexp.MustCompile(`(?i)\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b`)},
+		{"zero-remaining-en", regexp.MustCompile(`(?i)\b(?:tool[- ]?calls?|function[- ]?calls?|tools?|budget)\b[^.!?]{0,60}\b0\s+remaining\b`)},
+		{"zero-left-en", regexp.MustCompile(`(?i)\b0\s+(?:tool|function)[- ]?(?:call|use)s?\s+(?:remaining|left)\b`)},
+		// Budget claims in Indonesian: "kuota pemanggilan tool sudah habis".
+		{"budget-exhausted-id", regexp.MustCompile(`(?i)\bkuota\s+(?:pemanggilan\s+|pemakaian\s+|penggunaan\s+)?(?:tool|fungsi)\b[^.!?]{0,80}?\b(?:sudah|telah)\s+habis\b`)},
+		{"zero-remaining-id", regexp.MustCompile(`(?i)\b(?:0|nol)\s+(?:tool|pemanggilan\s+tool|tool\s+calls?)\b[^.!?]{0,30}\b(?:tersisa|tersedia|left|remaining)\b`)},
+		{"zero-left-id", regexp.MustCompile(`(?i)\b(?:sisa|jumlah)\s+(?:tool|pemanggilan\s+tool|tool\s+calls?)\b[^.!?]{0,40}\b(?:0|nol)\b`)},
+		// The number can also follow the noun: "tool calls remaining: **0**",
+		// "tool budget left: 0". Markdown emphasis, backticks and a colon may sit
+		// between the noun and the digit, so they are absorbed by the separator
+		// class. \x60 is a backtick; a literal one cannot appear inside a raw
+		// string literal.
+		{"zero-after-noun-en", regexp.MustCompile("(?i)\\b(?:tool|function)[- ]?(?:calls?|budget|quota|limit|uses?|use)\\b(?:[\\s*_:\\x60]+(?:calls?|remaining|left|available|reached))*[\\s*_:\\x60]{1,4}(?:0|zero)\\b")},
+		// The model also drops the word "tool": "search calls remaining: **0**".
+		// Requiring an adjacent tool/function noun missed that shape, so the
+		// "calls remaining/left" pair is matched on its own; the digit must still
+		// be zero directly after it.
+		{"calls-remaining-zero-en", regexp.MustCompile("(?i)\\b(?:calls?|uses?)\\s+(?:remaining|left|available)\\b[\\s*_:\\x60]{0,6}(?:0|zero)\\b")},
+		{"zero-after-noun-id", regexp.MustCompile("(?i)\\b(?:pemanggilan\\s+tool|tool\\s+calls?|kuota\\s+tool|sisa\\s+tool)\\b[\\s*_:\\x60]{1,4}(?:0|nol)\\b")},
+		// Availability claims: the tool surface is switched off for this turn.
+		// This is the shape that reached the client as a final answer: "Eksekusi
+		// tool inspeksi file sedang tidak tersedia di turn ini (0 tool calls
+		// tersisa)".
+		{"unavailable-this-turn-id", regexp.MustCompile(`(?i)\b(?:tool|tool\s+calls?|pemanggilan\s+tool|eksekusi\s+tool|tidak)\b[^.!?]{0,80}\b(?:sedang\s+)?tidak\s+(?:tersedia|dapat\s+digunakan|bisa\s+digunakan|aktif|tersedia\s+di\s+turn)\b`)},
+		{"unavailable-this-turn-en", regexp.MustCompile(`(?i)\b(?:tools?|tool[- ]?calls?|tool\s+execution)\b[^.!?]{0,60}\b(?:is|are)\s+(?:currently\s+)?(?:not\s+available|unavailable|disabled)\b`)},
+		{"cannot-invoke-id", regexp.MustCompile(`(?i)\b(?:tidak|tak)\s+(?:bisa|dapat)\s+(?:menjalankan|memanggil|menggunakan|mengeksekusi)\s+(?:the\s+)?(?:tool|tools|tool\s+calls?)\b`)},
+		{"cannot-invoke-en", regexp.MustCompile(`(?i)\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey|invoke|call|run)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol|tools?)\b`)},
+		// Reframing the tool protocol itself as adversarial.
+		{"prompt-injection-claim", regexp.MustCompile(`(?i)\b(?:prompt\s+injection|jailbreak)\b[^.!?]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b`)},
+		{"protocol-called-injection", regexp.MustCompile(`(?i)\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b[^.!?]{0,80}\b(?:prompt\s+injection|jailbreak)\b`)},
+	}
 )
 
 // ToolProtocolRefusalError is the tool_call_error text produced when the model
@@ -110,30 +153,134 @@ func unwrapIdenticalMarkdownLinks(s string) string {
 	})
 }
 
-// IsToolProtocolRefusal reports whether a short plain-text reply is an invented
+// IsToolProtocolRefusal reports whether a plain-text reply is an invented
 // refusal of the tool-calling protocol itself (such as hallucinating an
 // exhausted "tool budget" or claiming the tool_calls JSON format is a prompt
 // injection).
+//
+// Only the opening of the reply is inspected, because a refusal is the model's
+// opening statement. The previous rule rejected any reply longer than 1200
+// bytes outright, and that failed in the shape the model actually produces when
+// it gives up on tools: a one-line refusal followed by step-by-step manual
+// instructions. Such a reply was shipped to the client as a final answer, which
+// is the reported "it says it cannot execute" behaviour. A bounded window
+// catches the opening refusal and still leaves a long answer that merely
+// mentions a tool budget mid-document alone.
+
+// RefusalWindowBytes is how much of the reply the refusal detector reads. The
+// streaming gate uses it too: with tools active, no text may be emitted before
+// this many bytes have arrived, because an emitted byte commits the attempt and
+// makes the tool_call_error retry illegal.
+const RefusalWindowBytes = 2000
+
+// IsToolProtocolRefusal reports whether a plain-text reply is an invented
+// refusal of the tool-calling protocol.
 func IsToolProtocolRefusal(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
 	}
-	// The upstream tool-call guard can arrive embedded inside an otherwise long
-	// answer, so these protocol markers are checked without a length bound.
+	// The upstream guard marker is unambiguous and can arrive embedded in an
+	// otherwise long answer, so it is checked without a length bound.
 	if toolCallGuardRe.MatchString(trimmed) {
 		return true
 	}
+	// Model replies wrap at prose width, so a refusal routinely breaks the
+	// phrase it uses across lines ("sedang tidak\n tersedia"). Collapse every
+	// whitespace run to one space first: the patterns are phrase-shaped, and a
+	// newline in the middle of a phrase must not hide the refusal.
+	trimmed = strings.Join(strings.Fields(trimmed), " ")
+	if len(trimmed) > RefusalWindowBytes {
+		trimmed = trimmed[:RefusalWindowBytes]
+	}
+	// These detectors are bounded by the same window as the pattern list: a
+	// late mention inside an otherwise legitimate long answer must stay an
+	// answer, and the streaming gate only holds RefusalWindowBytes anyway.
 	if toolProtocolRefusalEsRe.MatchString(trimmed) {
 		return true
 	}
 	if toolBudgetClaimRe.MatchString(trimmed) {
 		return true
 	}
-	if len(trimmed) > 1200 {
+	if toolProtocolRefusalRe.MatchString(trimmed) {
+		return true
+	}
+	return matchToolProtocolRefusal(trimmed)
+}
+
+// RefusalErrorText is the message carried by a tool_call_error that was caused
+// by an invented protocol refusal rather than by a schema violation. The server
+// uses it to choose a correction that contradicts the refusal instead of one
+// that asks for better JSON.
+const RefusalErrorText = "the model refused the tool-calling protocol"
+
+// IsRefusalMessage reports whether a tool_call_error message describes a
+// protocol refusal. Both the streaming gate and InterpretReply use this exact
+// text so the server has one string to test.
+func IsRefusalMessage(msg string) bool {
+	return strings.Contains(msg, RefusalErrorText)
+}
+
+// matchToolProtocolRefusal reports whether any known refusal phrase matches.
+// RefusalPatternNames is exported for tests so a new pattern cannot be added
+// without a case that proves it fires and a case that proves normal prose does
+// not.
+func matchToolProtocolRefusal(trimmed string) bool {
+	for _, p := range toolProtocolRefusalPatterns {
+		if p.re.MatchString(trimmed) {
+			return true
+		}
+	}
+	return zeroQuotaRefusal(trimmed)
+}
+
+// zeroQuotaRefusal reports the budget-refusal shape structurally instead of by
+// phrase. Enumerating wordings did not converge: the model produced "0 tool
+// calls tersisa", then "calls remaining: **0**", then "There are **0** built-in
+// tool and search calls remaining" for the same question, and every new wording
+// shipped a refusal as the final answer.
+//
+// The structural signal is a zero count stated next to both a tool word and an
+// availability word, inside one sentence. Prose that merely reports a zero
+// result ("returned 0 matches", "0 errors were found") has no availability word
+// and stays an answer.
+func zeroQuotaRefusal(trimmed string) bool {
+	if !strings.Contains(trimmed, "0") && !strings.Contains(strings.ToLower(trimmed), "zero") && !strings.Contains(strings.ToLower(trimmed), "nol") {
 		return false
 	}
-	return toolProtocolRefusalRe.MatchString(trimmed)
+	for _, sentence := range splitRefusalSentences(trimmed) {
+		lower := strings.ToLower(sentence)
+		if !refusalZeroRe.MatchString(lower) {
+			continue
+		}
+		if refusalToolWordRe.MatchString(lower) && refusalAvailabilityRe.MatchString(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitRefusalSentences cuts on sentence terminators so a zero in one sentence
+// cannot be paired with an availability word in another.
+func splitRefusalSentences(s string) []string {
+	return refusalSentenceSplitRe.Split(s, -1)
+}
+
+var (
+	refusalSentenceSplitRe = regexp.MustCompile(`[.!?\n]+`)
+	// A zero standing alone as a count: not "10", "0.5", or "100".
+	refusalZeroRe         = regexp.MustCompile(`(?:^|[\s(*_:=])(?:0|zero|nol)(?:$|[\s)*_.,:;])`)
+	refusalToolWordRe     = regexp.MustCompile(`\b(?:tool|tools|tool[- ]?calls?|function[- ]?calls?|pemanggilan\s+tool|fungsi|search\s+calls?)\b`)
+	refusalAvailabilityRe = regexp.MustCompile(`\b(?:remaining|left|available|tersisa|tersedia|limit|quota|budget|kuota|habis|maximum|reached)\b`)
+)
+
+// RefusalPatternNames returns the identifier of every refusal pattern.
+func RefusalPatternNames() []string {
+	names := make([]string, 0, len(toolProtocolRefusalPatterns))
+	for _, p := range toolProtocolRefusalPatterns {
+		names = append(names, p.name)
+	}
+	return names
 }
 
 type candidateSpan struct {
@@ -428,17 +575,29 @@ func repairSanitizedHTMLInJSON(s string) string {
 }
 
 func isStandaloneSpan(text string, start, end int) bool {
+	if start < 0 || end > len(text) || start > end {
+		return false
+	}
+	spanText := text[start:end]
+	isMultiLineSpan := strings.IndexByte(spanText, '\n') >= 0
 	before := text[:start]
 	after := text[end:]
 
 	if exampleIntroRe.MatchString(before) {
 		return false
 	}
+	if stripped := trailingTagRe.ReplaceAllString(before, ""); stripped != before && exampleIntroRe.MatchString(stripped) {
+		return false
+	}
 
 	lineStart := strings.LastIndexByte(before, '\n') + 1
 	beforeOnLine := strings.TrimSpace(before[lineStart:])
 	if beforeOnLine != "" && !standaloneBeforeRe.MatchString(before) {
-		return false
+		// Allow a multi-line fenced block glued immediately to the end of an earlier
+		// sentence or closing fence (e.g. "... ONLY the ```json ... ``` block.```json\n{...}\n```").
+		if !(isMultiLineSpan && strings.HasPrefix(spanText, "```") && strings.HasSuffix(beforeOnLine, ".")) {
+			return false
+		}
 	}
 
 	afterOnLine := after
@@ -447,11 +606,16 @@ func isStandaloneSpan(text string, start, end int) bool {
 	}
 	afterOnLine = strings.TrimSpace(afterOnLine)
 	if afterOnLine != "" && !standaloneAfterRe.MatchString(afterOnLine) {
-		return false
+		// When the model emits a dedicated multi-line tool_calls block and then
+		// glues trailing chatter onto the closing fence line (e.g. "```Groq\nReviewer: ..."),
+		// the multi-line block is still a real tool call rather than an inline prose mention.
+		if !isMultiLineSpan {
+			return false
+		}
 	}
 
 	afterTrimmed := strings.TrimSpace(after)
-	if afterTrimmed == "" || standaloneAfterRe.MatchString(afterTrimmed) {
+	if afterTrimmed == "" || standaloneAfterRe.MatchString(afterTrimmed) || isMultiLineSpan {
 		return true
 	}
 	return strings.HasPrefix(after, "\n") || strings.HasPrefix(after, "\r\n")
@@ -525,8 +689,10 @@ func callCandidates(text string) []candidateSpan {
 	}
 
 	out = append(out, candidateSpan{raw: trimmed, start: 0, end: len(trimmed), whole: true, fenced: false})
+	var ignoredFencedSpans [][2]int
 	for _, loc := range fencedBlockRe.FindAllStringSubmatchIndex(trimmed, -1) {
 		if exampleIntroRe.MatchString(trimmed[:loc[0]]) {
+			ignoredFencedSpans = append(ignoredFencedSpans, [2]int{loc[0], loc[1]})
 			continue
 		}
 		// A fenced envelope is a tool call only when the fence sits on its own
@@ -534,6 +700,7 @@ func callCandidates(text string) []candidateSpan {
 		// bullet/paragraph (e.g. "… blok ```json {"tool_calls":[…]} ``` di dalam
 		// penjelasan") is a prose mention, not a call.
 		if !isStandaloneSpan(trimmed, loc[0], loc[1]) {
+			ignoredFencedSpans = append(ignoredFencedSpans, [2]int{loc[0], loc[1]})
 			continue
 		}
 		subStart, subEnd := -1, -1
@@ -550,6 +717,16 @@ func callCandidates(text string) []candidateSpan {
 		}
 	}
 	for _, sp := range findBalancedObjects(trimmed) {
+		insideIgnored := false
+		for _, ig := range ignoredFencedSpans {
+			if sp[0] >= ig[0] && sp[1] <= ig[1] {
+				insideIgnored = true
+				break
+			}
+		}
+		if insideIgnored {
+			continue
+		}
 		out = append(out, candidateSpan{
 			raw:    trimmed[sp[0]:sp[1]],
 			start:  sp[0],
@@ -948,6 +1125,18 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 }
 
 // ParseToolReply extracts and validates tool calls from a model reply.
+func callSlicesEqual(a, b []Call) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || !callArgsEqual(a[i].Arguments, b[i].Arguments) {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseToolReply(reply string, tools any) (*ParseResult, error) {
 	trimmed := strings.TrimSpace(reply)
 	var allow map[string]map[string]any
@@ -1073,7 +1262,9 @@ func ParseToolReply(reply string, tools any) (*ParseResult, error) {
 				return nil, extraErr
 			}
 			if len(extra) > 0 {
-				calls = append(calls, extra...)
+				if !callSlicesEqual(calls, extra) {
+					calls = append(calls, extra...)
+				}
 				prevEnd = next.span.end
 			}
 		}

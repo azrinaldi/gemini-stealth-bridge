@@ -21,6 +21,9 @@ var EssentialNames = []string{
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 	"__Secure-1PSIDTS", "__Secure-3PSIDTS",
 	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "NID", "AEC",
+	"OSID", "__Secure-OSID", "LSID",
+	"__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS",
+	"ACCOUNT_CHOOSER",
 }
 
 var essentialSet = func() map[string]bool {
@@ -167,14 +170,24 @@ func isCookieDeletion(val, attrs string, now time.Time) bool {
 				return true
 			}
 		case "expires":
-			if exp, err := http.ParseTime(av); err == nil && exp.Before(now) {
-				return true
+			av = strings.Trim(av, `"`)
+			if exp, err := http.ParseTime(av); err == nil {
+				if exp.Before(now) {
+					return true
+				}
+				continue
 			}
-			if exp, err := time.Parse("Mon, 02-Jan-2006 15:04:05 MST", av); err == nil && exp.Before(now) {
-				return true
-			}
-			if exp, err := time.Parse("Mon, 02-Jan-06 15:04:05 MST", av); err == nil && exp.Before(now) {
-				return true
+			for _, layout := range []string{
+				"Mon, 02-Jan-2006 15:04:05 MST",
+				"Monday, 02-Jan-2006 15:04:05 MST",
+				"Mon, 02-Jan-06 15:04:05 MST",
+			} {
+				if exp, err := time.Parse(layout, av); err == nil {
+					if exp.Before(now) {
+						return true
+					}
+					break
+				}
 			}
 		}
 	}
@@ -217,11 +230,7 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 			return norm, &cf, nil
 		}
 		var wrapper struct {
-			Cookies []struct {
-				Name   string `json:"name"`
-				Value  string `json:"value"`
-				Domain string `json:"domain"`
-			} `json:"cookies"`
+			Cookies []domainCookie `json:"cookies"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &wrapper); err == nil && len(wrapper.Cookies) > 0 {
 			h := selectBestDomainCookies(wrapper.Cookies)
@@ -229,11 +238,7 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 		}
 	}
 	if strings.HasPrefix(trimmed, "[") {
-		var list []struct {
-			Name   string `json:"name"`
-			Value  string `json:"value"`
-			Domain string `json:"domain"`
-		}
+		var list []domainCookie
 		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
 			return "", nil, fmt.Errorf("invalid cookie JSON array: %w", err)
 		}
@@ -243,33 +248,103 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 	return CanonicalHeader(m), nil, nil
 }
 
-func selectBestDomainCookies(list []struct {
+type domainCookie struct {
 	Name   string `json:"name"`
 	Value  string `json:"value"`
 	Domain string `json:"domain"`
-}) string {
-	score := func(d string) int {
-		if d == ".google.com" || d == "google.com" {
+}
+
+func selectBestDomainCookies(list []domainCookie) string {
+	_, hdr := selectBestDomainCookieMap(list)
+	return hdr
+}
+
+func isGoogleCookieDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" {
+		return false
+	}
+	if strings.HasPrefix(d, ".") {
+		d = d[1:]
+	}
+	return d == "google.com" || (strings.HasSuffix(d, ".google.com") && !strings.HasPrefix(d, ".") && !strings.Contains(d, ".."))
+}
+
+func cookieDomainScore(name, domain string) int {
+	if !isGoogleCookieDomain(domain) {
+		return 0
+	}
+	d := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	switch name {
+	case "OSID", "__Secure-OSID":
+		if d == "gemini.google.com" {
+			return 4
+		}
+		if d == "google.com" {
 			return 3
 		}
-		if strings.HasSuffix(d, ".google.com") {
-			return 2
+		return 2
+	case "LSID", "__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS", "ACCOUNT_CHOOSER":
+		if d == "accounts.google.com" {
+			return 4
 		}
-		return 1
+		if d == "google.com" {
+			return 3
+		}
+		return 2
+	default:
+		if d == "google.com" {
+			return 3
+		}
+		return 2
 	}
+}
+
+func hasEssentialCookieUpdate(setCookies []string) bool {
+	if len(setCookies) == 0 {
+		return false
+	}
+	now := time.Now()
+	for _, raw := range setCookies {
+		head := raw
+		attrs := ""
+		if semi := strings.IndexByte(raw, ';'); semi >= 0 {
+			head = raw[:semi]
+			attrs = raw[semi+1:]
+		}
+		i := strings.IndexByte(head, '=')
+		if i <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(head[:i])
+		val := strings.TrimSpace(head[i+1:])
+		if !essentialSet[name] {
+			continue
+		}
+		if !isCookieDeletion(val, attrs, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectBestDomainCookieMap(list []domainCookie) (map[string]string, string) {
 	best := make(map[string]string)
 	bestScore := make(map[string]int)
 	for _, c := range list {
 		if !essentialSet[c.Name] || c.Value == "" {
 			continue
 		}
-		s := score(c.Domain)
+		s := cookieDomainScore(c.Name, c.Domain)
+		if s == 0 {
+			continue
+		}
 		if s > bestScore[c.Name] {
 			best[c.Name] = c.Value
 			bestScore[c.Name] = s
 		}
 	}
-	return CanonicalHeader(best)
+	return best, CanonicalHeader(best)
 }
 
 // SaveCredentialFile atomically writes a CredentialFile to path with mode 0600.
@@ -286,6 +361,9 @@ func SaveCredentialFile(path string, cred CredentialFile) (int64, error) {
 		}
 		if cred.FSid == "" {
 			cred.FSid = prev.FSid
+		}
+		if cred.AuthUser == 0 && prev.AuthUser > 0 {
+			cred.AuthUser = prev.AuthUser
 		}
 		if cred.Email == "" {
 			cred.Email = prev.Email

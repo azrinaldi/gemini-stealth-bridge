@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -31,6 +32,9 @@ const (
 )
 
 var (
+	// Cookie versions must also order writes across replacement clients for the same ID.
+	cookieVersion atomic.Uint64
+
 	quotaActionLabels = map[int]string{
 		4:  "Gemini Pro",
 		11: "Gemini Flash",
@@ -73,10 +77,14 @@ type AccountClient struct {
 	Pool     *transport.Pool
 	Rotator  *cookies.Rotator
 
-	mu               sync.RWMutex
-	bootMu           sync.Mutex
-	cookieHeader     string
-	cookieGen        atomic.Uint64
+	mu                     sync.RWMutex
+	bootMu                 sync.Mutex
+	persistMu              sync.Mutex
+	persistRetired         atomic.Bool // set under persistMu after a successful replacement
+	cookieHeader           string
+	cookieGen              atomic.Uint64
+	reloadGen              atomic.Uint64
+	unsavedExplicitCookies bool
 	email            string
 	userTier         string
 	at               string
@@ -112,18 +120,33 @@ type AccountClient struct {
 // NewAccountClient creates an AccountClient for a specific Google account.
 func NewAccountClient(id, cookieHeader, filePath string, pool *transport.Pool, rotator *cookies.Rotator) *AccountClient {
 	ac := &AccountClient{
-		ID:           id,
-		FilePath:     filePath,
-		Pool:         pool,
-		Rotator:      rotator,
-		cookieHeader: cookieHeader,
-		pushID:       defaultPushID,
-		locale:       "en",
-		protocolMode: "bridge",
-		surfaces:     make(map[string]string),
+		ID:                     id,
+		FilePath:               filePath,
+		Pool:                   pool,
+		Rotator:                rotator,
+		cookieHeader:           cookieHeader,
+		unsavedExplicitCookies: cookieHeader != "",
+		pushID:                 defaultPushID,
+		locale:                 "en",
+		protocolMode:           "bridge",
+		surfaces:               make(map[string]string),
 	}
+	if filePath != "" {
+		if st, err := os.Stat(filePath); err == nil {
+			ac.fileMtimeMs = st.ModTime().UnixMilli()
+		}
+	}
+	ac.cookieGen.Store(cookieVersion.Add(1))
 	ac.reqCounter.Store(100000 + time.Now().UnixNano()%800000)
 	return ac
+}
+
+// SaveToFile binds the account client to path and persists its current state atomically.
+func (ac *AccountClient) SaveToFile(path string) {
+	ac.mu.Lock()
+	ac.FilePath = path
+	ac.mu.Unlock()
+	ac.persistState()
 }
 
 // LoadAccountFromFile loads an AccountClient from an account JSON file.
@@ -143,6 +166,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.fSid = rec.FSid
 	ac.authUser = rec.AuthUser
 	ac.fileMtimeMs = mtime
+	ac.unsavedExplicitCookies = false
 	ac.capturedAt = rec.CapturedAt
 	ac.rotatedAt = rec.RotatedAt
 	ac.cookieDB = rec.CookieDB
@@ -206,12 +230,8 @@ func (ac *AccountClient) SetRuntimeOptions(locale, blOverride, protocolMode, acc
 	if protocolMode != "" {
 		ac.protocolMode = protocolMode
 	}
-	if accountGroup != "" {
-		ac.accountGroup = accountGroup
-	}
-	if proxyURL != "" {
-		ac.proxyURL = proxyURL
-	}
+	ac.accountGroup = accountGroup
+	ac.proxyURL = proxyURL
 }
 
 // SetQuarantined updates the quarantine state and persists it to disk.
@@ -228,7 +248,7 @@ func (ac *AccountClient) SetQuarantined(quarantined bool, reason string) {
 		ac.surfaces["geminiWeb"] = "ok"
 	}
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
 }
 
 // SetDisabled updates the operator-disabled flag and persists it to disk.
@@ -236,7 +256,7 @@ func (ac *AccountClient) SetDisabled(disabled bool) {
 	ac.mu.Lock()
 	ac.disabled = disabled
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
 }
 
 // SetSurfaceStatus updates a surface status (e.g. "geminiWeb": "ok") and persists to disk.
@@ -247,7 +267,21 @@ func (ac *AccountClient) SetSurfaceStatus(surface, status string) {
 	}
 	ac.surfaces[surface] = status
 	ac.mu.Unlock()
-	ac.persistState()
+	ac.persistStateWithOptions(false)
+}
+
+// SetAuthUser updates the secondary Google account chooser index (/u/N/app) in memory.
+func (ac *AccountClient) SetAuthUser(authUser int) {
+	ac.mu.Lock()
+	ac.authUser = authUser
+	ac.mu.Unlock()
+}
+
+// AuthUser returns the configured secondary Google account chooser index (/u/N/app).
+func (ac *AccountClient) AuthUser() int {
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+	return ac.authUser
 }
 
 // ReloadFromDiskIfNewer checks if the account JSON file was updated externally
@@ -256,16 +290,34 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	ac.mu.RLock()
 	path := ac.FilePath
 	lastMtime := ac.fileMtimeMs
+	unsaved := ac.unsavedExplicitCookies
 	ac.mu.RUnlock()
-	if path == "" {
+	if path == "" || unsaved {
+		return false
+	}
+	st, err := os.Stat(path)
+	if err != nil || st.ModTime().UnixMilli() <= lastMtime {
+		return false
+	}
+
+	ac.persistMu.Lock()
+	if ac.persistRetired.Load() {
+		ac.persistMu.Unlock()
 		return false
 	}
 	rec, mtime, err := cookies.LoadAccountFile(path)
-	if err != nil || mtime <= lastMtime || rec.Cookies == "" {
+	if err != nil || rec.Cookies == "" {
+		ac.persistMu.Unlock()
 		return false
 	}
 	ac.mu.Lock()
-	changed := rec.Cookies != ac.cookieHeader
+	if ac.unsavedExplicitCookies || mtime <= ac.fileMtimeMs {
+		ac.mu.Unlock()
+		ac.persistMu.Unlock()
+		return false
+	}
+	cookiesChanged := rec.Cookies != ac.cookieHeader
+	prevAT := ac.at
 	ac.cookieHeader = rec.Cookies
 	if rec.Email != "" {
 		ac.email = rec.Email
@@ -273,6 +325,12 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	if rec.AT != "" {
 		ac.at = rec.AT
 		ac.fromDiskAT = true
+		if rec.AT != prevAT {
+			ac.bootstrappedAt = time.Time{}
+		}
+	} else if cookiesChanged {
+		ac.at = ""
+		ac.fromDiskAT = false
 	}
 	if rec.BL != "" {
 		ac.bl = rec.BL
@@ -288,22 +346,60 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	if rec.RotatedAt != "" {
 		ac.rotatedAt = rec.RotatedAt
 	}
+	if rec.CookieDB != "" {
+		ac.cookieDB = rec.CookieDB
+	}
+	if rec.ImportedFrom != "" {
+		ac.importedFrom = rec.ImportedFrom
+	}
+	if rec.ProfileID != "" {
+		ac.profileID = rec.ProfileID
+	}
+	if rec.TokenFetchedAt != "" {
+		ac.tokenFetchedAt = rec.TokenFetchedAt
+	}
+	if rec.TokenSource != "" {
+		ac.tokenSource = rec.TokenSource
+	}
+	if rec.LastReqID >= 100000 && rec.LastReqID > ac.reqCounter.Load() {
+		ac.reqCounter.Store(rec.LastReqID)
+	}
 	ac.quarantined = rec.Quarantined
 	ac.quarantineReason = rec.QuarantineReason
+	ac.disabled = rec.Disabled
+	if rec.AccountGroup != "" {
+		ac.accountGroup = rec.AccountGroup
+	}
+	if rec.ProxyURL != "" {
+		ac.proxyURL = rec.ProxyURL
+	}
+	if len(rec.Surfaces) > 0 {
+		if ac.surfaces == nil {
+			ac.surfaces = make(map[string]string, len(rec.Surfaces))
+		}
+		for k, v := range rec.Surfaces {
+			ac.surfaces[k] = v
+		}
+	}
 	ac.fileMtimeMs = mtime
-	if changed {
-		ac.cookieGen.Add(1)
+	var newGen uint64
+	if cookiesChanged {
+		newGen = cookieVersion.Add(1)
+		ac.cookieGen.Store(newGen)
+		ac.reloadGen.Add(1)
 		ac.bootstrappedAt = time.Time{}
 		ac.modelsCache = nil
 	}
+	key := ac.sessionKeyLocked()
 	ac.mu.Unlock()
+	ac.persistMu.Unlock()
 
-	if changed && ac.Pool != nil {
-		if s := ac.Pool.Existing(ac.sessionKey()); s != nil {
-			s.QueueCookieUpdate(rec.Cookies)
+	if cookiesChanged && ac.Pool != nil {
+		if s := ac.Pool.Existing(key); s != nil {
+			s.QueueCookieUpdateWithGen(rec.Cookies, newGen)
 		}
 	}
-	return changed
+	return true
 }
 
 // Email returns the account's Google email address.
@@ -344,16 +440,23 @@ func (ac *AccountClient) InvalidateAuth() {
 	ac.mu.Unlock()
 }
 
+func (ac *AccountClient) sessionKeyLocked() string {
+	if ac.ID != "" {
+		return ac.ID
+	}
+	if ac.email != "" {
+		return ac.email
+	}
+	return "default"
+}
+
 func (ac *AccountClient) sessionKey() string {
 	if ac.ID != "" {
 		return ac.ID
 	}
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
-	if ac.email != "" {
-		return ac.email
-	}
-	return "default"
+	return ac.sessionKeyLocked()
 }
 
 func (ac *AccountClient) absorbAndPersistCookies(setCookies []string) bool {
@@ -361,33 +464,66 @@ func (ac *AccountClient) absorbAndPersistCookies(setCookies []string) bool {
 }
 
 func (ac *AccountClient) absorbAndPersistCookiesWithGen(setCookies []string, expectedGen uint64, enforceGen bool) bool {
+	changed, _ := ac.absorbAndPersistCookiesWithGenNext(setCookies, expectedGen, enforceGen)
+	return changed
+}
+
+func (ac *AccountClient) absorbAndPersistCookiesWithGenNext(setCookies []string, expectedGen uint64, enforceGen bool) (bool, uint64) {
 	if len(setCookies) == 0 {
-		return false
+		return false, expectedGen
 	}
 	ac.mu.Lock()
-	if enforceGen && ac.cookieGen.Load() != expectedGen {
+	if ac.persistRetired.Load() || enforceGen && ac.cookieGen.Load() != expectedGen {
+		curGen := ac.cookieGen.Load()
 		ac.mu.Unlock()
-		return false
+		return false, curGen
 	}
 	merged, changed := cookies.AbsorbSetCookie(ac.cookieHeader, setCookies)
 	if !changed {
+		curGen := ac.cookieGen.Load()
 		ac.mu.Unlock()
-		return false
+		return false, curGen
 	}
 	ac.cookieHeader = merged
-	ac.cookieGen.Add(1)
+	newGen := cookieVersion.Add(1)
+	ac.cookieGen.Store(newGen)
+	key := ac.sessionKeyLocked()
 	ac.mu.Unlock()
 
 	if ac.Pool != nil {
-		if s := ac.Pool.Existing(ac.sessionKey()); s != nil {
-			s.QueueCookieUpdate(merged)
+		if s := ac.Pool.Existing(key); s != nil {
+			s.QueueCookieUpdateWithGen(merged, newGen)
 		}
 	}
 	ac.persistState()
-	return true
+	return true, newGen
+}
+
+// RetireCredentialWriter commits a replacement or deletion in the same
+// critical section as credential saves. A failed commit leaves the writer live.
+func (ac *AccountClient) RetireCredentialWriter(commit func() error) error {
+	ac.persistMu.Lock()
+	defer ac.persistMu.Unlock()
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if err := commit(); err != nil {
+		return err
+	}
+	ac.persistRetired.Store(true)
+	return nil
 }
 
 func (ac *AccountClient) persistState() {
+	ac.persistStateWithOptions(true)
+}
+
+func (ac *AccountClient) persistStateWithOptions(bumpRotatedAt bool) {
+	ac.persistMu.Lock()
+	defer ac.persistMu.Unlock()
+	if ac.persistRetired.Load() {
+		return
+	}
+
 	ac.mu.Lock()
 	path := ac.FilePath
 	if path == "" {
@@ -398,7 +534,9 @@ func (ac *AccountClient) persistState() {
 	if ac.capturedAt == "" {
 		ac.capturedAt = nowISO
 	}
-	ac.rotatedAt = nowISO
+	if bumpRotatedAt {
+		ac.rotatedAt = nowISO
+	}
 	surfCopy := make(map[string]string, len(ac.surfaces))
 	for k, v := range ac.surfaces {
 		surfCopy[k] = v
@@ -430,22 +568,96 @@ func (ac *AccountClient) persistState() {
 	ac.mu.Unlock()
 	if mtime, err := cookies.SaveCredentialFile(path, rec); err == nil {
 		ac.mu.Lock()
-		ac.fileMtimeMs = mtime
+		ac.unsavedExplicitCookies = false
+		if mtime > ac.fileMtimeMs {
+			ac.fileMtimeMs = mtime
+		}
 		ac.mu.Unlock()
 	}
+}
+
+func headerCaseInsensitive(headers map[string]string, key string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	if v, ok := headers[key]; ok {
+		return v
+	}
+	for k, v := range headers {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+func sanitizeRedirectLocation(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
+			return raw[:idx]
+		}
+		return raw
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
+func isSignInRedirect(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		base := raw
+		if idx := strings.IndexAny(base, "?#"); idx >= 0 {
+			base = base[:idx]
+		}
+		return strings.Contains(base, "accounts.google.com") || strings.Contains(base, "ServiceLogin")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "accounts.google.com" || host == "accounts.youtube.com" || strings.HasSuffix(host, ".accounts.google.com") {
+		return true
+	}
+	pathLower := strings.ToLower(u.Path)
+	for _, marker := range []string{
+		"servicelogin",
+		"/v3/signin",
+		"/signin",
+		"accountchooser",
+		"interactivelogin",
+		"checkcookie",
+	} {
+		if strings.Contains(pathLower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func classifyUpstreamAuthOrBan(status int, headers map[string]string, body string, defaultCode string) *transport.UpstreamError {
 	if status == 403 && (strings.Contains(body, "TOS_VIOLATION") || strings.Contains(body, "PERMISSION_DENIED")) {
 		return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", headers, nil)
 	}
+	var safeLoc string
 	if status == 302 || status == 301 || status == 303 || status == 307 || status == 308 {
-		loc := ""
-		if headers != nil {
-			loc = headers["location"]
-		}
-		if strings.Contains(loc, "accounts.google.com") || strings.Contains(loc, "ServiceLogin") || loc != "" {
-			return transport.NewUpstreamError("upstream redirected to Google sign-in", 401, "auth_redirect", headers, nil)
+		loc := headerCaseInsensitive(headers, "location")
+		safeLoc = sanitizeRedirectLocation(loc)
+		if isSignInRedirect(loc) {
+			msg := "upstream redirected to Google sign-in"
+			if safeLoc != "" {
+				msg += " (" + safeLoc + ")"
+			}
+			return transport.NewUpstreamError(msg, 401, "auth_redirect", headers, nil)
 		}
 	}
 	if status == 429 {
@@ -456,15 +668,26 @@ func classifyUpstreamAuthOrBan(status int, headers map[string]string, body strin
 	if status == 401 || status == 403 {
 		code = "upstream_auth_error"
 	}
-	return transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d", status), outStatus, code, headers, nil)
+	msg := fmt.Sprintf("upstream HTTP %d", status)
+	if safeLoc != "" {
+		msg += " (redirect to " + safeLoc + ")"
+	}
+	return transport.NewUpstreamError(msg, outStatus, code, headers, nil)
 }
 
 func (ac *AccountClient) acquireSession(ctx context.Context) (*transport.Session, error) {
 	ac.ReloadFromDiskIfNewer()
 	ac.mu.RLock()
+	if ac.persistRetired.Load() {
+		ac.mu.RUnlock()
+		return nil, transport.NewUpstreamError("account credentials changed; retry the request", 403, "account_disabled", nil, nil)
+	}
 	proxy := ac.proxyURL
+	cookie := ac.cookieHeader
+	gen := ac.cookieGen.Load()
+	key := ac.sessionKeyLocked()
 	ac.mu.RUnlock()
-	return ac.Pool.AcquireWithProxy(ctx, ac.sessionKey(), ac.CookieHeader(), proxy)
+	return ac.Pool.AcquireWithProxyWithGen(ctx, key, cookie, proxy, gen)
 }
 
 // Bootstrap loads https://gemini.google.com/app over the account's stealth session
@@ -479,130 +702,226 @@ func (ac *AccountClient) Bootstrap(ctx context.Context) error {
 	return ac.bootstrapOnClient(ctx, sess.Client)
 }
 
-func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.StealthClient) error {
-	ac.mu.RLock()
-	authUser := ac.authUser
-	ac.mu.RUnlock()
-	appURL := Origin + "/app"
-	if authUser > 0 {
-		appURL = Origin + "/u/" + strconv.Itoa(authUser) + "/app"
-	}
-	doFetchURL := func(target string) (*transport.Response, error) {
-		res, err := sc.Do(ctx, transport.RequestOptions{
-			Method:  "GET",
-			URL:     target,
-			Kind:    transport.ReqKindNavigate,
-			Headers: map[string]string{"cookie": ac.CookieHeader()},
-			Timeout: 30 * time.Second,
-		})
-		if err != nil {
-			return nil, err
-		}
-		ac.absorbAndPersistCookies(res.SetCookies)
-		return res, nil
-	}
-	doFetchApp := func() (*transport.Response, error) { return doFetchURL(appURL) }
+const maxBootstrapRedirects = 4
 
-	res, err := doFetchApp()
-	if err != nil {
-		return err
+func isSafeBootstrapRedirect(curURL string, res *transport.Response, authUser int) (string, bool) {
+	if res == nil || (res.Status != 301 && res.Status != 302 && res.Status != 303 && res.Status != 307 && res.Status != 308) {
+		return "", false
 	}
-	// A stored authUser may not resolve (e.g. the account is no longer on the
-	// Google account chooser, or the cookies belong to the profile's primary
-	// account). Fall back to the default /app surface instead of failing.
-	if authUser > 0 && (res.Status == 301 || res.Status == 302 || res.Status == 303 || res.Status == 307 || res.Status == 308) {
-		appURL = Origin + "/app"
-		res, err = doFetchApp()
+	loc := strings.TrimSpace(headerCaseInsensitive(res.Headers, "location"))
+	if loc == "" || isSignInRedirect(loc) {
+		return "", false
+	}
+	baseU, err := url.Parse(curURL)
+	if err != nil {
+		return "", false
+	}
+	locU, err := url.Parse(loc)
+	if err != nil {
+		return "", false
+	}
+	resolved := baseU.ResolveReference(locU)
+	if !strings.EqualFold(resolved.Scheme, "https") || !strings.EqualFold(resolved.Hostname(), "gemini.google.com") {
+		return "", false
+	}
+	if p := resolved.Port(); p != "" && p != "443" {
+		return "", false
+	}
+	if authUser > 0 {
+		prefix := "/u/" + strconv.Itoa(authUser) + "/"
+		exact := "/u/" + strconv.Itoa(authUser)
+		if !strings.HasPrefix(resolved.Path, prefix) && resolved.Path != exact {
+			return "", false
+		}
+	}
+	return resolved.String(), true
+}
+
+func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.StealthClient) error {
+	doFetchURL := func(target string, au int, chainGen uint64) (*transport.Response, uint64, error) {
+		curURL := target
+		var res *transport.Response
+		for hop := 0; ; hop++ {
+			ac.mu.RLock()
+			cookie := ac.cookieHeader
+			if hop > 0 && ac.cookieGen.Load() != chainGen {
+				ac.mu.RUnlock()
+				return res, chainGen, nil
+			}
+			ac.mu.RUnlock()
+			hopRes, err := sc.Do(ctx, transport.RequestOptions{
+				Method:  "GET",
+				URL:     curURL,
+				Kind:    transport.ReqKindNavigate,
+				Headers: map[string]string{"cookie": cookie},
+				Timeout: 30 * time.Second,
+			})
+			if err != nil {
+				return nil, chainGen, err
+			}
+			res = hopRes
+			absorbed, postGen := ac.absorbAndPersistCookiesWithGenNext(res.SetCookies, chainGen, true)
+			if absorbed {
+				chainGen = postGen
+			}
+			if nextURL, ok := isSafeBootstrapRedirect(curURL, res, au); ok && hop < maxBootstrapRedirects {
+				if ac.cookieGen.Load() != chainGen {
+					return res, chainGen, nil
+				}
+				curURL = nextURL
+				continue
+			}
+			return res, chainGen, nil
+		}
+	}
+	doFetchApp := func() (*transport.Response, uint64, error) {
+		ac.mu.RLock()
+		authUser := ac.authUser
+		chainGen := ac.cookieGen.Load()
+		ac.mu.RUnlock()
+		appURL := Origin + "/app"
+		if authUser > 0 {
+			appURL = Origin + "/u/" + strconv.Itoa(authUser) + "/app"
+		}
+		return doFetchURL(appURL, authUser, chainGen)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		res, bootFetchGen, err := doFetchApp()
 		if err != nil {
 			return err
 		}
-	}
+		if res.Status == 429 {
+			return classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
+		}
 
-	at := ""
-	if res.Status == 200 {
-		at = matchFirst(snlm0eRe, res.Body)
-	}
-	// Self-heal expired __Secure-1PSIDTS / SIDCC before declaring session dead:
-	// if /app failed or returned no SNlM0e token, run RotateCookies once and retry.
-	var lastRotRes *cookies.RotateResult
-	if res.Status != 200 || at == "" {
-		if rotRes, rotErr := ac.rotateOnClient(ctx, sc); rotErr == nil && rotRes != nil {
-			lastRotRes = rotRes
-			if rotRes.Rotated {
-				if retryRes, retryErr := doFetchApp(); retryErr == nil {
+		at := ""
+		if res.Status == 200 {
+			at = matchFirst(snlm0eRe, res.Body)
+		}
+		// A refresh can renew rotating cookies, but bootstrap must retry only the
+		// configured account slot.
+		if res.Status != 200 || at == "" {
+			if ac.cookieGen.Load() != bootFetchGen {
+				if attempt == 0 {
+					continue
+				}
+				ac.mu.RLock()
+				hasValidAT := ac.at != "" && ac.fromDiskAT
+				ac.mu.RUnlock()
+				if hasValidAT {
+					return nil
+				}
+				return transport.NewUpstreamError("session cookies changed during bootstrap; please retry", 503, "upstream_transient", nil, nil)
+			}
+			bootStartGen := ac.cookieGen.Load()
+			if rotRes, rotErr := ac.rotateOnClient(ctx, sc); rotErr == nil && rotRes != nil {
+				if rotRes.Status == 429 {
+					var headers map[string]string
+					if rotRes.RetryAfter != "" {
+						headers = map[string]string{"retry-after": rotRes.RetryAfter}
+					}
+					return transport.NewUpstreamError("cookie rotation rate limited (HTTP 429)", 429, "rate_limit_error", headers, nil)
+				}
+				if rotRes.Rotated || ac.cookieGen.Load() != bootStartGen {
+					retryRes, retryGen, retryErr := doFetchApp()
+					if retryErr != nil {
+						return retryErr
+					}
 					res = retryRes
+					bootFetchGen = retryGen
 					if res.Status == 200 {
 						at = matchFirst(snlm0eRe, res.Body)
+					}
+					if (res.Status != 200 || at == "") && ac.cookieGen.Load() != bootFetchGen {
+						if attempt == 0 {
+							continue
+						}
+						ac.mu.RLock()
+						hasValidAT := ac.at != "" && ac.fromDiskAT
+						ac.mu.RUnlock()
+						if hasValidAT {
+							return nil
+						}
+						return transport.NewUpstreamError("session cookies changed during bootstrap; please retry", 503, "upstream_transient", nil, nil)
 					}
 				}
 			}
 		}
-	}
 
-	if lastRotRes != nil && lastRotRes.Status == 429 && at == "" {
-		return transport.NewUpstreamError("cookie rotation rate limited (HTTP 429)", 429, "rate_limit_error", res.Headers, nil)
-	}
-
-	if res.Status != 200 {
-		return classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
-	}
-
-	bl := matchFirst(cfb2hRe, res.Body)
-	fSid := matchFirst(fdrfjeRe, res.Body)
-	pushID := matchFirst(pushIDRe, res.Body)
-	pctx := matchFirst(pctxRe, res.Body)
-	email := matchFirst(emailRe, res.Body)
-	if email == "" {
-		email = matchFirst(emailAltRe, res.Body)
-	}
-	tier := matchFirst(tierRe, res.Body)
-
-	if at == "" {
-		if strings.Contains(res.Body, "TOS_VIOLATION") || strings.Contains(res.Body, "PERMISSION_DENIED") {
-			return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", res.Headers, nil)
+		if res.Status != 200 {
+			return classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
 		}
-		return transport.NewUpstreamError(
-			"could not extract SNlM0e (at token); the saved session is expired or incomplete — run `gsb --login <name>` to sign in again, then re-import (browser cookie exports copied without signing in usually expire immediately)",
-			401,
-			"upstream_auth_error",
-			res.Headers,
-			nil,
-		)
-	}
-	nowISO := time.Now().UTC().Format(time.RFC3339)
-	ac.mu.Lock()
-	ac.at = at
-	ac.tokenFetchedAt = nowISO
-	ac.tokenSource = "bridge"
-	ac.fromDiskAT = false
-	if ac.blOverride != "" {
-		ac.bl = ac.blOverride
-		log.Printf("[gemini] account %s using BRIDGE_BL_OVERRIDE=%s", ac.ID, ac.blOverride)
-	} else if bl != "" {
-		ac.bl = bl
-	} else if ac.bl == "" {
-		log.Printf("[gemini] WARNING: account %s could not extract cfb2h build label; falling back to DefaultBL", ac.ID)
-		ac.bl = DefaultBL
-	}
-	if fSid != "" {
-		ac.fSid = fSid
-	}
-	if pushID != "" {
-		ac.pushID = pushID
-	}
-	if pctx != "" {
-		ac.pctx = pctx
-	}
-	if email != "" {
-		ac.email = email
-	}
-	if tier != "" {
-		ac.userTier = tier
-	}
-	ac.bootstrappedAt = time.Now()
-	ac.mu.Unlock()
 
-	ac.persistState()
+		bl := matchFirst(cfb2hRe, res.Body)
+		fSid := matchFirst(fdrfjeRe, res.Body)
+		pushID := matchFirst(pushIDRe, res.Body)
+		pctx := matchFirst(pctxRe, res.Body)
+		email := matchFirst(emailRe, res.Body)
+		if email == "" {
+			email = matchFirst(emailAltRe, res.Body)
+		}
+		tier := matchFirst(tierRe, res.Body)
+
+		if at == "" {
+			if strings.Contains(res.Body, "TOS_VIOLATION") || strings.Contains(res.Body, "PERMISSION_DENIED") {
+				return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", res.Headers, nil)
+			}
+			return transport.NewUpstreamError(
+				"could not extract SNlM0e (at token); the saved session is expired or incomplete — run `gsb --login <name>` to sign in again, then re-import (browser cookie exports copied without signing in usually expire immediately)",
+				401,
+				"upstream_auth_error",
+				res.Headers,
+				nil,
+			)
+		}
+		nowISO := time.Now().UTC().Format(time.RFC3339)
+		ac.mu.Lock()
+		if ac.cookieGen.Load() != bootFetchGen {
+			hasValidAT := ac.at != "" && ac.fromDiskAT
+			ac.mu.Unlock()
+			if attempt == 0 {
+				continue
+			}
+			if hasValidAT {
+				return nil
+			}
+			return transport.NewUpstreamError("session cookies changed during bootstrap; please retry", 503, "upstream_transient", nil, nil)
+		}
+		ac.at = at
+		ac.tokenFetchedAt = nowISO
+		ac.tokenSource = "bridge"
+		ac.fromDiskAT = false
+		if ac.blOverride != "" {
+			ac.bl = ac.blOverride
+			log.Printf("[gemini] account %s using BRIDGE_BL_OVERRIDE=%s", ac.ID, ac.blOverride)
+		} else if bl != "" {
+			ac.bl = bl
+		} else if ac.bl == "" {
+			log.Printf("[gemini] WARNING: account %s could not extract cfb2h build label; falling back to DefaultBL", ac.ID)
+			ac.bl = DefaultBL
+		}
+		if fSid != "" {
+			ac.fSid = fSid
+		}
+		if pushID != "" {
+			ac.pushID = pushID
+		}
+		if pctx != "" {
+			ac.pctx = pctx
+		}
+		if email != "" {
+			ac.email = email
+		}
+		if tier != "" {
+			ac.userTier = tier
+		}
+		ac.bootstrappedAt = time.Now()
+		ac.mu.Unlock()
+
+		ac.persistState()
+		return nil
+	}
 	return nil
 }
 
@@ -659,21 +978,65 @@ func (ac *AccountClient) rotateOnClient(ctx context.Context, sc *transport.Steal
 	if ac.Rotator == nil {
 		ac.Rotator = cookies.NewRotator()
 	}
-	res, err := ac.Rotator.RotateAccount(ctx, ac.sessionKey(), ac.CookieHeader(), sc)
+	ac.mu.RLock()
+	startCookie := ac.cookieHeader
+	startReloadGen := ac.reloadGen.Load()
+	key := ac.sessionKeyLocked()
+	ac.mu.RUnlock()
+
+	res, err := ac.Rotator.RotateAccount(ctx, key, startCookie, sc)
 	if err != nil {
 		return nil, err
 	}
-	if res.Rotated && res.CookieHeader != "" {
+	if res.Rotated && (len(res.SetCookies) > 0 || res.CookieHeader != "") {
 		ac.mu.Lock()
-		ac.cookieHeader = res.CookieHeader
-		ac.cookieGen.Add(1)
+		if ac.persistRetired.Load() || ac.reloadGen.Load() != startReloadGen {
+			curCookie := ac.cookieHeader
+			ac.mu.Unlock()
+			return &cookies.RotateResult{
+				Status:       res.Status,
+				Rotated:      false,
+				CookieHeader: curCookie,
+				NextInterval: res.NextInterval,
+				RetryAfter:   res.RetryAfter,
+			}, nil
+		}
+		var merged string
+		var changed bool
+		if len(res.SetCookies) > 0 {
+			merged, changed = cookies.AbsorbSetCookie(ac.cookieHeader, res.SetCookies)
+		} else if res.CookieHeader != "" && res.CookieHeader != ac.cookieHeader {
+			merged, changed = res.CookieHeader, true
+		}
+		if !changed {
+			curCookie := ac.cookieHeader
+			ac.mu.Unlock()
+			return &cookies.RotateResult{
+				Status:       res.Status,
+				Rotated:      false,
+				CookieHeader: curCookie,
+				NextInterval: res.NextInterval,
+				RetryAfter:   res.RetryAfter,
+			}, nil
+		}
+		ac.cookieHeader = merged
+		newGen := cookieVersion.Add(1)
+		ac.cookieGen.Store(newGen)
 		ac.mu.Unlock()
 		if ac.Pool != nil {
-			if s := ac.Pool.Existing(ac.sessionKey()); s != nil {
-				s.QueueCookieUpdate(res.CookieHeader)
+			if s := ac.Pool.Existing(key); s != nil {
+				s.QueueCookieUpdateWithGen(merged, newGen)
 			}
 		}
 		ac.persistState()
+		return &cookies.RotateResult{
+			Status:       res.Status,
+			Rotated:      true,
+			CookieHeader: merged,
+			SetCookies:   res.SetCookies,
+			NextInterval: res.NextInterval,
+			RetryAfter:   res.RetryAfter,
+		}, nil
 	}
 	return res, nil
 }
@@ -700,6 +1063,7 @@ func (ac *AccountClient) doBatchExec(ctx context.Context, sc *transport.StealthC
 	bl := ac.bl
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
+	startGen := ac.cookieGen.Load()
 	hl := ac.locale
 	authUser := ac.authUser
 	ac.mu.RUnlock()
@@ -757,7 +1121,7 @@ func (ac *AccountClient) doBatchExec(ctx context.Context, sc *transport.StealthC
 	if err != nil {
 		return nil, err
 	}
-	ac.absorbAndPersistCookies(res.SetCookies)
+	ac.absorbAndPersistCookiesWithGen(res.SetCookies, startGen, true)
 	return res, nil
 }
 
@@ -864,11 +1228,39 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 		if err != nil {
 			return nil, err
 		}
+		if res.Status != 200 {
+			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "model_discovery_error")
+		}
 		p = findBatchPayload(entries, "otAQ7b")
 	}
 
-	if isStatus1016(p) {
-		return nil, transport.NewUpstreamError("session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account", 401, "upstream_auth_error", res.Headers, nil)
+	if code := accountStatusCode(p); code != 0 && code != 1000 {
+		if code == 1014 {
+			// A temporary access restriction, not a verdict on the account. It is
+			// reported as a retryable degradation so the pool fails over now and
+			// comes back to this account once the restriction lifts.
+			return nil, transport.NewUpstreamError(
+				"upstream temporarily restricted this account (code 1014): "+accountStatusCodes[code]+" — retrying later usually succeeds",
+				503,
+				"upstream_degraded",
+				res.Headers,
+				nil,
+			)
+		}
+		if code == 1016 {
+			return nil, transport.NewUpstreamError("session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account", 401, "upstream_auth_error", res.Headers, nil)
+		}
+		reason, known := accountStatusCodes[code]
+		if !known {
+			reason = "account status is not one this bridge recognizes"
+		}
+		return nil, transport.NewUpstreamError(
+			fmt.Sprintf("upstream rejected this account (code %d): %s — retrying will not help; fix the account on gemini.google.com", code, reason),
+			403,
+			"account_banned",
+			res.Headers,
+			nil,
+		)
 	}
 
 	pArr, ok := p.([]any)
@@ -1077,16 +1469,25 @@ func (ac *AccountClient) enrichWithGraphqlUsagePools(ctx context.Context, sc *tr
 	if sc == nil {
 		return base
 	}
+	ac.mu.RLock()
+	cookie := ac.cookieHeader
+	startGen := ac.cookieGen.Load()
+	authUser := ac.authUser
+	ac.mu.RUnlock()
+
 	q := url.Values{}
 	q.Set("query_signature", graphqlUsageQuerySig)
 	q.Set("variables", graphqlUsageVariables)
+	if authUser > 0 {
+		q.Set("authuser", strconv.Itoa(authUser))
+	}
 	u := Origin + "/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery?" + q.Encode()
 	res, err := sc.Do(ctx, transport.RequestOptions{
 		Method: "GET",
 		URL:    u,
 		Kind:   transport.ReqKindCORS,
 		Headers: map[string]string{
-			"cookie": ac.CookieHeader(),
+			"cookie": cookie,
 			"accept": "application/json",
 		},
 		Timeout: 10 * time.Second,
@@ -1094,7 +1495,7 @@ func (ac *AccountClient) enrichWithGraphqlUsagePools(ctx context.Context, sc *tr
 	if err != nil || res == nil || res.Status != 200 {
 		return base
 	}
-	ac.absorbAndPersistCookies(res.SetCookies)
+	ac.absorbAndPersistCookiesWithGen(res.SetCookies, startGen, true)
 
 	body := strings.TrimSpace(res.Body)
 	if strings.HasPrefix(body, ")]}'") {
@@ -1215,15 +1616,38 @@ func findBatchPayload(entries []BatchEntry, rpcID string) any {
 	return nil
 }
 
-func isStatus1016(p any) bool {
+// accountStatusCodes maps the numeric status GetUserStatus returns to a human
+// explanation. Only a handful were recognized before, so an account restricted
+// for a terms-of-service or regional reason surfaced as a generic upstream
+// error and the operator went looking in the wrong place. Every code below is
+// an account-level verdict that retrying cannot fix.
+var accountStatusCodes = map[int]string{
+	1014: "access is temporarily restricted (possibly regional or a transient session problem)",
+	1016: "session is unauthenticated or the saved cookies have expired",
+	1021: "account access is rejected; check the account's Google settings",
+	1033: "account did not pass Google's safety or trust checks for some features",
+	1040: "the latest Terms of Service must be accepted on this account",
+	1042: "the account's accepted Terms of Service are out of date",
+	1054: "access is blocked by a parent or guardian",
+	1057: "access requires parent or guardian approval",
+	1060: "Gemini is not available in this account's country or region",
+}
+
+// accountStatusCode reads the numeric status field of a GetUserStatus payload.
+// A nil or 1000 status means the account is authorized.
+func accountStatusCode(p any) int {
 	arr, ok := p.([]any)
 	if !ok || len(arr) <= 14 {
-		return false
+		return 0
 	}
-	if f, ok := arr[14].(float64); ok && int(f) == 1016 {
-		return true
+	if f, ok := arr[14].(float64); ok {
+		return int(f)
 	}
-	return false
+	return 0
+}
+
+func isStatus1016(p any) bool {
+	return accountStatusCode(p) == 1016
 }
 
 func toIntSlice(v any) []int {

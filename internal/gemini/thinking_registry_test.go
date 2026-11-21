@@ -1,6 +1,9 @@
 package gemini
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // The point of these cases is that no model name appears in the expectation.
 // A tier the registry renames, or a new one it introduces, must be described by
@@ -56,5 +59,30 @@ func TestThinkingLevelForModelFallsBackToName(t *testing.T) {
 	}
 	if got := ThinkingLevelForModel("high", legacy, "low"); got != 2 {
 		t.Fatalf("level = %d, want 2", got)
+	}
+}
+
+func TestThinkingLevelForModelNumericEffort(t *testing.T) {
+	all := ModelInfo{ThinkingLevels: []string{"low", "medium", "high"}}
+	limited := ModelInfo{ThinkingLevels: []string{"low", "high"}}
+	for _, tc := range []struct {
+		name string
+		raw any
+		model ModelInfo
+		want int
+	}{
+		{"decoded high", float64(2), all, 2},
+		{"decoded low", float64(0), all, 1},
+		{"integer medium", 4, all, 4},
+		{"JSON number low", json.Number("1"), all, 1},
+		{"unsupported medium", float64(4), limited, 1},
+		{"fraction not an enum", float64(2.5), all, 4},
+		{"no advertised levels", 2, ModelInfo{ModelName: "gemini-pro", ThinkingPolicyKnown: true}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ThinkingLevelForModel(tc.raw, tc.model, "high"); got != tc.want {
+				t.Fatalf("level for %v (%T) = %d, want %d", tc.raw, tc.raw, got, tc.want)
+			}
+		})
 	}
 }

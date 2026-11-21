@@ -48,11 +48,29 @@ func isContextNote(s string) bool {
 	return strings.HasPrefix(s, "[Context note:") || strings.HasPrefix(s, "Instruction: [")
 }
 
-// DetectImageMIME infers the MIME type and file extension of an image from its magic bytes.
+// DetectImageMIME uses raster magic bytes when present and otherwise returns the fallback type and extension.
 func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string) {
+	if mimeType, ext := rasterImageMIME(data); mimeType != "" {
+		return mimeType, ext
+	}
 	if fallback == "" {
 		fallback = "image/png"
 	}
+	ext = "png"
+	if parts := strings.Split(strings.ToLower(fallback), "/"); len(parts) > 1 {
+		cleaned := nonAlphaNumRe.ReplaceAllString(parts[1], "")
+		if cleaned != "" {
+			if cleaned == "jpeg" {
+				ext = "jpg"
+			} else {
+				ext = cleaned
+			}
+		}
+	}
+	return strings.ToLower(fallback), ext
+}
+
+func rasterImageMIME(data []byte) (mimeType, ext string) {
 	switch {
 	case len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}):
 		return "image/png", "png"
@@ -60,7 +78,8 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 		return "image/jpeg", "jpg"
 	case len(data) >= 6 && (bytes.Equal(data[:6], []byte("GIF87a")) || bytes.Equal(data[:6], []byte("GIF89a"))):
 		return "image/gif", "gif"
-	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+	case len(data) >= 16 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" &&
+		(string(data[12:16]) == "VP8 " || string(data[12:16]) == "VP8L" || string(data[12:16]) == "VP8X"):
 		return "image/webp", "webp"
 	case len(data) >= 2 && data[0] == 'B' && data[1] == 'M':
 		return "image/bmp", "bmp"
@@ -75,18 +94,7 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 			return "image/heic", "heic"
 		}
 	}
-	ext = "png"
-	if parts := strings.Split(strings.ToLower(fallback), "/"); len(parts) > 1 {
-		cleaned := nonAlphaNumRe.ReplaceAllString(parts[1], "")
-		if cleaned != "" {
-			if cleaned == "jpeg" {
-				ext = "jpg"
-			} else {
-				ext = cleaned
-			}
-		}
-	}
-	return strings.ToLower(fallback), ext
+	return "", ""
 }
 
 // FlattenOptions configures FlattenMessages.
@@ -221,8 +229,49 @@ func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 	return images
 }
 
-// FetchRemoteImage downloads an http(s) image URL with SSRF protection, a 20MB cap,
-// and magic-byte MIME detection.
+// IsGlobalUnicast alone does not exclude these IANA special-purpose ranges.
+var specialUseImagePrefixes = [...]netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),        // This network
+	netip.MustParsePrefix("100.64.0.0/10"),    // Shared address space (CGNAT)
+	netip.MustParsePrefix("192.0.0.0/24"),     // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),    // Documentation
+	netip.MustParsePrefix("192.31.196.0/24"), // AS112
+	netip.MustParsePrefix("192.52.193.0/24"),  // AMT
+	netip.MustParsePrefix("192.88.99.0/24"),   // Deprecated 6to4 relay anycast
+	netip.MustParsePrefix("192.175.48.0/24"),  // AS112
+	netip.MustParsePrefix("198.18.0.0/15"),    // Benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // Documentation
+	netip.MustParsePrefix("203.0.113.0/24"),   // Documentation
+	netip.MustParsePrefix("240.0.0.0/4"),      // Reserved and limited broadcast
+	netip.MustParsePrefix("2001::/23"),        // IETF protocol assignments (incl. benchmarking and Teredo)
+	netip.MustParsePrefix("2001:db8::/32"),    // Documentation
+	netip.MustParsePrefix("2002::/16"),        // 6to4
+	netip.MustParsePrefix("2620:4f:8000::/48"), // AS112
+	netip.MustParsePrefix("3fff::/20"),        // Documentation
+}
+
+var publicImageIPv6Space = netip.MustParsePrefix("2000::/3")
+
+func isPublicImageAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.Zone() != "" {
+		return false
+	}
+	// Exclude IPv6 outside the current global unicast allocation, including
+	// NAT64 (64:ff9b::/96 and 64:ff9b:1::/48) and other reserved ranges.
+	if addr.Is6() && !publicImageIPv6Space.Contains(addr) {
+		return false
+	}
+	for _, prefix := range specialUseImagePrefixes {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+// FetchRemoteImage downloads an HTTP(S) raster image with SSRF protection and a 20 MiB cap.
+// BRIDGE_ALLOW_PRIVATE_IMAGE_URLS=1 disables address checks for trusted callers only.
 func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
@@ -231,6 +280,8 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 	allowPrivate := os.Getenv("BRIDGE_ALLOW_PRIVATE_IMAGE_URLS") == "1"
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
+		// Check the actual address selected by the dialer, not a separate DNS
+		// lookup. This covers address selection on the initial hop and redirects.
 		Control: func(network, address string, c syscall.RawConn) error {
 			if allowPrivate {
 				return nil
@@ -243,9 +294,8 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 			if addrErr != nil {
 				return fmt.Errorf("unresolved IP %s", host)
 			}
-			addr = addr.Unmap()
-			if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
-				return fmt.Errorf("blocked private or loopback image address %s", addr.String())
+			if !isPublicImageAddress(addr) {
+				return fmt.Errorf("blocked private or special-use image address %s", addr)
 			}
 			return nil
 		},
@@ -268,12 +318,13 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 			return nil
 		},
 	}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, transport.NewUpstreamError("invalid remote image request", 400, "invalid_request_error", nil, err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/png,image/jpeg,image/gif,image/bmp,image/tiff,image/heic")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -291,8 +342,10 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 	if len(data) > maxImageBytes {
 		return nil, transport.NewUpstreamError("remote image exceeds 20MB limit", 400, "invalid_request_error", nil, nil)
 	}
-	headerMIME := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
-	mime, ext := DetectImageMIME(data, headerMIME)
+	mime, ext := rasterImageMIME(data)
+	if mime == "" {
+		return nil, transport.NewUpstreamError("remote image does not have a supported raster image signature", 400, "invalid_request_error", nil, nil)
+	}
 	if index < 0 {
 		index = 0
 	}
@@ -303,7 +356,8 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 	}, nil
 }
 
-// BoundOldToolText middle-truncates text exceeding cap, preserving 65% head and 35% tail.
+// BoundOldToolText middle-truncates text to a byte budget (excluding the marker),
+// retaining approximately 65% head and 35% tail without splitting UTF-8 runes.
 func BoundOldToolText(text string, cap int, label string) string {
 	if cap <= 0 || len(text) <= cap {
 		return text
@@ -312,9 +366,14 @@ func BoundOldToolText(text string, cap int, label string) string {
 		label = "earlier tool output"
 	}
 	head := int(float64(cap) * 0.65)
-	tail := cap - head
-	omitted := len(text) - head - tail
-	return fmt.Sprintf("%s\n...[truncated %d chars of %s]...\n%s", text[:head], omitted, label, text[len(text)-tail:])
+	tailStart := len(text) - (cap - head)
+	for head > 0 && !utf8.RuneStart(text[head]) {
+		head--
+	}
+	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
+		tailStart++
+	}
+	return fmt.Sprintf("%s\n...[truncated %d bytes of %s]...\n%s", text[:head], tailStart-head, label, text[tailStart:])
 }
 
 type turnEntry struct {

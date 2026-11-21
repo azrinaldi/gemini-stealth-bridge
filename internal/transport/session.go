@@ -22,20 +22,23 @@ type SessionStatus struct {
 // Session owns an isolated per-account StealthClient and serializes generations
 // on that account with a bounded wait queue, mirroring BrowserSession without Chrome.
 type Session struct {
-	Name          string
-	Client        *StealthClient
-	Generation    uint64
-	MaxQueueDepth int
-	WaitTimeout   time.Duration
-	proxyURL      string
-	mu            sync.Mutex
-	ready         bool
-	active        int
-	reservedUntil time.Time
-	lastUsed      time.Time
-	cookieHeader  string
-	pendingCookie string
-	execMu        sync.Mutex
+	Name             string
+	Client           *StealthClient
+	Generation       uint64
+	MaxQueueDepth    int
+	WaitTimeout      time.Duration
+	proxyURL         string
+	mu               sync.Mutex
+	ready            bool
+	active           int
+	queued           int
+	reservedUntil    time.Time
+	lastUsed         time.Time
+	cookieHeader     string
+	cookieGen        uint64
+	pendingCookie    string
+	pendingCookieGen uint64
+	execSem          chan struct{}
 }
 
 // NewSession constructs a new isolated account session.
@@ -56,6 +59,7 @@ func NewSession(name string, client *StealthClient, gen uint64, cookieHeader str
 		ready:         true,
 		lastUsed:      time.Now(),
 		cookieHeader:  cookieHeader,
+		execSem:       make(chan struct{}, 1),
 	}
 }
 
@@ -77,18 +81,46 @@ func (s *Session) Active() int {
 func (s *Session) Queued() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active <= 1 {
-		return 0
-	}
-	return s.active - 1
+	return s.queued
 }
 
 // QueueCookieUpdate schedules a fresh cookie header to be applied before the next request.
+// Unversioned updates never overwrite or clear a non-empty pendingCookie.
 func (s *Session) QueueCookieUpdate(cookie string) {
+	if cookie == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cookie != "" && cookie != s.cookieHeader {
+	if s.pendingCookie != "" {
+		return
+	}
+	if cookie != s.cookieHeader {
 		s.pendingCookie = cookie
+		s.pendingCookieGen = max(s.cookieGen, s.pendingCookieGen) + 1
+	}
+}
+
+// QueueCookieUpdateWithGen schedules a versioned cookie header update, ignoring
+// stale updates whose generation is not strictly newer than the session's
+// current or pending generation.
+func (s *Session) QueueCookieUpdateWithGen(cookie string, gen uint64) {
+	if cookie == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	curMax := max(s.cookieGen, s.pendingCookieGen)
+	if gen <= curMax {
+		return
+	}
+	if cookie != s.cookieHeader {
+		s.pendingCookie = cookie
+		s.pendingCookieGen = gen
+	} else {
+		s.pendingCookie = ""
+		s.pendingCookieGen = 0
+		s.cookieGen = gen
 	}
 }
 
@@ -121,11 +153,18 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 	}
 
 	s.mu.Lock()
-	waiting := 0
-	if s.active > 0 {
-		waiting = s.active - 1
+	if s.execSem == nil {
+		s.execSem = make(chan struct{}, 1)
 	}
-	if waiting >= s.MaxQueueDepth {
+	sem := s.execSem
+	acquired := false
+	select {
+	case sem <- struct{}{}:
+		acquired = true
+	default:
+	}
+	if !acquired && s.queued >= s.MaxQueueDepth {
+		waiting := s.queued
 		s.mu.Unlock()
 		return NewUpstreamError(
 			fmt.Sprintf("session %s is busy: %d request(s) already queued", s.Name, waiting),
@@ -136,54 +175,66 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 		)
 	}
 	s.active++
+	isQueued := !acquired
+	if isQueued {
+		s.queued++
+	}
 	s.reservedUntil = time.Time{}
 	s.lastUsed = time.Now()
 	s.mu.Unlock()
 
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			<-sem
+		})
+	}
+	if acquired {
+		defer release()
+	}
+
 	defer func() {
 		s.mu.Lock()
 		s.active--
+		if isQueued {
+			s.queued--
+			isQueued = false
+		}
 		s.lastUsed = time.Now()
 		s.mu.Unlock()
 	}()
 
-	// Acquire the execution mutex while respecting caller cancellation while waiting.
-	acquired := make(chan struct{})
-	go func() {
-		s.execMu.Lock()
-		close(acquired)
-	}()
+	if !acquired {
+		// Acquire the 1-slot execution semaphore directly in select so timed-out or
+		// cancelled waiters never spawn background goroutines.
+		var waitCh <-chan time.Time
+		var timer *time.Timer
+		if s.WaitTimeout > 0 {
+			timer = time.NewTimer(s.WaitTimeout)
+			defer timer.Stop()
+			waitCh = timer.C
+		}
 
-	var waitCh <-chan time.Time
-	var timer *time.Timer
-	if s.WaitTimeout > 0 {
-		timer = time.NewTimer(s.WaitTimeout)
-		defer timer.Stop()
-		waitCh = timer.C
-	}
-
-	select {
-	case <-acquired:
-		defer s.execMu.Unlock()
-	case <-waitCh:
-		go func() {
-			<-acquired
-			s.execMu.Unlock()
-		}()
-		return NewUpstreamError(
-			fmt.Sprintf("session %s is busy: timed out after %s waiting for active generation", s.Name, s.WaitTimeout),
-			429,
-			"session_busy",
-			map[string]string{"retry-after": "2"},
-			nil,
-		)
-	case <-ctx.Done():
-		// Clean up the lock when the goroutine eventually acquires it.
-		go func() {
-			<-acquired
-			s.execMu.Unlock()
-		}()
-		return NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
+		select {
+		case sem <- struct{}{}:
+			defer release()
+			s.mu.Lock()
+			if isQueued {
+				s.queued--
+				isQueued = false
+			}
+			s.mu.Unlock()
+		case <-waitCh:
+			return NewUpstreamError(
+				fmt.Sprintf("session %s is busy: timed out after %s waiting for active generation", s.Name, s.WaitTimeout),
+				429,
+				"session_busy",
+				map[string]string{"retry-after": "2"},
+				nil,
+			)
+		case <-ctx.Done():
+			return NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -192,9 +243,15 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 
 	s.mu.Lock()
 	s.lastUsed = time.Now()
-	if s.pendingCookie != "" && s.pendingCookie != s.cookieHeader {
-		s.cookieHeader = s.pendingCookie
+	if s.pendingCookie != "" {
+		if s.pendingCookie != s.cookieHeader {
+			s.cookieHeader = s.pendingCookie
+		}
+		if s.pendingCookieGen > s.cookieGen {
+			s.cookieGen = s.pendingCookieGen
+		}
 		s.pendingCookie = ""
+		s.pendingCookieGen = 0
 	}
 	curCookie := s.cookieHeader
 	s.mu.Unlock()
@@ -203,7 +260,7 @@ func (s *Session) Lease(ctx context.Context, fn func(cookieHeader string) error)
 }
 
 // RunStream executes an HTTP/2 multiplexed stream on this session without holding
-// the single-tab execMu lock, allowing up to MaxQueueDepth concurrent streams per account.
+// the single-tab execSem semaphore, allowing up to MaxQueueDepth concurrent streams per account.
 func (s *Session) RunStream(ctx context.Context, fn func(cookieHeader string) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -230,9 +287,15 @@ func (s *Session) RunStream(ctx context.Context, fn func(cookieHeader string) er
 	s.active++
 	s.reservedUntil = time.Time{}
 	s.lastUsed = time.Now()
-	if s.pendingCookie != "" && s.pendingCookie != s.cookieHeader {
-		s.cookieHeader = s.pendingCookie
+	if s.pendingCookie != "" {
+		if s.pendingCookie != s.cookieHeader {
+			s.cookieHeader = s.pendingCookie
+		}
+		if s.pendingCookieGen > s.cookieGen {
+			s.cookieGen = s.pendingCookieGen
+		}
 		s.pendingCookie = ""
+		s.pendingCookieGen = 0
 	}
 	curCookie := s.cookieHeader
 	s.mu.Unlock()
@@ -249,13 +312,7 @@ func (s *Session) RunStream(ctx context.Context, fn func(cookieHeader string) er
 
 // Close releases idle connections held by the session.
 func (s *Session) Close() {
-	s.mu.Lock()
-	s.ready = false
-	s.pendingCookie = ""
-	s.mu.Unlock()
-	if s.Client != nil {
-		s.Client.ResetConnections()
-	}
+	s.Retire()
 }
 
 // Retire takes a session out of service without rebuilding its client. An
@@ -265,6 +322,7 @@ func (s *Session) Retire() {
 	s.mu.Lock()
 	s.ready = false
 	s.pendingCookie = ""
+	s.pendingCookieGen = 0
 	s.mu.Unlock()
 	if s.Client != nil {
 		s.Client.CloseIdleConnections()
@@ -345,6 +403,17 @@ func (p *Pool) Acquire(ctx context.Context, key, cookieHeader string) (*Session,
 // default. Each Google account may sit behind its own proxy, so the proxy is
 // a property of the session rather than of the pool.
 func (p *Pool) AcquireWithProxy(ctx context.Context, key, cookieHeader, proxyURL string) (*Session, error) {
+	return p.acquireWithProxy(ctx, key, cookieHeader, proxyURL, 0, false)
+}
+
+// AcquireWithProxyWithGen behaves like AcquireWithProxy while enforcing a
+// monotonic cookie generation counter so stale snapshots cannot clobber newer
+// cookies queued or promoted on an existing session.
+func (p *Pool) AcquireWithProxyWithGen(ctx context.Context, key, cookieHeader, proxyURL string, cookieGen uint64) (*Session, error) {
+	return p.acquireWithProxy(ctx, key, cookieHeader, proxyURL, cookieGen, true)
+}
+
+func (p *Pool) acquireWithProxy(ctx context.Context, key, cookieHeader, proxyURL string, cookieGen uint64, hasGen bool) (*Session, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -357,8 +426,21 @@ func (p *Pool) AcquireWithProxy(ctx context.Context, key, cookieHeader, proxyURL
 			isReady := existing.Generation == p.generation && existing.ready
 			proxyChanged := existing.proxyURL != proxyURL
 			if isReady {
-				if cookieHeader != "" && cookieHeader != existing.cookieHeader {
+				if hasGen {
+					curMax := max(existing.cookieGen, existing.pendingCookieGen)
+					if cookieHeader != "" && cookieGen > curMax {
+						if cookieHeader != existing.cookieHeader {
+							existing.pendingCookie = cookieHeader
+							existing.pendingCookieGen = cookieGen
+						} else {
+							existing.pendingCookie = ""
+							existing.pendingCookieGen = 0
+							existing.cookieGen = cookieGen
+						}
+					}
+				} else if cookieHeader != "" && cookieHeader != existing.cookieHeader && existing.pendingCookie == "" {
 					existing.pendingCookie = cookieHeader
+					existing.pendingCookieGen = max(existing.cookieGen, existing.pendingCookieGen) + 1
 				}
 				existing.reservedUntil = time.Now().Add(p.reserveFor)
 			}
@@ -384,6 +466,9 @@ func (p *Pool) AcquireWithProxy(ctx context.Context, key, cookieHeader, proxyURL
 				return nil, err
 			}
 			s := NewSession(key, sc, p.generation, cookieHeader, p.maxQueue, p.waitTimeout)
+			if hasGen {
+				s.cookieGen = cookieGen
+			}
 			s.proxyURL = proxyURL
 			s.reservedUntil = time.Now().Add(p.reserveFor)
 			p.sessions[key] = s
@@ -457,6 +542,22 @@ func (p *Pool) ReapIdle(maxIdle time.Duration) int {
 	return len(toClose)
 }
 
+// Remove evicts and closes the session associated with key, if present.
+func (p *Pool) Remove(key string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	s, ok := p.sessions[key]
+	if ok {
+		delete(p.sessions, key)
+	}
+	p.mu.Unlock()
+	if ok && s != nil {
+		s.Close()
+	}
+}
+
 // Status returns a diagnostic snapshot of all open sessions in the pool.
 func (p *Pool) Status() []SessionStatus {
 	now := time.Now()
@@ -465,15 +566,11 @@ func (p *Pool) Status() []SessionStatus {
 	out := make([]SessionStatus, 0, len(p.sessions))
 	for k, s := range p.sessions {
 		s.mu.Lock()
-		queued := 0
-		if s.active > 1 {
-			queued = s.active - 1
-		}
 		st := SessionStatus{
 			Key:     k,
 			Ready:   s.ready,
 			Busy:    s.active > 0,
-			Queued:  queued,
+			Queued:  s.queued,
 			Active:  s.active,
 			Stale:   s.Generation != p.generation,
 			IdleSec: int64(now.Sub(s.lastUsed).Seconds()),

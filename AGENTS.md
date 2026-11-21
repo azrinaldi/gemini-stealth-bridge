@@ -84,7 +84,7 @@ Default listener: `127.0.0.1:20133`. Default pool key: `public` (unauthenticated
 |---|---|---|---|
 | **Pool key** | `BRIDGE_API_KEY` (default `public`) | Every loaded account | Yes, across the pool |
 | **Group key** | `BRIDGE_GROUP_TOKENS` entry (`token:group`) | The accounts in one group | Yes, inside the group only |
-| **Account key** | `gsb-<name>` or `<name>` | Exactly one account | No |
+| **Account key** | A `BRIDGE_ACCOUNT_TOKENS` entry or a public-mode alias | Exactly one account | No |
 
 Default to the pool key in every example and client configuration.
 
@@ -96,8 +96,8 @@ When a user reports that a request failed while another account had quota, **che
 
 - `BRIDGE_API_KEY=public` accepts requests with **no** key, the literal `public`, or the derived `gsb-pool-<hash>` token shown in the Web UI.
 - With exactly one loaded account, the pool key resolves to that account's scope.
-- Account aliases (`gsb-<name>` and `<name>`) are registered automatically for every loaded account file. They are predictable from filenames and are not secrets.
-- `BRIDGE_ACCOUNT_TOKENS="token:account_id"` adds custom aliases without removing the automatic ones. It also disables the on-demand hot reload of newly added account files for unknown `gsb-*` tokens.
+- Filename aliases (`gsb-<name>` and `<name>`) work only when `BRIDGE_API_KEY=public` and `BRIDGE_ACCOUNT_TOKENS` is unset. They are routing aliases, not secrets.
+- `BRIDGE_ACCOUNT_TOKENS="token:account_id"` configures explicit account keys. Use it for account pinning with a private pool key.
 - `BRIDGE_ADMIN_KEY` grants the admin scope: all accounts, plus `/v1/admin/*`.
 - Accepted headers: `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`, `?key=`. Prefer `Authorization`.
 
@@ -141,7 +141,7 @@ If no local browser or display is available, `--login` falls back to a terminal 
 
 ### 4.2 Remote VPS / headless
 
-Two supported paths:
+Three supported paths:
 
 1. **Incognito cookie paste (works everywhere)**
    - Open a **New Incognito Window** (`Ctrl+Shift+N`).
@@ -150,12 +150,17 @@ Two supported paths:
    - **Immediately close the Incognito window without signing out.**
    - Paste into the Web UI's **+ Add Account** or pipe it to `gsb --import-cookie <name>`.
 
-2. **One-click isolated browser with a local helper**
+2. **Manual desktop helper for the VPS Web UI**
    - On the laptop: `gsb --login-helper` (listens on `127.0.0.1:20134`).
-   - Forward both ports: `ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps`.
-   - In the VPS Web UI: **+ Add Account → Isolated browser window → Launch**.
+   - Tunnel the daemon only: `ssh -L 20133:127.0.0.1:20133 user@vps`. Leave port `20134` on the laptop.
+   - In the VPS Web UI: **+ Add Account → Isolated browser window**. Paste the token from the laptop helper terminal into **Desktop helper token**, then select **Launch**.
    - The page calls the VPS first; if the VPS has no browser/GUI, it falls back to the local helper and posts the captured cookie to the VPS import endpoint.
    - Account name, proxy, and group are collapsed under **Optional settings** in that dialog; leave them closed for a normal single-key setup.
+
+3. **Desktop browser login on VPS — one daemon UI, one local port**
+   - Set up private SSH socket and `gsb --desktop-ui` as shown in README §6.4.
+   - Open `http://127.0.0.1:20133/ui`; this serves daemon Web UI through local proxy. No Connect desktop pairing and no second UI.
+   - Select **Add Account → Launch**. Desktop process captures browser session locally and posts it to daemon import endpoint. API clients use same `http://127.0.0.1:20133/v1`.
 
 ### 4.3 Cookie import is acceptable only when the profile is already signed in
 
@@ -176,7 +181,7 @@ Supported: Chrome, Chromium, Brave, Edge, Vivaldi, Arc, Firefox.
 - Linux keyring-backed cookies may require `secret-tool` and an unlocked keyring.
 - Windows DPAPI requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export.
 
-**Multi-account Chrome profiles:** a profile signed in to several Google accounts always imports the profile's *primary* account, because Chromium stores one cookie set per domain. To target a secondary account, set `"authUser": <N>` in the account JSON after import (the index from Google's `/u/N/app` surface). Bootstrap fetches `/u/N/app` and falls back to `/app` if the index no longer resolves. There is no auto-detection: Chrome's `account_info` order does not reliably map to `/u/N`, so guessing could attribute the session to the wrong account.
+**Multi-account Chrome profiles:** imports use the profile's primary account. A credential with `authUser: N` bootstraps only through `/u/N/app`. If Google no longer resolves that slot, relink the intended account. The daemon does not guess a slot or fall back to the primary account.
 
 Cookie export is the fallback when browser decryption is unavailable:
 
@@ -213,6 +218,7 @@ Each account has its own cookie state, model list, quota state, transport sessio
 ## 5. Never recommend
 
 - Copying cookies from a browser that was never signed in to Gemini. Those cookies expire almost immediately and surface later as `401 upstream_auth_error` or upstream `code 1016`.
+- Importing cookies from a Chromium profile that has Device Bound Session Credentials (DBSC) active. Recent Chrome, Edge and Brave bind the session to the machine's key, so the exported cookies stay valid for only a few hours and cannot be renewed by `--rotate`. `gsb --login` disables DBSC in the browser it launches, and a Firefox profile has no equivalent; use one of those when imports keep expiring.
 - Pasting cookies, `Cookie` headers, account JSON, or `session-cache.json` into chat, issues, logs, commits, or shell history.
 - `--rotate` as a fix for an expired session. It only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
 - Committing `$BRIDGE_HOME` (default `~/.gemini-stealth-bridge`) to version control.
@@ -238,7 +244,7 @@ Statuses are computed in this precedence order and are shared by `/v1/accounts`,
 | `expired` | Expired | Saved session invalid (`upstream_auth_error`, `auth_redirect`, `code 1016`, `snlm0e`, …) | `gsb --login <name>` |
 | `exhausted` | Exhausted | A real quota window is spent until `resetAt`, or a model stayed exhausted across retries | Wait for reset, use another account/model, or use `gemini-flash-lite` |
 | `cooling` | Cooling | Failed within the last 60 seconds | Wait; the pool routes around it |
-| `degraded` | Degraded | Cooldown elapsed but the failure counter is still nonzero | A success or a manual reset clears it |
+| `degraded` | Degraded | Cooldown elapsed but the failure counter is still nonzero | Automatic: the account is re-checked within ~2 minutes and a healthy re-check clears it. No manual refresh needed |
 | `unknown` | Unprobed | No quota check has run in this process | `gsb --accounts --accounts-live` or query a running daemon |
 | `ok` | Ready | Loaded, authenticated, no known limit | None |
 
@@ -249,6 +255,13 @@ Statuses are computed in this precedence order and are shared by `/v1/accounts`,
 | `401 upstream_auth_error` | Session expired or rejected | `gsb --login <name>`, then `gsb --probe` |
 | upstream `code 1016` | Same as above | Same |
 | `403 account_banned` / `TOS_VIOLATION` | Account restricted upstream | Stop retrying; the account is quarantined |
+| `403 account_banned` with `code 1021` | Account access rejected | Fix the account on gemini.google.com; retrying does not help |
+| `403 account_banned` with `code 1033` | Account failed Google's safety/trust checks | Same |
+| `403 account_banned` with `code 1040` / `1042` | Terms of Service must be accepted (or are stale) | Sign in to the account and accept the current terms |
+| `403 account_banned` with `code 1054` / `1057` | Blocked by, or awaiting, parent/guardian approval | Same |
+| `403 account_banned` with `code 1060` | Gemini unavailable in the account's country | Use an account or egress in a supported region |
+| `502 upstream_degraded` with `code 1014` | Temporary regional or session restriction | Retry later; the pool fails over meanwhile |
+| `503 upstream_transient` with `code 1013` | Random temporary model error | Retried automatically; no action |
 | `no SAPISID cookie found` | Selected browser profile is not signed in | Use `gsb --login` |
 | `401 authentication_error` from `gsb` | Wrong API key, not a Google problem | Check pool/group/account key |
 | `503 auth_unavailable` | No accounts loaded | Check `BRIDGE_HOME`, import an account, `/v1/refresh` |
@@ -402,7 +415,14 @@ Accepted body fields:
 | `thinkingConfig`, `generationConfig.thinkingConfig` | `thinkingLevel` / `thinkingBudget` |
 | `output_config` | `effort` |
 
-Ignored: `temperature`, `top_p`, `max_tokens`, `stop`, and other sampling controls. Do not present them as working output limits.
+Ignored: `temperature`, `top_p`, and `seed` — Gemini Web has no upstream equivalent. Do **not** describe those as working.
+
+Enforced locally by gsb (they are real, not advisory):
+- `max_tokens` / `max_completion_tokens` truncate the answer and set `finish_reason: "length"`.
+- `stop` (string or array) cuts the answer at the first matching sequence.
+- `response_format` `{"type":"json_object"}` or `{"type":"json_schema"}` returns the JSON object without Gemini's ```` ```json ```` fence.
+
+`max_tokens` and `stop` keep incremental streaming: the bridge emits only the prefix still inside the limit, so no bytes reach the client that the final answer would not contain. `response_format` is the exception — a JSON object cannot be unwrapped until it is complete, so that request is delivered once at the end.
 
 Streaming: `chat.completion.chunk` events, final chunk with `finish_reason` and `usage`, then `data: [DONE]`. `: ping` comments every 15 seconds.
 
@@ -422,7 +442,7 @@ Output item types: `reasoning`, `message` with `output_text`, `function_call`, `
 
 Streaming events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.custom_tool_call_input.delta`, `response.custom_tool_call_input.done`, `response.output_item.done`, `response.completed`.
 
-There is **no** `[DONE]` marker; the stream ends with `response.completed`.
+There is **no** `[DONE]` marker. The stream ends with `response.completed`, `response.incomplete` after `max_output_tokens`, or a named `error` event if the request failed after headers were sent.
 
 For multi-turn calls, resend history in `input`. `previous_response_id` is not supported.
 
@@ -489,7 +509,11 @@ Coercion only applies when the raw value fails validation and the coerced value 
 - Repairs JSON string escapes and HTML-sanitized content inside string values.
 - Detects truncated `{"tool_calls":[...` arrays and retries.
 - Extracts valid calls even when preceded by refusal prose.
-- Retries when the model refuses a required tool turn or invents a tool-budget limit.
+- Retries when the model refuses a required tool turn or invents a tool-budget limit. Detection runs on the opening of the reply (first 2000 bytes, whitespace-collapsed so a phrase wrapped across lines still matches) and combines two mechanisms:
+  - Named phrase patterns in `toolProtocolRefusalPatterns` for the wordings seen in the field: hallucinated budget/quota in English and Indonesian (`tool-call budget`, `kuota pemanggilan tool sudah habis`, `Eksekusi tool sedang tidak tersedia di turn ini`), a claim that the tool surface is off for this turn, a claim that the protocol cannot be invoked, and labelling the `tool_calls` format as prompt injection.
+  - A structural rule (`zeroQuotaRefusal`) that catches wordings the phrase list missed. It fires when one sentence contains a standalone zero **and** a tool word **and** an availability word. This exists because enumerating phrases did not converge: the same question produced `0 tool calls tersisa`, then `calls remaining: **0**`, then `There are **0** built-in tool and search calls remaining`, and each new wording shipped a refusal as the final answer.
+  - Prose that merely reports a zero result (`returned 0 matches`, `0 errors were found`) has no availability word in that sentence and stays a plain answer.
+  - `TestRefusalPatternNamesHaveCoverage` fails if a phrase pattern is added without a sample that fires, so no entry can be dead code.
 - Keeps raw JSON envelopes out of plain answer text.
 - Does not mark an account `degraded` for client/schema `tool_call_error`.
 
@@ -555,7 +579,7 @@ MIME type is detected from magic bytes, not trusted from the URL.
 
 ### 11.3 Media URLs
 
-Generated media is served at `GET /v1/media/<id>`. The proxy URL is built from the request's `Host` (or `X-Forwarded-Host`) and scheme (or `X-Forwarded-Proto`), so a client connecting through a reverse proxy receives a URL it can reach. The endpoint is unauthenticated because upstream URLs require Google cookies. Media is cached in memory (max 96 entries), so URLs die on restart or eviction.
+Generated media is served at `GET /v1/media/<id>` from a bounded, in-memory cache. URLs use the request's `Host` and connection scheme, not untrusted forwarding headers. The endpoint is unauthenticated; share media URLs only with intended recipients.
 
 Full-resolution images use `=s0-d`; lossless PNG uses `=s0-rp`. Both HTTP redirects and application-level `text/plain` URL redirects are followed. `revised_prompt` comes from Gemini Web's internal `modelDescription` when available.
 
@@ -682,7 +706,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 
 - Accounts tab: pool/per-account keys, quota bars, filters, priority `↑`/`↓`, `⋯` menu (Refresh, Pause/Resume, Unquarantine/Reset failures, Copy Key, Remove), Refresh All.
 - Add Account: Incognito cookie paste plus an isolated-browser launcher (with local helper fallback). Account name, proxy, and group are collapsed under **Optional settings**.
-- Runtime configuration: strategy, quota preflight, priority, default thinking, RPM, concurrency, downgrade rejection, live thoughts, live tool calls, tool preamble, history offload. Apply in memory or persist to `config.env`.
+- Runtime configuration: strategy, quota preflight, priority, default thinking, RPM, concurrency, downgrade rejection, label-mismatch rejection, live thoughts, live tool calls, tool preamble, history offload. Apply in memory or persist to `config.env`.
 
 ### 14.4 Admin API
 
@@ -701,7 +725,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 
 Runtime fields editable through `PATCH`:
 
-`defaultThinking`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
+`defaultThinking`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `rejectLabelMismatch`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
 
 Everything else is environment-only.
 
@@ -773,7 +797,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | `0` disables |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | `0` disables |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject silent substitution |
-| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included. Router tiers such as `gemini-auto` are never rejected: they label the answer with whichever backing model they chose |
+| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included. The relabel is detected on the first frame that carries the label, so a pool request fails over instead of waiting out the whole generation and returning `502`. Router tiers such as `gemini-auto` are never rejected: they label the answer with whichever backing model they chose |
 | `BRIDGE_QUIET_HOURS` | empty | `HH:MM-HH:MM`; pauses background work only |
 
 ### 15.6 Generation, history, tools
@@ -806,8 +830,9 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | First byte |
-| `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames |
+| `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Deadline for upstream HTTP response headers |
+| `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Between frames (keepalive envelopes do not count as a frame) |
+| `BRIDGE_NO_FRAME_TIMEOUT_MS` | `75000` | First candidate frame deadline; fires `upstream_stalled` and fails over. When unset, `low`-effort requests are capped at `30s` for `hydrogen`/`flash`/`lite`/`adapts`/`auto` models and `45s` for other models |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Whole request |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Rotation interval (60s–3600s) |
 | `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh |
@@ -821,6 +846,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|
 | `--login <name>` | Isolated browser sign-in |
 | `--login-helper` | Local desktop helper on `127.0.0.1:20134` |
+| `--desktop-ui` | Desktop control plane on `127.0.0.1:20133` using the private SSH socket from README §6.4 |
 | `--import-chrome <name>` | Import from browser profile |
 | `--import-cookie <name>` | Import raw cookie payload |
 | `--chrome-profile <v>` | Profile name/dir/DB |
@@ -892,10 +918,12 @@ Only one daemon may hold a `BRIDGE_HOME` lock. `--probe` proceeds without it; `-
 ### 18.2 Remote VPS with SSH tunnel
 
 ```sh
-ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps
+ssh -L 20133:127.0.0.1:20133 user@vps
 gsb --web
 gsb --login-helper   # on the laptop, optional
 ```
+
+For desktop browser sign-in without a manual helper token, follow README §6.4 and open `http://127.0.0.1:20133/ui`.
 
 ### 18.3 Docker
 
@@ -961,6 +989,17 @@ Build or download the new binary, replace `gsb`, restart the service. The data d
 8. Is the client reading SSE correctly? (Errors can arrive after HTTP 200.)
 9. Is a proxy or tunnel in the path? Is `127.0.0.1` the right host from that process?
 10. Is the client timeout shorter than the model's real latency?
+
+### 19.1a When carbon on `high` stalls repeatedly
+
+`gemini-4-carbon` with `reasoning_effort: high` and a large prompt is the one workload that trips `upstream_stalled` in practice. A measured sample over 24 hours: 40 successes out of 111 attempts, with failures clustering at exactly the no-frame deadline and producing no candidate frame at all.
+
+Two things that do **not** work, each measured:
+
+- **Raising `BRIDGE_NO_FRAME_TIMEOUT_MS`.** At 150000 ms the same request went from stalling at 75 s to stalling at 150 s, six times out of six. The stream is silent, not slow; the larger number only moves the wall.
+- **Blaming the queue.** A captured frame for this workload is `[["wrb.fr",null,"[{\"37\":[0]}]"]]`: three elements, no `part[5]`, so there is no queue-status block to distinguish it from a dead stream.
+
+What does change the outcome is account selection. Per-account success rates for this workload are not uniform: over seven days the spread ran from 8% on one account to 59% on another, with the weakest account carrying most of the stalls. Retry on another account, or pin the workload to a pool whose accounts are known to serve it, rather than stretching the deadline.
 
 ### 19.2 Symptom → action
 
@@ -1051,6 +1090,6 @@ Cutting it short still spends the quota.
 ### 20.7 "Image generation returns 404 later"
 
 ```text
-Media is cached in memory (max 96 entries) and is not persisted.
-A restart or eviction invalidates the URL; regenerate the media.
+Media lives in memory for up to 24 hours (96 entries, 128 MiB total).
+A restart, expiry, or eviction invalidates the URL; regenerate the media.
 ```

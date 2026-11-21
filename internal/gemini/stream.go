@@ -44,7 +44,17 @@ type StreamOptions struct {
 	ProtocolMode    string // "bridge" | "web"
 	PersonalContext string // "auto" | "off" | "on"
 	FreshSocket     bool
+	// NoFrameTimeout bounds the wait for a candidate with content or a final
+	// status after HTTP 200 headers. New activity can extend the wait; repeated
+	// activity, empty candidates, and keepalive envelopes cannot.
+	NoFrameTimeout time.Duration
 }
+
+// defaultNoFrameTimeout bounds a StreamGenerate that never yields a candidate
+// frame. It is deliberately shorter than the transport stall timeout: a stream
+// answering with keepalive envelopes is not slow, it is dead, and holding the
+// caller until the transport gives up costs the whole request.
+const defaultNoFrameTimeout = 75 * time.Second
 
 // StreamResponse captures the final HTTP status, headers, and conversation state from StreamGenerateLive.
 type StreamResponse struct {
@@ -68,12 +78,7 @@ func (ac *AccountClient) UploadFile(ctx context.Context, data []byte, filename, 
 		return UploadedFile{}, err
 	}
 	var uploaded UploadedFile
-	err = sess.Lease(ctx, func(leasedCookie string) error {
-		if leasedCookie != "" {
-			ac.mu.Lock()
-			ac.cookieHeader = leasedCookie
-			ac.mu.Unlock()
-		}
+	err = sess.Lease(ctx, func(_ string) error {
 		var uErr error
 		uploaded, uErr = ac.uploadFileLocked(ctx, sess.Client, data, filename, contentType)
 		return uErr
@@ -98,6 +103,7 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 	pushID := ac.pushID
 	pctx := ac.pctx
 	cookie := ac.cookieHeader
+	startGen := ac.cookieGen.Load()
 	ac.mu.RUnlock()
 	if pushID == "" {
 		pushID = defaultPushID
@@ -129,7 +135,7 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 		Timeout: 60 * time.Second,
 	})
 	if err == nil {
-		ac.absorbAndPersistCookies(res.SetCookies)
+		ac.absorbAndPersistCookiesWithGen(res.SetCookies, startGen, true)
 		trimmed := strings.TrimSpace(res.Body)
 		if res.Status == 200 && strings.HasPrefix(trimmed, "/") {
 			return UploadedFile{Path: trimmed, Filename: safeName}, nil
@@ -137,6 +143,10 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 	}
 
 	// Fallback path: 2-step Scotrup resumable upload via push.clients6.google.com/upload/
+	ac.mu.RLock()
+	cookie = ac.cookieHeader
+	startGen = ac.cookieGen.Load()
+	ac.mu.RUnlock()
 	initHeaders := map[string]string{
 		"cookie":                              cookie,
 		"origin":                              Origin,
@@ -161,9 +171,13 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 		Timeout: 30 * time.Second,
 	})
 	if initErr == nil {
-		ac.absorbAndPersistCookies(initRes.SetCookies)
+		ac.absorbAndPersistCookiesWithGen(initRes.SetCookies, startGen, true)
 		uploadURL := initRes.Headers["x-goog-upload-url"]
 		if initRes.Status == 200 && uploadURL != "" {
+			ac.mu.RLock()
+			cookie = ac.cookieHeader
+			startGen = ac.cookieGen.Load()
+			ac.mu.RUnlock()
 			putHeaders := map[string]string{
 				"cookie":                cookie,
 				"origin":                Origin,
@@ -187,7 +201,7 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 				Timeout: 60 * time.Second,
 			})
 			if putErr == nil {
-				ac.absorbAndPersistCookies(putRes.SetCookies)
+				ac.absorbAndPersistCookiesWithGen(putRes.SetCookies, startGen, true)
 				trimmed := strings.TrimSpace(putRes.Body)
 				if putRes.Status == 200 && strings.HasPrefix(trimmed, "/") {
 					return UploadedFile{Path: trimmed, Filename: safeName}, nil
@@ -212,6 +226,25 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 		res.Headers,
 		nil,
 	)
+}
+
+// temporaryFlagUsed reports whether BuildInnerRequest sets the temporary
+// conversation flag (inner[45]). Upstream does not persist temporary
+// conversations, so an async media conversation created this way cannot be
+// polled: the stream must retry without the flag. Deriving the answer from the
+// same predicate that builds the request keeps the retry from drifting out of
+// sync with the wire payload.
+func temporaryFlagUsed(opts StreamOptions, prompt string) bool {
+	if !opts.Temporary {
+		return false
+	}
+	if opts.DisableTools {
+		return true
+	}
+	if opts.HasTools {
+		return true
+	}
+	return !PromptRequestsVideo(prompt)
 }
 
 // BuildInnerRequest constructs the 81-slot StreamGenerate inner payload, uuid,
@@ -266,7 +299,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	inner[27] = 1 // return_request_routing_early
 	inner[30] = []int{4}
 	inner[41] = []int{1}
-	if opts.Temporary && (inner[11] != 0 || opts.HasTools || !PromptRequestsVideo(prompt)) {
+	if temporaryFlagUsed(opts, prompt) {
 		inner[45] = 1
 	}
 	inner[53] = 0
@@ -351,8 +384,8 @@ func (ac *AccountClient) streamGenerateLocked(
 
 	innerJSON, uuidVal, modelHeader := ac.BuildInnerRequest(prompt, opts)
 
-	startGen := ac.cookieGen.Load()
 	ac.mu.RLock()
+	startGen := ac.cookieGen.Load()
 	at := ac.at
 	bl := ac.bl
 	fSid := ac.fSid
@@ -360,7 +393,7 @@ func (ac *AccountClient) streamGenerateLocked(
 	defLang := ac.locale
 	authUser := ac.authUser
 	ac.mu.RUnlock()
-	if leasedCookie != "" {
+	if cookie == "" && leasedCookie != "" {
 		cookie = leasedCookie
 	}
 
@@ -401,17 +434,38 @@ func (ac *AccountClient) streamGenerateLocked(
 		headers["x-goog-ext-525001261-jspb"] = modelHeader
 	}
 	var (
-		lineBuf         strings.Builder
-		inOuterArray    bool
-		cid, rid        string
-		asyncVideoCID   string
-		frameCount      int
-		sawDone         bool
-		sawContextToken bool
-		sawStreamEnd    bool
-		grounding       []GroundingSource
+		lineBuf          strings.Builder
+		inOuterArray     bool
+		frameScan        arrayScan
+		cid, rid         string
+		asyncVideoCID    string
+		asyncVideoRefCID string
+		videoToolActive  bool
+		frameCount       int
+		lastActivity     string
+		lastText         string
+		lastThoughts     string
+		lastMediaCount   int
+		sawCandidate     bool
+		sawDone          bool
+		sawContextToken  bool
+		sawStreamEnd     bool
+		stoppedEarly     bool
+		grounding        []GroundingSource
 	)
 
+	// Transport timers see bytes, not content. Bound the wait for the first
+	// meaningful candidate even when upstream keeps sending empty envelopes.
+	//
+	// It is armed from OnHeaders, not before the request: the connect phase has
+	// its own transport deadline, and starting this timer early would report a
+	// slow connect as a frame stall.
+	firstFrameTimeout := opts.NoFrameTimeout
+	if firstFrameTimeout <= 0 {
+		firstFrameTimeout = defaultNoFrameTimeout
+	}
+	noFrameCtx, frameWatch := newPendingFrameWatchdog(ctx)
+	defer frameWatch.Release()
 	emitLine := func(line string) error {
 		parsed, err := ParseFrameLine(line)
 		if err != nil {
@@ -430,12 +484,42 @@ func (ac *AccountClient) streamGenerateLocked(
 		} else {
 			parsed.RID = rid
 		}
-		if parsed.AsyncVideoCID != "" {
-			asyncVideoCID = parsed.AsyncVideoCID
+		// An explicit reference CID wins over the ambient conversation id, and it
+		// must survive the tool signal arriving in a different envelope or in the
+		// other order: remember it until a video tool phase is actually seen.
+		if parsed.AsyncVideoRefCID != "" {
+			asyncVideoRefCID = parsed.AsyncVideoRefCID
 		}
+		videoToolActive = videoToolActive || parsed.VideoToolActive
+		if videoToolActive {
+			asyncVideoCID = asyncVideoRefCID
+			if asyncVideoCID == "" {
+				asyncVideoCID = cid
+			}
+			parsed.AsyncVideoCID = asyncVideoCID
+		}
+		progress := false
 		for _, f := range parsed.Frames {
 			if f.Done {
 				sawDone = true
+			}
+			trimText := strings.TrimSpace(f.Text)
+			trimThoughts := strings.TrimSpace(f.Thoughts)
+			mediaCount := len(f.GeneratedImages) + len(f.GeneratedVideos)
+			if f.Done || trimText != "" || trimThoughts != "" || mediaCount > 0 {
+				sawCandidate = true
+			}
+			if trimText != "" && trimText != lastText {
+				lastText = trimText
+				progress = true
+			}
+			if trimThoughts != "" && trimThoughts != lastThoughts {
+				lastThoughts = trimThoughts
+				progress = true
+			}
+			if mediaCount > lastMediaCount {
+				lastMediaCount = mediaCount
+				progress = true
 			}
 		}
 		if sawDone && parsed.ContextToken != "" {
@@ -444,32 +528,59 @@ func (ac *AccountClient) streamGenerateLocked(
 		if parsed.StreamEnd {
 			sawStreamEnd = true
 		}
+		if sawDone || sawStreamEnd {
+			frameWatch.Disarm()
+		} else if progress {
+			frameWatch.Reset(firstFrameTimeout)
+		} else if activity := strings.TrimSpace(parsed.Activity); activity != "" && activity != lastActivity {
+			lastActivity = activity
+			frameWatch.Reset(firstFrameTimeout)
+		}
 		frameCount += len(parsed.Frames)
 		grounding = MergeGroundingSources(grounding, parsed.GroundingSources)
-		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
+		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.Activity != "" || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
 			return onFrame(parsed)
 		}
 		return nil
 	}
 
-	res, err := sc.Do(ctx, transport.RequestOptions{
+	res, err := sc.Do(noFrameCtx, transport.RequestOptions{
 		Method:      "POST",
 		URL:         Origin + "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?" + q.Encode(),
 		Kind:        transport.ReqKindCORS,
 		Headers:     headers,
 		Body:        []byte(form.Encode()),
 		FreshSocket: opts.FreshSocket,
+		OnHeaders: func(status int) {
+			// Headers are in: the body phase starts now, so the no-frame deadline
+			// covers the body only and cannot race the transport first-byte timer.
+			// A non-200 response has no frame stream to watch; its body is an
+			// error to classify, not work to wait on.
+			if status == 200 {
+				frameWatch.Arm(firstFrameTimeout)
+			}
+		},
 		OnChunk: func(chunk string) error {
 			lineBuf.WriteString(chunk)
-			envelopes, rem, nextInOuter := extractStreamEnvelopes(lineBuf.String(), inOuterArray, false)
+			buf := lineBuf.String()
+			envelopes, rem, nextInOuter := scanStreamEnvelopes(buf, inOuterArray, false, &frameScan)
 			inOuterArray = nextInOuter
-			lineBuf.Reset()
-			lineBuf.WriteString(rem)
+			if len(rem) != len(buf) {
+				lineBuf.Reset()
+				lineBuf.WriteString(rem)
+			}
+			if len(rem) > 16<<20 {
+				return transport.NewUpstreamError("upstream frame exceeds size limit", 502, "upstream_parse_error", nil, nil)
+			}
 			for _, env := range envelopes {
 				if err := emitLine(env); err != nil {
+					if errors.Is(err, transport.ErrStopStreaming) {
+						stoppedEarly = true
+					}
 					return err
 				}
 				if sawStreamEnd || (sawDone && sawContextToken) {
+					stoppedEarly = true
 					return transport.ErrStopStreaming
 				}
 			}
@@ -477,8 +588,25 @@ func (ac *AccountClient) streamGenerateLocked(
 		},
 	})
 	if err != nil {
+		// The watchdog cancels the request context, so the transport reports the
+		// failure as an ordinary cancellation. The expiry flag is what turns it
+		// into a retryable stall instead of a client_cancelled that no failover
+		// path will pick up.
 		var ue *transport.UpstreamError
-		if errors.As(err, &ue) {
+		errors.As(err, &ue)
+		if frameWatch.Expired() && ctx.Err() == nil && ue != nil && ue.Code == "client_cancelled" {
+			if !sawCandidate {
+				return nil, noFrameStallError(firstFrameTimeout, ue.Headers)
+			}
+			return nil, transport.NewUpstreamError(
+				"upstream stream interrupted after receiving frames",
+				502,
+				"incomplete_upstream_response",
+				ue.Headers,
+				err,
+			)
+		}
+		if ue != nil {
 			return nil, ue
 		}
 		return nil, err
@@ -490,28 +618,37 @@ func (ac *AccountClient) streamGenerateLocked(
 			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "account_banned")
 		}
 		if res.Status == 302 || res.Status == 301 || res.Status == 303 || res.Status == 307 || res.Status == 308 {
-			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "auth_redirect")
+			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
 		}
 	}
 
 	if res.Status == 200 {
-		if tail := strings.TrimSpace(lineBuf.String()); tail != "" {
-			envelopes, _, _ := extractStreamEnvelopes(tail, inOuterArray, true)
-			for _, env := range envelopes {
-				if err := emitLine(env); err != nil {
-					var ue *transport.UpstreamError
-					if errors.As(err, &ue) && ue.Headers == nil {
-						ue.Headers = res.Headers
+		if !stoppedEarly {
+			if tail := strings.TrimSpace(lineBuf.String()); tail != "" {
+				envelopes, _, _ := extractStreamEnvelopes(tail, inOuterArray, true)
+				for _, env := range envelopes {
+					if err := emitLine(env); err != nil {
+						var ue *transport.UpstreamError
+						if errors.As(err, &ue) && ue.Headers == nil {
+							ue.Headers = res.Headers
+						}
+						return nil, err
 					}
-					return nil, err
 				}
 			}
 		}
+		// Preserve a valid frame delivered at the deadline, including one in
+		// the final chunk. A caller cancellation must not become a stall.
+		if !sawCandidate && frameWatch.Expired() && ctx.Err() == nil {
+			return nil, noFrameStallError(firstFrameTimeout, res.Headers)
+		}
+		frameWatch.Disarm()
 		if frameCount == 0 && asyncVideoCID != "" {
-			// If Temporary was enabled and inner[45] was 1, Google does not persist the conversation for hNvQHb polling.
-			// Re-run once with Temporary=false and clean up the conversation afterward.
-			usedTemp := opts.Temporary && !PromptRequestsVideo(prompt)
-			if usedTemp {
+			// If the temporary flag was set (inner[45]=1), Google does not persist the
+			// conversation, so hNvQHb polling cannot see it. Re-run once with the flag
+			// off and clean up the conversation afterward. The predicate is the same
+			// one BuildInnerRequest uses, so this decision cannot drift from the wire.
+			if temporaryFlagUsed(opts, prompt) {
 				retryOpts := opts
 				retryOpts.Temporary = false
 				retryRes, retryErr := ac.streamGenerateLocked(ctx, sc, leasedCookie, prompt, retryOpts, onFrame)
@@ -560,6 +697,10 @@ func (ac *AccountClient) streamGenerateLocked(
 // chunk buffer, supporting both single outer array streaming (with no newlines
 // between elements) and newline/length-delimited outer arrays.
 func extractStreamEnvelopes(buf string, inOuter bool, flushTail bool) (envelopes []string, rem string, nextInOuter bool) {
+	return scanStreamEnvelopes(buf, inOuter, flushTail, &arrayScan{})
+}
+
+func scanStreamEnvelopes(buf string, inOuter bool, flushTail bool, scan *arrayScan) (envelopes []string, rem string, nextInOuter bool) {
 	pos := 0
 	n := len(buf)
 	for pos < n {
@@ -641,10 +782,10 @@ func extractStreamEnvelopes(buf string, inOuter bool, flushTail bool) (envelopes
 			continue
 		}
 		if buf[pos] == '[' {
-			end := findBalancedJSONArrayEnd(buf, pos)
-			if end > pos {
-				envelopes = append(envelopes, "["+buf[pos:end]+"]")
-				pos = end
+			end := scan.end(buf[pos:])
+			if end > 0 {
+				envelopes = append(envelopes, "["+buf[pos:pos+end]+"]")
+				pos += end
 				continue
 			}
 			if flushTail {
@@ -669,34 +810,38 @@ func extractStreamEnvelopes(buf string, inOuter bool, flushTail bool) (envelopes
 	return envelopes, "", inOuter
 }
 
-func findBalancedJSONArrayEnd(s string, start int) int {
-	depth := 0
-	inStr := false
-	esc := false
-	for i := start; i < len(s); i++ {
+type arrayScan struct {
+	pos, depth int
+	inStr, esc bool
+}
+
+func (a *arrayScan) end(s string) int {
+	for i := a.pos; i < len(s); i++ {
 		ch := s[i]
-		if inStr {
-			if esc {
-				esc = false
+		if a.inStr {
+			if a.esc {
+				a.esc = false
 			} else if ch == '\\' {
-				esc = true
+				a.esc = true
 			} else if ch == '"' {
-				inStr = false
+				a.inStr = false
 			}
 			continue
 		}
 		switch ch {
 		case '"':
-			inStr = true
+			a.inStr = true
 		case '[':
-			depth++
+			a.depth++
 		case ']':
-			depth--
-			if depth == 0 {
+			a.depth--
+			if a.depth == 0 {
+				*a = arrayScan{}
 				return i + 1
 			}
 		}
 	}
+	a.pos = len(s)
 	return -1
 }
 
@@ -718,23 +863,47 @@ func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, pollCtx.Err()
+			if ctx.Err() != nil {
+				return nil, transport.NewUpstreamError("request cancelled", 499, "client_cancelled", nil, ctx.Err())
+			}
+			return nil, transport.NewUpstreamError("async video generation poll timed out", 504, "upstream_timeout", nil, pollCtx.Err())
 		case <-ticker.C:
+			ac.mu.RLock()
+			liveCookie := ac.cookieHeader
+			startGen := ac.cookieGen.Load()
+			authUser := ac.authUser
+			liveAt, liveBL, liveSID := ac.at, ac.bl, ac.fSid
+			ac.mu.RUnlock()
+			if liveCookie == "" {
+				liveCookie = cookie
+			}
+			if liveAt == "" {
+				liveAt, liveBL, liveSID = at, bl, fSid
+			}
+
+			sourcePath := "/app/" + shortID
+			if authUser > 0 {
+				sourcePath = "/u/" + strconv.Itoa(authUser) + "/app/" + shortID
+			}
+
 			q := url.Values{}
 			q.Set("rpcids", "hNvQHb")
-			q.Set("source-path", "/app/"+shortID)
-			if bl != "" {
-				q.Set("bl", bl)
+			q.Set("source-path", sourcePath)
+			if authUser > 0 {
+				q.Set("authuser", strconv.Itoa(authUser))
 			}
-			if fSid != "" {
-				q.Set("f.sid", fSid)
+			if liveBL != "" {
+				q.Set("bl", liveBL)
+			}
+			if liveSID != "" {
+				q.Set("f.sid", liveSID)
 			}
 			q.Set("hl", lang)
 			q.Set("_reqid", strconv.FormatInt(ac.nextReqID(), 10))
 			q.Set("rt", "c")
 
 			form := url.Values{}
-			form.Set("at", at)
+			form.Set("at", liveAt)
 			form.Set("f.req", string(freqBytes))
 
 			res, err := sc.Do(pollCtx, transport.RequestOptions{
@@ -744,15 +913,28 @@ func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 				Headers: map[string]string{
 					"content-type":  "application/x-www-form-urlencoded;charset=utf-8",
 					"x-same-domain": "1",
-					"cookie":        cookie,
+					"cookie":        liveCookie,
 				},
 				Body:    []byte(form.Encode()),
 				Timeout: 20 * time.Second,
 			})
-			if err != nil || res.Status != 200 {
+			if err != nil {
+				// An auth or rate-limit verdict is not transient: retrying the same
+				// account every 4s for three minutes only delays the failover path that
+				// can rotate the account or report the limit.
+				var ue *transport.UpstreamError
+				if errors.As(err, &ue) && (ue.StatusCode == 401 || ue.StatusCode == 403 || ue.StatusCode == 429) {
+					return nil, ue
+				}
 				continue
 			}
-			ac.absorbAndPersistCookies(res.SetCookies)
+			if res.Status == 401 || res.Status == 403 || res.Status == 429 {
+				return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
+			}
+			if res.Status != 200 {
+				continue
+			}
+			ac.absorbAndPersistCookiesWithGen(res.SetCookies, startGen, true)
 			parsed, parseErr := ParseConversationPollResponse(res.Body)
 			if parseErr != nil {
 				return nil, parseErr
@@ -832,77 +1014,12 @@ func (ac *AccountClient) deleteConversationAsync(cid string) {
 	})
 }
 
-// DownloadMedia downloads a generated image or video URL using the account's
-// authenticated session cookies, falling back to fallbackURL if provided.
-func (ac *AccountClient) DownloadMedia(ctx context.Context, rawURL, fallbackURL string) ([]byte, string, error) {
-	sess, err := ac.acquireSession(ctx)
-	if err != nil {
-		return nil, "", err
-	}
-	ac.mu.RLock()
-	cookie := ac.cookieHeader
-	ac.mu.RUnlock()
-
-	candidates := []string{rawURL}
-	if fallbackURL != "" && fallbackURL != rawURL {
-		candidates = append(candidates, fallbackURL)
-	}
-	var lastStatus int
-	for _, startURL := range candidates {
-		if startURL == "" {
-			continue
-		}
-		curURL := startURL
-		for hop := 0; hop < 10; hop++ {
-			ac.mu.RLock()
-			cookie = ac.cookieHeader
-			ac.mu.RUnlock()
-
-			res, doErr := sess.Client.Do(ctx, transport.RequestOptions{
-				Method: "GET",
-				URL:    curURL,
-				Kind:   transport.ReqKindNavigate,
-				Headers: map[string]string{
-					"cookie":  cookie,
-					"referer": Origin + "/",
-				},
-				Timeout: 60 * time.Second,
-			})
-			if doErr != nil {
-				break
-			}
-			ac.absorbAndPersistCookies(res.SetCookies)
-			lastStatus = res.Status
-			if res.Status == 301 || res.Status == 302 || res.Status == 303 || res.Status == 307 || res.Status == 308 {
-				loc := strings.TrimSpace(res.Headers["location"])
-				if loc == "" {
-					break
-				}
-				if strings.HasPrefix(loc, "/") {
-					if parsedBase, err := url.Parse(curURL); err == nil {
-						loc = parsedBase.Scheme + "://" + parsedBase.Host + loc
-					}
-				}
-				curURL = loc
-				continue
-			}
-			if res.Status == 200 && len(res.Body) > 0 {
-				ct := strings.ToLower(strings.TrimSpace(res.Headers["content-type"]))
-				if strings.HasPrefix(ct, "text/plain") {
-					bodyStr := strings.TrimSpace(res.Body)
-					if strings.HasPrefix(bodyStr, "https://") || strings.HasPrefix(bodyStr, "http://") {
-						curURL = bodyStr
-						continue
-					}
-				}
-				origCT := res.Headers["content-type"]
-				if origCT == "" {
-					origCT = "application/octet-stream"
-				}
-				return []byte(res.Body), origCT, nil
-			}
-			break
-		}
-	}
-	return nil, "", fmt.Errorf("media download failed (HTTP %d)", lastStatus)
+func noFrameStallError(timeout time.Duration, headers map[string]string) error {
+	return transport.NewUpstreamError(
+		fmt.Sprintf("upstream sent no candidate content or new activity for %s", timeout),
+		504,
+		"upstream_stalled",
+		headers,
+		nil,
+	)
 }

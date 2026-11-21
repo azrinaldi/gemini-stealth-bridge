@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
@@ -109,9 +110,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	hasher := prep.hasher
 	cacheKey := prep.cacheKey
 	cacheUsed := cacheKey != ""
+	cfg := s.cfgSnapshot()
 	cmplID := "chatcmpl-" + randomHex(8)
 	created := time.Now().Unix()
-	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
+	eagerStream := strings.EqualFold(cfg.StreamBufferMode, "eager")
+
+	type streamTarget struct{ accountID, modelName string }
+	var activeTarget atomic.Pointer[streamTarget]
+	activeTarget.Store(&streamTarget{account.ID, mid})
 
 	headersSent := false
 	// handlerDone is set before the handler returns. Keepalive and early-SSE
@@ -148,14 +154,43 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	}
 	// assignAccount counts an account switch only when failover moves the request
 	// to a different account. Same-account retries leave the counter untouched.
-	assignAccount := func(next *AccountState) {
+	assignAccount := func(next *AccountState, nextModel *gemini.ModelInfo) {
 		if next != nil && next != account {
 			accountSwitches.Add(1)
 		}
-		account = next
+		account, model, opts.Model = next, nextModel, nextModel
+		mid = nextModel.ModelName
+		activeTarget.Store(&streamTarget{next.ID, mid})
 	}
 
 	var writeBuf []byte
+	emitLocked := func(delta any, finish any, usage map[string]any) {
+		if handlerDone.Load() {
+			return
+		}
+		chunk := sseChatChunk{
+			ID:      cmplID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   activeTarget.Load().modelName,
+			Choices: [1]sseChatChoice{
+				{
+					Index:        0,
+					Delta:        delta,
+					FinishReason: finish,
+				},
+			},
+			Usage: usage,
+		}
+		b, _ := json.Marshal(&chunk)
+		writeBuf = append(writeBuf[:0], "data: "...)
+		writeBuf = append(writeBuf, b...)
+		writeBuf = append(writeBuf, "\n\n"...)
+		_, _ = w.Write(writeBuf)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 	emit := func(delta any, finish any, usage map[string]any) {
 		if ctx.Err() != nil {
 			return
@@ -179,46 +214,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 		streamMu.Lock()
 		defer streamMu.Unlock()
-		if handlerDone.Load() {
-			return
-		}
-		chunk := sseChatChunk{
-			ID:      cmplID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   mid,
-			Choices: [1]sseChatChoice{
-				{
-					Index:        0,
-					Delta:        delta,
-					FinishReason: finish,
-				},
-			},
-			Usage: usage,
-		}
-		b, _ := json.Marshal(&chunk)
-		writeBuf = append(writeBuf[:0], "data: "...)
-		writeBuf = append(writeBuf, b...)
-		writeBuf = append(writeBuf, "\n\n"...)
-		_, _ = w.Write(writeBuf)
-		if flusher != nil {
-			flusher.Flush()
-		}
+		emitLocked(delta, finish, usage)
 	}
-
-	var pinger *streamPinger
-	var pingerMu sync.Mutex
-	stopKeepalive := func() {
-		pingerMu.Lock()
-		p := pinger
-		pinger = nil
-		pingerMu.Unlock()
-		p.Stop()
-	}
-	defer stopKeepalive()
-	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
-	// handlerDone and exits instead of writing after the handler returns.
-	defer handlerDone.Store(true)
 
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
@@ -226,13 +223,39 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	var streamStartedOnce sync.Once
 	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
 
+	var graceWG sync.WaitGroup
+	stopGrace := func() {
+		markStreamStarted()
+		graceWG.Wait()
+	}
+
+	var pinger *streamPinger
+	var pingerMu sync.Mutex
+	keepaliveStopped := false
+	stopKeepalive := func() {
+		pingerMu.Lock()
+		keepaliveStopped = true
+		p := pinger
+		pinger = nil
+		pingerMu.Unlock()
+		p.Stop()
+	}
+	defer func() {
+		streamMu.Lock()
+		handlerDone.Store(true)
+		streamMu.Unlock()
+		stopGrace()
+		stopKeepalive()
+	}()
+
 	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
 		if headersSent || ctx.Err() != nil || handlerDone.Load() {
 			streamMu.Unlock()
 			return
 		}
-		setGSBHeaders(w, false, account.ID, mid, attempt, upstreamStatus, retryReason)
+		target := activeTarget.Load()
+		setGSBHeaders(w, false, target.accountID, target.modelName, attempt, upstreamStatus, retryReason)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -243,20 +266,16 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		// early flush or first meaningful delta.
 		markPhase(&headerMs)
 		_, _ = io.WriteString(w, ": ping\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
+		emitLocked(map[string]any{"role": "assistant", "content": ""}, nil, nil)
 		streamMu.Unlock()
 
 		pingerMu.Lock()
-		if pinger == nil && !handlerDone.Load() {
+		if pinger == nil && !keepaliveStopped && !handlerDone.Load() {
 			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, func() {
 				emit(map[string]any{"role": "assistant"}, nil, nil)
 			})
 		}
 		pingerMu.Unlock()
-
-		emit(map[string]any{"role": "assistant", "content": ""}, nil, nil)
 	}
 
 	// startStream reads the caller-owned attempt diagnostics, so it must only be
@@ -265,9 +284,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
 	}
 
-	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
+	if stream && cfg.EarlySSE && (eagerStream || !cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+	} else if stream && cfg.EarlySSEGrace > 0 {
 		// Buffered mode normally holds the response headers until the first frame
 		// so a detected model downgrade can still become an HTTP error. That only
 		// works while the upstream answers inside the proxy's response-header
@@ -278,8 +297,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		// check is strictly stronger than the status-line one, because a
 		// downgrade detected there still stops the stream and the client sees the
 		// mismatch in the frames.
+		graceDur := cfg.EarlySSEGrace
+		graceWG.Add(1)
 		go func() {
-			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
+			defer graceWG.Done()
+			timer := time.NewTimer(graceDur)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
@@ -297,33 +319,46 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	originGroup := account.AccountGroup
 	account.mu.RUnlock()
 
-	maxAttempts := s.Cfg.MaxAttempts
+	maxAttempts := cfg.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	maxUpstream := s.Cfg.MaxUpstreamAttempts
+	maxUpstream := cfg.MaxUpstreamAttempts
 	if maxUpstream < 1 {
 		maxUpstream = maxAttempts
 	}
 	upstreamCalls := 0
 	var retryDeadline time.Time
-	if s.Cfg.RetryBudget > 0 {
-		retryDeadline = reqStartedAt.Add(s.Cfg.RetryBudget)
+	if cfg.RetryBudget > 0 {
+		retryDeadline = reqStartedAt.Add(cfg.RetryBudget)
 	}
 
 	triedAccounts := map[string]bool{account.ID: true}
+	var stallTracker requestStallTracker
+	errorReplyRetried := false
 	freshSocketNext := false
 	rebootstrapNext := false
 	priorAttemptSentThought := false
 	serverMediaRounds := 0
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
+		var limitFinish string
+		// limitReached stops incremental emission once the client's budget or a
+		// stop sequence has fired. Continuing to watch the upstream answer after
+		// that point would compare frames against text the client never got and
+		// could surface a spurious revision error instead of the real verdict.
+		var limitReached bool
+		// limitedText is the answer frozen at the moment a limit fired. Later
+		// upstream frames are revisions of text the client never received, so the
+		// committed answer must be this snapshot, not the final frame.
+		var limitedText string
 		var (
 			candidateID           string
 			selected              bool
 			done                  bool
 			text, thoughts        string
 			sentText, sentThought string
+			lastActivity          string
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
@@ -350,23 +385,23 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		lastActiveKeepaliveAt := attemptStartedAt
 		var toolStreamer *toolbridge.LiveToolCallStreamer
 		preambleFlushed := false
-		if stream && buffered && hasTools && s.Cfg.LiveToolCalls {
+		if stream && buffered && hasTools && cfg.LiveToolCalls {
 			toolStreamer = toolbridge.NewLiveToolCallStreamer(toolsRaw, toolChoiceRaw, func(d map[string]any) {
 				startStream(false)
 				if !preambleFlushed {
 					preambleFlushed = true
 					if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
-						if s.Cfg.KeepToolPreamble {
+						if cfg.KeepToolPreamble {
 							if tail, ok := remainingStreamTail(pre, sentText); ok && tail != "" {
 								emit(sseDeltaContent{Content: tail}, nil, nil)
 								sentText = pre
 							}
-						} else if s.Cfg.LiveThoughts {
+						} else if cfg.LiveThoughts {
 							thoughts = appendPreambleToThoughts(thoughts, pre)
 						}
 					}
 				}
-				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+				if cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 					sentThought = thoughts
 				}
@@ -393,13 +428,15 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 		var upstream *gemini.StreamResponse
 		var streamErr error
+		var releaseStream func()
 		if uploadErr != nil {
 			streamErr = uploadErr
 		} else {
+			releaseStream, streamErr = s.beginAuxStream(account)
+		}
+		if streamErr == nil {
 			upstreamCalls++
-			account.mu.Lock()
-			account.activeStreams++
-			account.mu.Unlock()
+			// Capacity and operator state are checked again at dispatch.
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
@@ -415,11 +452,22 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
-				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+				earlyMismatch := shouldAbortForModelRejection(cfg, mediaToolUsed, *model, servedID, servedLabel)
+				identityVerifiedNow := canStreamVerifiedWithConfig(cfg, eagerStream, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
+				}
+				if stream && cfg.LiveThoughts && ctx.Err() == nil && !identityConflict && !priorAttemptSentThought {
+					if activity := strings.TrimSpace(toolbridge.StripToolGuard(update.Activity)); activity != "" && activity != lastActivity {
+						startStream(false)
+						prefix := ""
+						if sentThought != "" {
+							prefix = "\n\n"
+						}
+						emit(sseDeltaReasoning{ReasoningContent: prefix + activity + "\n\n"}, nil, nil)
+						lastActivity = activity
+					}
 				}
 				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
 					startStream(false)
@@ -470,38 +518,65 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 					thoughts = toolbridge.StripToolGuard(mergeStreamedThoughts(thoughts, frame.Thoughts))
-					done = frame.Done
-					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+					done = done || frame.Done
+					frameMismatch := shouldAbortForModelRejection(cfg, mediaToolUsed, *model, servedID, servedLabel)
 					attemptStateMu.Unlock()
 					if frameMismatch {
 						return transport.ErrStopStreaming
 					}
-					if stream && !buffered && ctx.Err() == nil {
-						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
+					// Intermediate thoughts are progress, not a verified answer. Hold
+					// final-frame-only thoughts until the attempt passes validation.
+					if stream && cfg.LiveThoughts && ctx.Err() == nil && !done && !limitReached && !identityConflict && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+						startStream(false)
+						emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
+						sentThought = thoughts
+						lastActiveKeepaliveAt = time.Now()
+					}
+					if stream && !buffered && !limitReached && prep.limits.streamable() && ctx.Err() == nil {
+						clean := toolbridge.StripToolGuard(text)
+						if !hasCompatibleStreamPrefix(clean, sentText) || (cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
-						if len(text) > len(sentText) || (s.Cfg.LiveThoughts && len(thoughts) > len(sentThought)) {
+						if hasTools && sentText == "" {
+							if toolbridge.IsToolProtocolRefusal(clean) {
+								return transport.NewUpstreamError(toolbridge.RefusalErrorText+" (hallucinated tool limit or refusal)", 502, "tool_call_error", nil, nil)
+							}
+							if len(clean) <= toolbridge.RefusalWindowBytes {
+								return nil
+							}
+						}
+						if done && sentText == "" && gemini.GeminiErrorReply(clean) != "" {
+							return nil
+						}
+						if len(clean) > len(sentText) && gemini.GeminiErrorReply(clean) == "" {
 							startStream(false)
-							if len(text) > len(sentText) {
-								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
-								sentText = text
+							visibleText := clean
+							if !hasTools {
+								var limitHit string
+								visibleText, limitHit = prep.limits.visibleAfter(clean, len(sentText))
+								if limitHit != "" {
+									limitFinish = limitHit
+									limitReached = true
+									limitedText = visibleText
+								}
 							}
-							if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) {
-								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-								sentThought = thoughts
+							if tail, ok := remainingStreamTail(visibleText, sentText); ok && tail != "" {
+								emit(sseDeltaContent{Content: tail}, nil, nil)
+								sentText = visibleText
 							}
 						}
-					} else if stream && buffered && ctx.Err() == nil && !done {
-						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
+					} else if stream && buffered && !limitReached && ctx.Err() == nil && !done {
+						clean := toolbridge.StripToolGuard(text)
+						if sentText != "" && !hasCompatibleStreamPrefix(clean, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
-						// Hold all model output until the requested identity is verified.
-						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
+						// Hold answer text and tool calls until model identity is verified.
+						identityVerified := canStreamVerifiedWithConfig(cfg, eagerStream, identityConflict, *model, servedID, servedLabel)
 						if identityVerified {
 							startStream(false)
 						}
-						if identityVerified && s.Cfg.LiveThoughts {
-							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
+						if identityVerified && cfg.LiveThoughts {
+							if hasTools && !cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
 								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
 									thoughts = appendPreambleToThoughts(thoughts, pre)
 								}
@@ -524,19 +599,34 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								return err
 							}
 						}
-						canStreamText := identityVerified
+						canStreamText := identityVerified && prep.limits.streamable()
 						if canStreamText {
-							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								startStream(false)
-								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
-								sentText = text
-								lastActiveKeepaliveAt = time.Now()
-						} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
-									startStream(false)
-									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
-									sentText = safePrefix
-									lastActiveKeepaliveAt = time.Now()
+							if hasTools && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) && toolbridge.IsToolProtocolRefusal(clean) {
+								return transport.NewUpstreamError(toolbridge.RefusalErrorText+" (hallucinated tool limit or refusal)", 502, "tool_call_error", nil, nil)
+							}
+							if !hasTools {
+								visibleText, limitHit := prep.limits.visibleAfter(clean, len(sentText))
+								if limitHit != "" {
+									limitFinish = limitHit
+									limitReached = true
+									limitedText = visibleText
+								}
+								if len(visibleText) > 240 && gemini.GeminiErrorReply(clean) == "" {
+									if tail, ok := remainingStreamTail(visibleText, sentText); ok && tail != "" {
+										startStream(false)
+										emit(sseDeltaContent{Content: tail}, nil, nil)
+										sentText = visibleText
+										lastActiveKeepaliveAt = time.Now()
+									}
+								}
+							} else if !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(clean) > 240 && gemini.GeminiErrorReply(clean) == "" && !toolbridge.IsToolProtocolRefusal(clean) {
+								if safePrefix := toolbridge.SafeStreamablePrefix(clean); len(safePrefix) > len(sentText) {
+									if tail, ok := remainingStreamTail(safePrefix, sentText); ok && tail != "" {
+										startStream(false)
+										emit(sseDeltaContent{Content: tail}, nil, nil)
+										sentText = safePrefix
+										lastActiveKeepaliveAt = time.Now()
+									}
 								}
 							}
 						}
@@ -544,11 +634,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				return nil
 			})
-			account.mu.Lock()
-			if account.activeStreams > 0 {
-				account.activeStreams--
-			}
-			account.mu.Unlock()
+			releaseStream()
 		}
 		if upstream != nil && upstream.Status > 0 {
 			lastUpstreamStatus = upstream.Status
@@ -557,8 +643,23 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
+		// Once a limit has fired, the committed answer is the snapshot the client
+		// already received. Comparing the final upstream frame against it would
+		// report a revision for text the client was never sent.
+		rawText := text
+		evalText, evalSent := text, sentText
+		if limitReached && !hasTools {
+			evalText = limitedText
+			if sentText != "" {
+				evalSent = limitedText
+			}
+			if evalText == "" && rawText != "" {
+				evalText = " "
+			}
+		}
 		interpreted, runCheck := s.evaluateAttemptCompletion(
 			ctx,
+			cfg,
 			account,
 			*model,
 			mid,
@@ -566,8 +667,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			streamErr,
 			selected,
 			done,
-			text,
-			sentText,
+			evalText,
+			evalSent,
 			servedID,
 			servedLabel,
 			identityConflict,
@@ -588,15 +689,21 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					lastUpstreamStatus = errStatus
 				}
 			}
-			if errCode == "account_banned" {
+			if uploadErr == nil && releaseStream == nil {
+				// A local reservation rejection is not an upstream account failure.
+			} else if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
+			} else if stallTracker.recordError(s, account, errCode, runCheck.Error()) {
+				if !stallTracker.poisoned {
+					s.refreshQuotaAsync(account, c)
+				}
 			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && shouldEvictSessionCacheOnError(errCode, errStatus) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}
@@ -614,18 +721,27 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			inStreamRetryable := (errCode == "tool_call_error" ||
 				errCode == "upstream_error_reply" ||
+				errCode == "upstream_transient" ||
+				errCode == "upstream_degraded" ||
+				(sentThought == "" && (errCode == "upstream_transport_error" ||
+					errCode == "upstream_error" ||
+					errCode == "upstream_http_error" ||
+					errCode == "upstream_upload_error" ||
+					errCode == "upstream_parse_error")) ||
 				errCode == "empty_upstream_response" ||
 				errCode == "incomplete_upstream_response" ||
-				(scope.AccountID == "" && (errCode == "model_substitution" ||
+				errCode == "session_busy" ||
+				errCode == "upstream_auth_error" ||
+				errCode == "auth_redirect" ||
+				(len(opts.Metadata) > 0 && (errCode == "upstream_stalled" || errCode == "upstream_timeout")) ||
+				(scope.AccountID == "" && (errCode == "account_disabled" ||
+					errCode == "model_substitution" ||
+					errCode == "model_label_mismatch" ||
 					errStatus == 429 ||
 					errCode == "rate_limit_error" ||
-					errCode == "session_busy" ||
-					errCode == "upstream_auth_error" ||
-					errCode == "auth_redirect" ||
 					errCode == "upstream_connect_timeout" ||
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" ||
-					errCode == "upstream_degraded" ||
 					errCode == "model_identity_unknown" ||
 					errCode == "model_identity_conflict"))) && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
@@ -633,7 +749,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				(!responseCommitted() || inStreamRetryable) && ctx.Err() == nil &&
 				errCode != "account_banned"
 			if canRetryMore {
-				if sentThought != "" {
+				if sentThought != "" || lastActivity != "" {
 					priorAttemptSentThought = true
 				}
 				if errCode == "session_busy" {
@@ -641,9 +757,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -672,9 +786,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -690,9 +802,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -710,12 +820,21 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" {
 					lastRetryReason = errCode
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+					if !stallTracker.poisoned {
+						if scope.AccountID == "" {
+							if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+								triedAccounts[nextAcct.ID] = true
+								assignAccount(nextAcct, nextModel)
+								opts.Metadata = nil
+								opts.Files = nil
+								curPrompt = fullPrompt
+								attachmentParts = fullAttachmentParts
+								continue
+							}
+						}
+						if len(opts.Metadata) > 0 {
+							// The continuation itself stalled; retry once as a fresh
+							// conversation even on a single or pinned account.
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -724,17 +843,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 				}
-				if errCode == "upstream_degraded" {
-					// Gemini Web failed the turn on its side while the account still
-					// has quota. Prefer a different account; if the request is pinned
-					// or the pool is spent, retry once on a fresh socket.
+				if errCode == "upstream_degraded" || errCode == "upstream_transient" {
+					// Prefer another eligible account for a temporary upstream failure.
+					// Pinned requests retry without crossing their account boundary.
 					lastRetryReason = errCode
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -742,22 +858,35 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							continue
 						}
 					}
-					freshSocketNext = true
-					rebootstrapNext = true
+					freshSocketNext = errCode == "upstream_degraded"
+					rebootstrapNext = freshSocketNext
 					opts.Metadata = nil
 					opts.Files = nil
 					curPrompt = fullPrompt
 					attachmentParts = fullAttachmentParts
 					continue
 				}
-				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
+				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" ||
+					errCode == "model_label_mismatch" {
 					lastRetryReason = errCode
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+				}
+				if errCode == "account_disabled" {
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct, nextModel)
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
@@ -768,9 +897,23 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				if errCode == "upstream_transport_error" ||
 					errCode == "upstream_error" ||
+					errCode == "upstream_http_error" ||
+					errCode == "upstream_upload_error" ||
+					errCode == "upstream_parse_error" ||
 					errCode == "incomplete_upstream_response" ||
 					errCode == "tool_call_error" {
 					lastRetryReason = errCode
+					if errCode != "tool_call_error" && scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct, nextModel)
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
 					if errCode != "tool_call_error" {
 						freshSocketNext = true
 						rebootstrapNext = true
@@ -786,8 +929,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				if errCode == "upstream_error_reply" {
 					// §11.6: Soft block: at most 1 retry on the SAME account without failover or GetQuota
-					if attempt == 0 {
-						lastRetryReason = errCode
+					if !errorReplyRetried {
+						errorReplyRetried = true
 						freshSocketNext = true
 						rebootstrapNext = true
 						opts.Metadata = nil
@@ -801,7 +944,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								StartIndex:      0,
 								MaxPromptChars:  100000,
 								MaxOldToolChars: 12000,
-								AllowOverflow:   s.Cfg.HistoryOffload,
+								AllowOverflow:   cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
 								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
@@ -824,9 +967,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if !wasCachedContinuation && scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
+							assignAccount(nextAcct, nextModel)
 							switched = true
 						}
 					}
@@ -840,8 +981,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 			}
 
+			stopGrace()
 			stopKeepalive()
-			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			streamMu.Lock()
+			sent := headersSent
+			setGSBHeaders(w, sent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			streamMu.Unlock()
 			totalMs := time.Since(reqStartedAt).Milliseconds()
 			s.logRequestJSON(map[string]any{
 				"req_id":             cmplID,
@@ -860,6 +1005,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"error_code":         errCode,
 				"cached_tokens":      0,
 				"attempts":           curAttempt + 1,
+				"retry_reason":       lastRetryReason,
 				"prepare_ms":         prepareMs,
 				"cache_hit":          cacheUsed,
 				"cache_prefix_split": prep.cacheSplit,
@@ -877,7 +1023,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
-				sendChatError(w, headersSent, runCheck)
+				streamMu.Lock()
+				sendChatError(w, sent, runCheck)
+				streamMu.Unlock()
 			}
 			return
 		}
@@ -897,6 +1045,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
+				opts.Files = nil
+				attachmentParts = fullAttachmentParts
+				priorAttemptSentThought = priorAttemptSentThought || sentThought != "" || lastActivity != ""
 				serverMediaRounds++
 				attempt--
 				if upstreamCalls > 0 {
@@ -910,6 +1061,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
+				opts.Files = nil
+				attachmentParts = fullAttachmentParts
+				priorAttemptSentThought = priorAttemptSentThought || sentThought != "" || lastActivity != ""
 				serverMediaRounds++
 				attempt--
 				if upstreamCalls > 0 {
@@ -920,26 +1074,44 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"
+		// Apply the controls Gemini Web cannot express before anything is
+		// emitted, so the client never receives text past its own budget and
+		// finish_reason describes what actually happened.
+		if len(calls) == 0 {
+			if limitReached {
+				// The limit already fired during the stream; keep the answer the
+				// client was promised instead of a later upstream revision of it.
+				text = limitedText
+			} else {
+				text, limitFinish = prep.limits.apply(text)
+			}
+			if prep.limits.wantJSON {
+				text = jsonObjectText(text)
+			}
+			if limitFinish != "" {
+				finish = limitFinish
+			}
+		}
 		var content any = text
 		if textStr, ok := content.(string); ok {
 			content = toolbridge.StripToolGuard(textStr)
 		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
-			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
+			if (cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
 				content = interpreted.Text
 			} else {
-				if s.Cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
+				if cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
 					thoughts = appendPreambleToThoughts(thoughts, interpreted.Text)
 				}
 				content = nil
 			}
 		} else if sentText == "" && thoughts != "" {
-			content = stripLeakedThoughtsFromContent(text, thoughts)
+			content = stripLeakedThoughtsFromContent(toolbridge.StripToolGuard(text), thoughts)
 		}
 		// Web-search citations are appended to the answer so the client sees the
 		// sources the model actually used, in the order Google returned them.
-		if s.Cfg.IncludeGrounding && len(grounding) > 0 {
+		if cfg.IncludeGrounding && len(grounding) > 0 && len(calls) == 0 && !prep.limits.enabled() {
 			if textStr, ok := content.(string); ok {
 				content = appendGroundingCitations(textStr, grounding)
 			}
@@ -959,6 +1131,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 		usage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
 		s.clearModelExhausted(account, model.ModelName)
+		stopGrace()
 		stopKeepalive()
 		if ctx.Err() != nil {
 			return
@@ -968,7 +1141,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			if stream && buffered {
 				startStream(false)
 				if toolStreamer == nil || !toolStreamer.SentAny() {
-					if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+					if cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 						emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 						sentThought = thoughts
 					}
@@ -984,7 +1157,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					oaCalls, finalizeErr = toolStreamer.FinalizeError(calls, text)
 					if finalizeErr != nil {
 						if ctx.Err() == nil {
+							streamMu.Lock()
 							sendChatError(w, headersSent, finalizeErr)
+							streamMu.Unlock()
 						}
 						return
 					}
@@ -997,6 +1172,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			} else {
 				oaCalls = toolbridge.ToOpenAIToolCalls(calls)
 			}
+		} else if stream && buffered && toolStreamer != nil && toolStreamer.SentAny() {
+			revErr := transport.NewUpstreamError("upstream revised an already streamed tool call into prose", 502, "upstream_revision", nil, nil)
+			if ctx.Err() == nil {
+				streamMu.Lock()
+				sendChatError(w, headersSent, revErr)
+				streamMu.Unlock()
+			}
+			return
 		}
 
 		if !opts.Temporary {
@@ -1005,10 +1188,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 		if stream {
 			startStream(false)
-			if buffered && len(calls) == 0 {
-				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) {
-					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-					sentThought = thoughts
+			if len(calls) == 0 && cfg.LiveThoughts && !priorAttemptSentThought {
+				if tail, ok := remainingStreamTail(thoughts, sentThought); ok && tail != "" {
+					emit(sseDeltaReasoning{ReasoningContent: tail}, nil, nil)
 				}
 			}
 			if len(calls) == 0 {
@@ -1027,9 +1209,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			emit(sseDeltaEmpty{}, finish, usage)
 			streamMu.Lock()
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-			if flusher != nil {
-				flusher.Flush()
+			if !handlerDone.Load() {
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
 			streamMu.Unlock()
 		} else {
@@ -1037,7 +1221,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"role":    "assistant",
 				"content": content,
 			}
-			if s.Cfg.LiveThoughts && thoughts != "" {
+			if cfg.LiveThoughts && thoughts != "" {
 				msgObj["reasoning_content"] = toolbridge.StripToolGuard(thoughts)
 			}
 			if len(oaCalls) > 0 {
@@ -1088,6 +1272,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"error_code":         "",
 			"cached_tokens":      cachedTok,
 			"attempts":           curAttempt + 1,
+			"retry_reason":       lastRetryReason,
 			"prepare_ms":         prepareMs,
 			"cache_hit":          cacheUsed,
 			"cache_prefix_split": prep.cacheSplit,
@@ -1107,6 +1292,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 		account.mu.Lock()
 		account.Fails = 0
+		account.LastFail = time.Time{}
+		account.LastError = ""
+		account.ModelsError = nil
 		account.LastUsed = s.now()
 		account.mu.Unlock()
 		s.refreshQuotaAsync(account, c)
@@ -1116,6 +1304,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 func (s *Server) evaluateAttemptCompletion(
 	ctx context.Context,
+	cfg config.Config,
 	account *AccountState,
 	model gemini.ModelInfo,
 	mid string,
@@ -1132,7 +1321,7 @@ func (s *Server) evaluateAttemptCompletion(
 	toolsRaw any,
 	toolChoiceRaw any,
 ) (*toolbridge.InterpretResult, error) {
-	if s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(model, servedID, servedLabel) {
+	if cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(model, servedID, servedLabel) {
 		servedName := servedLabel
 		if servedName == "" {
 			servedName = servedID
@@ -1150,7 +1339,7 @@ func (s *Server) evaluateAttemptCompletion(
 		}
 		return nil, subErr
 	}
-	if s.Cfg.RejectLabelMismatch && gemini.ServedLabelMismatch(model, servedID, servedLabel) {
+	if cfg.RejectLabelMismatch && gemini.ServedLabelMismatch(model, servedID, servedLabel) {
 		// Opt-in strictness: the id named the requested slot, but the label says a
 		// different tier answered. That is only detectable from the label, so a
 		// deployment that needs certainty about the tier must fail here.
@@ -1203,7 +1392,7 @@ func (s *Server) evaluateAttemptCompletion(
 	if identityConflict {
 		return nil, transport.NewUpstreamError("upstream reported conflicting served models", 502, "model_identity_conflict", nil, nil)
 	}
-	if s.Cfg.RejectDowngrade && servedID == "" {
+	if cfg.RejectDowngrade && servedID == "" {
 		return nil, transport.NewUpstreamError("upstream did not identify the served model", 502, "model_identity_unknown", nil, nil)
 	}
 	if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
@@ -1254,7 +1443,7 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	for common < maxCommon && fullTrimLeft[common] == sentTrimLeft[common] {
 		common++
 	}
-	for common > 0 && !utf8.RuneStart(fullTrimLeft[common]) {
+	for common > 0 && common < len(fullTrimLeft) && !utf8.RuneStart(fullTrimLeft[common]) {
 		common--
 	}
 	if common >= 32 {
@@ -1264,6 +1453,9 @@ func remainingStreamTail(full, sent string) (string, bool) {
 				anchor := sentTrimLeft[len(sentTrimLeft)-anchorLen:]
 				if idx := strings.Index(fullTrimLeft[common:], anchor); idx >= 0 {
 					endPos := common + idx + len(anchor)
+					for endPos < len(fullTrimLeft) && !utf8.RuneStart(fullTrimLeft[endPos]) {
+						endPos++
+					}
 					return fullTrimLeft[endPos:], true
 				}
 			}
@@ -1286,14 +1478,24 @@ func hasCompatibleStreamPrefix(full, sent string) bool {
 }
 
 func appendToolErrorCorrection(fullPrompt, errMsg string) string {
-	var note string
-	if strings.Contains(errMsg, toolbridge.ToolProtocolRefusalError) {
-		// The model invented a tool-call budget. A generic schema note does not
-		// address that, so name the invention explicitly and restate availability.
-		note = "[System correction: Tools ARE available and there is NO tool-call or search budget in this session. The previous reply wrongly claimed a tool limit. Disregard any such claim and emit the next ```json {\"tool_calls\":[...]} ``` block now, using only the declared tools and their exact schema.]"
-	} else {
-		note = fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	// A protocol refusal is not a schema mistake, so telling the model to fix its
+	// JSON only makes it repeat the refusal. It has to be told that the premise
+	// it invented is false.
+	if toolbridge.IsRefusalMessage(errMsg) {
+		return appendNoteBeforeAssistant(fullPrompt, refusalCorrectionNote)
 	}
+	note := fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	return appendNoteBeforeAssistant(fullPrompt, note)
+}
+
+// refusalCorrectionNote contradicts the invented limit directly. The model
+// claims a per-turn tool budget that does not exist, so the correction states
+// the real contract instead of asking for better JSON.
+const refusalCorrectionNote = "[System correction: Your previous reply claimed a tool or function-call budget that does not exist. There is no per-turn tool limit, no numeric quota, and no counter to track; tools stay available for every turn of this conversation. Do not mention budgets, quotas, remaining counts, or tool availability. Take the next step now by emitting exactly one ```json {\"tool_calls\":[...]} ``` block that calls the tool the task requires, or, if the task is already complete, state the result in one short paragraph.]"
+
+// appendNoteBeforeAssistant inserts a note immediately before the trailing
+// "Assistant:" cue, so the model reads it as the last thing before answering.
+func appendNoteBeforeAssistant(fullPrompt, note string) string {
 	const suffix = "\n\nAssistant:"
 	if strings.HasSuffix(fullPrompt, suffix) {
 		return fullPrompt[:len(fullPrompt)-len(suffix)] + "\n\n" + note + suffix
@@ -1328,7 +1530,7 @@ func (s *Server) computeChatUsage(
 		if rawFull, _, uErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 			StartIndex:      0,
 			MaxPromptChars:  0,
-			MaxOldToolChars: s.Cfg.MaxOldToolChars,
+			MaxOldToolChars: s.cfgSnapshot().MaxOldToolChars,
 			AllowOverflow:   false,
 		}); uErr == nil {
 			usagePrompt = rawFull
@@ -1408,6 +1610,9 @@ func mergeStreamedThoughts(prev, next string) string {
 		common++
 	}
 	if common >= 32 && common >= len(prev)-16 {
+		for common > 0 && common < len(next) && !utf8.RuneStart(next[common]) {
+			common--
+		}
 		if len(next) > common {
 			return prev + next[common:]
 		}
