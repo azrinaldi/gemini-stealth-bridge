@@ -282,8 +282,8 @@ func TestRollbackPreservesConcurrentFailure(t *testing.T) {
 }
 
 func TestNoFrameTimeoutForAttemptTiering(t *testing.T) {
-	defaultCfg := config.Config{NoFrameTimeout: 75 * time.Second, NoFrameTimeoutExplicit: false}
-	explicitCfg := config.Config{NoFrameTimeout: 75 * time.Second, NoFrameTimeoutExplicit: true}
+	defaultCfg := config.Config{NoFrameTimeout: 180 * time.Second, NoFrameTimeoutExplicit: false}
+	explicitCfg := config.Config{NoFrameTimeout: 180 * time.Second, NoFrameTimeoutExplicit: true}
 	smallCfg := config.Config{NoFrameTimeout: 50 * time.Millisecond, NoFrameTimeoutExplicit: false}
 
 	hydrogen := gemini.ModelInfo{ModelID: "56fdd199312815e2", ModelName: "gemini-4-hydrogen"}
@@ -292,19 +292,19 @@ func TestNoFrameTimeoutForAttemptTiering(t *testing.T) {
 	if got := noFrameTimeoutForAttempt(defaultCfg, hydrogen, "low"); got != 30*time.Second {
 		t.Fatalf("hydrogen low expected 30s, got %v", got)
 	}
-	if got := noFrameTimeoutForAttempt(defaultCfg, hydrogen, "high"); got != 75*time.Second {
-		t.Fatalf("hydrogen high expected 75s, got %v", got)
+	if got := noFrameTimeoutForAttempt(defaultCfg, hydrogen, "high"); got != 180*time.Second {
+		t.Fatalf("hydrogen high expected 180s, got %v", got)
 	}
 	if got := noFrameTimeoutForAttempt(defaultCfg, neon, "low"); got != 45*time.Second {
 		t.Fatalf("neon low expected 45s, got %v", got)
 	}
-	if got := noFrameTimeoutForAttempt(defaultCfg, neon, "medium"); got != 75*time.Second {
-		t.Fatalf("neon medium expected 75s, got %v", got)
+	if got := noFrameTimeoutForAttempt(defaultCfg, neon, "medium"); got != 180*time.Second {
+		t.Fatalf("neon medium expected 180s, got %v", got)
 	}
-	if got := noFrameTimeoutForAttempt(defaultCfg, neon, "high"); got != 75*time.Second {
-		t.Fatalf("neon high expected 75s, got %v", got)
+	if got := noFrameTimeoutForAttempt(defaultCfg, neon, "high"); got != 180*time.Second {
+		t.Fatalf("neon high expected 180s, got %v", got)
 	}
-	if got := noFrameTimeoutForAttempt(explicitCfg, hydrogen, "low"); got != 75*time.Second {
+	if got := noFrameTimeoutForAttempt(explicitCfg, hydrogen, "low"); got != 180*time.Second {
 		t.Fatalf("explicit BRIDGE_NO_FRAME_TIMEOUT_MS must be respected verbatim, got %v", got)
 	}
 	if got := noFrameTimeoutForAttempt(smallCfg, hydrogen, "low"); got != 50*time.Millisecond {

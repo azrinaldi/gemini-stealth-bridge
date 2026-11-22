@@ -54,7 +54,7 @@ type StreamOptions struct {
 // frame. It is deliberately shorter than the transport stall timeout: a stream
 // answering with keepalive envelopes is not slow, it is dead, and holding the
 // caller until the transport gives up costs the whole request.
-const defaultNoFrameTimeout = 75 * time.Second
+const defaultNoFrameTimeout = 180 * time.Second
 
 // StreamResponse captures the final HTTP status, headers, and conversation state from StreamGenerateLive.
 type StreamResponse struct {

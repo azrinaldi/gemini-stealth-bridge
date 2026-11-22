@@ -329,7 +329,7 @@ func FromEnv() *Config {
 		StreamTimeout:           time.Duration(lookupPositiveInt("BRIDGE_STREAM_TIMEOUT_MS", 600000, 1000)) * time.Millisecond,
 		FirstByteTimeout:        time.Duration(lookupPositiveInt("BRIDGE_FIRST_BYTE_TIMEOUT_MS", 60000, 1000)) * time.Millisecond,
 		StallTimeout:            time.Duration(lookupPositiveInt("BRIDGE_STALL_TIMEOUT_MS", 90000, 1000)) * time.Millisecond,
-		NoFrameTimeout:          time.Duration(lookupPositiveInt("BRIDGE_NO_FRAME_TIMEOUT_MS", 75000, 1000)) * time.Millisecond,
+		NoFrameTimeout:          time.Duration(lookupPositiveInt("BRIDGE_NO_FRAME_TIMEOUT_MS", 180000, 1000)) * time.Millisecond,
 		NoFrameTimeoutExplicit:  lookup("BRIDGE_NO_FRAME_TIMEOUT_MS") != "",
 		IdleSessionTimeout:      time.Duration(lookupPositiveInt("BRIDGE_IDLE_SESSION_MS", 180000, 1000)) * time.Millisecond,
 		MaxSessions:             lookupPositiveInt("BRIDGE_MAX_SESSIONS", 16, 1),

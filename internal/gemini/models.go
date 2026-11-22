@@ -68,6 +68,8 @@ var documentedModelLimits = map[string]ModelLimits{
 	// documented limits rather than falling back to the configured guess.
 	"gemini-3.8-flash": {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-4-argon":   {ContextWindow: 1048576, MaxOutput: 65536},
+	// 4 Argon was renamed to 4 Neon ("Deeper analysis") on 2026-11-22.
+	"gemini-4-neon": {ContextWindow: 1048576, MaxOutput: 65536},
 }
 
 // DocumentedModelKeys lists the documented model ids a registry entry could
@@ -241,7 +243,7 @@ var ThinkingLevels = map[string]int{
 // SupportedThinkingEfforts lists the 3 valid thinking effort levels in order.
 var SupportedThinkingEfforts = []string{"low", "medium", "high"}
 
-var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|carbon|hydrogen|flash`)
+var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|neon|carbon|hydrogen|flash`)
 
 var explicitReasoningModels = map[string]bool{
 	"gemini-pro":                true,
@@ -251,6 +253,8 @@ var explicitReasoningModels = map[string]bool{
 	"gemini-4-carbon":           true,
 	"gemini-argon":              true,
 	"gemini-4-argon":            true,
+	"gemini-neon":               true,
+	"gemini-4-neon":             true,
 	"gemini-hydrogen":           true,
 	"gemini-4-hydrogen":         true,
 	"gemini-3-pro":              true,

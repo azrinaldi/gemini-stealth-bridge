@@ -1443,6 +1443,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			setGSBHeaders(w, sent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
 			streamMu.Unlock()
 			totalMs := time.Since(reqStartedAt).Milliseconds()
+			pt := computePerfTelemetry(cacheUsed, prepareMs+uploadMs.Load(), firstUpstreamFrameMs.Load(), ttftMs.Load(), totalMs, upstream, 0)
 			s.logRequestJSON(map[string]any{
 				"req_id":             respID,
 				"endpoint":           "/v1/responses",
@@ -1476,6 +1477,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"served_model":       servedID,
 				"served_label":       servedLabel,
 				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
+				"pre_request_ms":     pt.PreRequestMs,
+				"bootstrap_ms":       pt.BootstrapMs,
+				"upstream_ttfb_ms":   pt.UpstreamTTFBMs,
+				"first_frame_ms":     pt.FirstFrameMs,
+				"bridge_hold_ms":     pt.BridgeHoldMs,
+				"bridge_overhead_ms": pt.BridgeOverheadMs,
+				"gen_window_ms":      pt.GenWindowMs,
+				"frame_count":        pt.FrameCount,
 			})
 			if ctx.Err() == nil {
 				if sent {
