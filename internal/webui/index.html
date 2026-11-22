@@ -961,6 +961,50 @@
       background: var(--active-fg);
     }
 
+    .plan-badge {
+      display: inline-flex;
+      align-items: center;
+      font-family: var(--font-mono);
+      font-size: 0.625rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 1px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+      line-height: 1.35;
+    }
+
+    .plan-pro {
+      background: rgba(96, 165, 250, 0.14);
+      color: #60A5FA;
+      border: 1px solid rgba(96, 165, 250, 0.30);
+    }
+
+    :root[data-theme="light"] .plan-pro {
+      background: rgba(37, 99, 235, 0.10);
+      color: #1D4ED8;
+      border-color: rgba(37, 99, 235, 0.25);
+    }
+
+    .plan-ultra {
+      background: rgba(192, 132, 252, 0.15);
+      color: #C084FC;
+      border: 1px solid rgba(192, 132, 252, 0.32);
+    }
+
+    :root[data-theme="light"] .plan-ultra {
+      background: rgba(147, 51, 234, 0.10);
+      color: #7E22CE;
+      border-color: rgba(147, 51, 234, 0.25);
+    }
+
+    .plan-free {
+      background: var(--surface-subtle);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-strong);
+    }
+
     .acct-sub-line {
       display: flex;
       align-items: center;
@@ -3094,6 +3138,24 @@
         stateEl.hidden = true;
         tableWrap.hidden = false;
 
+        function accountPlanBadgeInfo(acct) {
+          if (!acct) return null;
+          const plan = String(acct.plan || '').toLowerCase();
+          const cap = Number(acct.capacity || 0);
+          const models = Array.isArray(acct.models) ? acct.models : [];
+          const hasProModel = models.some(function (m) { return /carbon|flash-lite/i.test(String(m)); });
+          if (plan === 'ultra' || cap >= 4) {
+            return { label: 'Ultra', cls: 'plan-badge plan-ultra', title: 'Google AI Ultra / Plus plan (capacity ' + (cap || 4) + ')' };
+          }
+          if (plan === 'pro' || cap >= 2 || hasProModel) {
+            return { label: 'Pro', cls: 'plan-badge plan-pro', title: 'Google AI Pro / Gemini Advanced plan (capacity ' + (cap || 2) + ')' };
+          }
+          if (plan === 'free' || cap === 1 || models.length > 0) {
+            return { label: 'Free', cls: 'plan-badge plan-free', title: 'Google Gemini Free plan' };
+          }
+          return null;
+        }
+
         filtered.forEach(function (acct, idx) {
           const fullIdx = allAccountsCache.indexOf(acct);
           const rankIdx = fullIdx >= 0 ? fullIdx : idx;
@@ -3117,6 +3179,15 @@
           idSpan.className = 'acct-id';
           idSpan.textContent = acct.id;
           primaryLine.appendChild(idSpan);
+
+          const planInfo = accountPlanBadgeInfo(acct);
+          if (planInfo) {
+            const planEl = document.createElement('span');
+            planEl.className = planInfo.cls;
+            planEl.title = planInfo.title;
+            planEl.textContent = planInfo.label;
+            primaryLine.appendChild(planEl);
+          }
 
           if (isTurn) {
             const cur = document.createElement('span');

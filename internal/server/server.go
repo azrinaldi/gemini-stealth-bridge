@@ -821,6 +821,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func accountPlanLocked(a *AccountState) string {
+	if a == nil {
+		return ""
+	}
+	if a.Capacity >= 4 {
+		return "ultra"
+	}
+	if a.Capacity >= 2 {
+		return "pro"
+	}
+	for _, m := range a.Models {
+		name := strings.ToLower(m.ModelName)
+		if m.ModelID == "95a4c0abcba24364" || strings.Contains(name, "carbon") || strings.Contains(name, "flash-lite") {
+			return "pro"
+		}
+	}
+	if a.Capacity == 1 || len(a.Models) > 0 {
+		return "free"
+	}
+	return ""
+}
+
 func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any {
 	rpmCutoff := now.Add(-60 * time.Second)
 	a.mu.RLock()
@@ -868,6 +890,7 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 		"status":           status,
 		"statusReason":     statusReason,
 		"capacity":         a.Capacity,
+		"plan":             accountPlanLocked(a),
 		"fails":            a.Fails,
 		"lastError":        lastError,
 		"lastFailAt":       lastFailStr,

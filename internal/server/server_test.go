@@ -2857,3 +2857,35 @@ func TestChatAndResponsesPerfTelemetryHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountPlanDetectionInStatusMapAndUI(t *testing.T) {
+	srv, _ := newTestHarness(false, false)
+	srv.UpdateCfg(func(c *config.Config) { c.WebUI = true })
+	now := time.Now()
+	ultra := &AccountState{ID: "u1", Capacity: 4}
+	proCap := &AccountState{ID: "p1", Capacity: 2}
+	proModel := &AccountState{ID: "p2", Capacity: 1, Models: []gemini.ModelInfo{{ModelID: "95a4c0abcba24364", ModelName: "gemini-4-carbon"}}}
+	freeAcct := &AccountState{ID: "f1", Capacity: 1, Models: []gemini.ModelInfo{{ModelID: "cf41b0e0dd7d53e5", ModelName: "gemini-auto"}}}
+
+	if got := srv.accountStatusMap(ultra, now)["plan"]; got != "ultra" {
+		t.Fatalf("ultra plan = %v, want ultra", got)
+	}
+	if got := srv.accountStatusMap(proCap, now)["plan"]; got != "pro" {
+		t.Fatalf("proCap plan = %v, want pro", got)
+	}
+	if got := srv.accountStatusMap(proModel, now)["plan"]; got != "pro" {
+		t.Fatalf("proModel plan = %v, want pro", got)
+	}
+	if got := srv.accountStatusMap(freeAcct, now)["plan"]; got != "free" {
+		t.Fatalf("freeAcct plan = %v, want free", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/ui", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.Host = "127.0.0.1:20133"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "accountPlanBadgeInfo") {
+		t.Fatalf("expected /ui to include accountPlanBadgeInfo, code=%d", rec.Code)
+	}
+}
