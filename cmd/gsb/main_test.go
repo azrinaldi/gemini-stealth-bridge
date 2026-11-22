@@ -277,3 +277,30 @@ func TestOfflineFallbackModels_VersionedIDsAndBareAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestReadInteractiveCookieInput_SingleLineAndMultilineJSON(t *testing.T) {
+	single := readInteractiveCookieInput(strings.NewReader("Cookie: SAPISID=s1; OSID=o1\n"))
+	if single != "Cookie: SAPISID=s1; OSID=o1" {
+		t.Fatalf("unexpected single-line read: %q", single)
+	}
+
+	multiJSON := "[\n  {\n    \"name\": \"SAPISID\",\n    \"value\": \"sap_ml\",\n    \"domain\": \".google.com\"\n  },\n  {\n    \"name\": \"OSID\",\n    \"value\": \"o_ml\",\n    \"domain\": \"gemini.google.com\"\n  }\n]\n"
+	gotJSON := readInteractiveCookieInput(strings.NewReader(multiJSON))
+	hdrJSON, _, err := cookies.ParseImportPayload(gotJSON)
+	if err != nil {
+		t.Fatalf("ParseImportPayload(multiline JSON) failed: %v", err)
+	}
+	if cookies.ExtractSAPISID(hdrJSON) != "sap_ml" || cookies.ParseHeader(hdrJSON)["OSID"] != "o_ml" {
+		t.Fatalf("unexpected multiline JSON cookies: %q", hdrJSON)
+	}
+
+	netscape := "# Netscape HTTP Cookie File\n.google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsap_ns\n#HttpOnly_gemini.google.com\tFALSE\t/\tTRUE\t0\tOSID\to_ns\n"
+	gotNS := readInteractiveCookieInput(strings.NewReader(netscape))
+	hdrNS, _, err := cookies.ParseImportPayload(gotNS)
+	if err != nil {
+		t.Fatalf("ParseImportPayload(multiline Netscape) failed: %v", err)
+	}
+	if cookies.ExtractSAPISID(hdrNS) != "sap_ns" || cookies.ParseHeader(hdrNS)["OSID"] != "o_ns" {
+		t.Fatalf("unexpected multiline Netscape cookies: %q", hdrNS)
+	}
+}

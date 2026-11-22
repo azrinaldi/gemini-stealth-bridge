@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,14 +60,41 @@ type CredentialFile struct {
 	Surfaces         map[string]string `json:"surfaces,omitempty"`
 }
 
-// ParseHeader splits a Cookie header string into ordered key-value pairs.
+func trimCookieHeaderPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 7 && strings.EqualFold(s[:7], "cookie:") {
+		s = strings.TrimSpace(s[7:])
+	}
+	return s
+}
+
+// ParseHeader splits a Cookie header string (or multi-line HTTP request headers)
+// into key-value pairs.
 func ParseHeader(header string) map[string]string {
+	if strings.ContainsAny(header, "\r\n") {
+		var cookieLines []string
+		for _, line := range strings.Split(strings.ReplaceAll(header, "\r\n", "\n"), "\n") {
+			t := strings.TrimSpace(line)
+			if len(t) >= 7 && strings.EqualFold(t[:7], "cookie:") {
+				if val := strings.TrimSpace(t[7:]); val != "" {
+					cookieLines = append(cookieLines, val)
+				}
+			}
+		}
+		if len(cookieLines) > 0 {
+			header = strings.Join(cookieLines, "; ")
+		}
+	}
+	header = trimCookieHeaderPrefix(header)
 	out := make(map[string]string, len(EssentialNames))
 	for _, part := range strings.Split(header, ";") {
-		part = strings.TrimSpace(part)
+		part = trimCookieHeaderPrefix(part)
 		if i := strings.IndexByte(part, '='); i > 0 {
 			k := strings.TrimSpace(part[:i])
 			v := strings.TrimSpace(part[i+1:])
+			if len(v) >= 2 && strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
+				v = v[1 : len(v)-1]
+			}
 			if k != "" && v != "" {
 				out[k] = v
 			}
@@ -211,8 +239,9 @@ func SAPISIDHash(sapisidOrHeader, origin string) string {
 	return fmt.Sprintf("SAPISIDHASH %d_%s", ts, hex.EncodeToString(sum[:]))
 }
 
-// ParseImportPayload parses either a raw Cookie header string, a browser
-// extension JSON array of cookie objects, or a CredentialFile JSON object.
+// ParseImportPayload parses a raw Cookie header string, F12 cURL command,
+// Netscape cookies.txt / DevTools Application Cookies TSV, browser extension
+// JSON array of cookie objects, or a CredentialFile JSON object.
 func ParseImportPayload(raw string) (header string, cred *CredentialFile, err error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -243,14 +272,230 @@ func ParseImportPayload(raw string) (header string, cred *CredentialFile, err er
 		}
 		return selectBestDomainCookies(list), nil, nil
 	}
+	if curlCookies := extractCurlCookies(trimmed); curlCookies != "" {
+		m := ParseHeader(curlCookies)
+		return CanonicalHeader(m), nil, nil
+	}
+	if tsvList := parseTSVCookies(trimmed); len(tsvList) > 0 {
+		return selectBestDomainCookies(tsvList), nil, nil
+	}
 	m := ParseHeader(trimmed)
 	return CanonicalHeader(m), nil, nil
 }
 
 type domainCookie struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
+	Name           string  `json:"name"`
+	Value          string  `json:"value"`
+	Domain         string  `json:"domain"`
+	Host           string  `json:"host"`
+	URL            string  `json:"url"`
+	Path           string  `json:"path"`
+	ExpirationDate float64 `json:"expirationDate"`
+	Expiry         float64 `json:"expiry"`
+}
+
+func isExpiredEpoch(exp float64, now time.Time) bool {
+	if exp <= 0 {
+		return false
+	}
+	if exp > 1e12 {
+		exp = exp / 1000
+	}
+	return exp < float64(now.Unix())
+}
+
+func resolveCookieDomain(c domainCookie) string {
+	if d := strings.TrimSpace(c.Domain); d != "" {
+		return d
+	}
+	if h := strings.TrimSpace(c.Host); h != "" {
+		return h
+	}
+	if uStr := strings.TrimSpace(c.URL); uStr != "" {
+		if !strings.Contains(uStr, "://") {
+			uStr = "https://" + uStr
+		}
+		if u, err := url.Parse(uStr); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+	}
+	return ""
+}
+
+func tokenizeShellArgs(s string) []string {
+	var args []string
+	var cur strings.Builder
+	inTok := false
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+				continue
+			}
+			if quote == '"' && ch == '\\' && i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+				continue
+			}
+			cur.WriteByte(ch)
+			continue
+		}
+		switch ch {
+		case ' ', '\t', '\r', '\n':
+			if inTok {
+				args = append(args, cur.String())
+				cur.Reset()
+				inTok = false
+			}
+		case '\'', '"':
+			quote = ch
+			inTok = true
+		case '$':
+			if i+1 < len(s) && s[i+1] == '\'' {
+				quote = '\''
+				inTok = true
+				i++
+			} else {
+				cur.WriteByte(ch)
+				inTok = true
+			}
+		case '\\':
+			if i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+				inTok = true
+			}
+		default:
+			cur.WriteByte(ch)
+			inTok = true
+		}
+	}
+	if inTok {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+func extractCurlCookies(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	isCurl := strings.HasPrefix(lower, "curl ") || strings.HasPrefix(lower, "curl\t") ||
+		strings.HasPrefix(lower, "curl\n") || strings.HasPrefix(lower, "curl\r") ||
+		strings.HasPrefix(lower, "curl.exe ")
+	if !isCurl {
+		isCurl = strings.Contains(lower, "-h ") || strings.Contains(lower, "--header ") ||
+			strings.Contains(lower, "-b ") || strings.Contains(lower, "--cookie ")
+	}
+	if !isCurl {
+		return ""
+	}
+	norm := raw
+	norm = strings.ReplaceAll(norm, "\\\r\n", " ")
+	norm = strings.ReplaceAll(norm, "\\\n", " ")
+	norm = strings.ReplaceAll(norm, "^\r\n", " ")
+	norm = strings.ReplaceAll(norm, "^\n", " ")
+	norm = strings.ReplaceAll(norm, "^\"", "\"")
+
+	args := tokenizeShellArgs(norm)
+	var cookies []string
+	appendHeaderIfCookie := func(h string) {
+		t := strings.TrimSpace(h)
+		if len(t) >= 7 && strings.EqualFold(t[:7], "cookie:") {
+			if val := strings.TrimSpace(t[7:]); val != "" {
+				cookies = append(cookies, val)
+			}
+		}
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-H" || a == "--header":
+			if i+1 < len(args) {
+				i++
+				appendHeaderIfCookie(args[i])
+			}
+		case strings.HasPrefix(a, "--header="):
+			appendHeaderIfCookie(strings.TrimPrefix(a, "--header="))
+		case strings.HasPrefix(a, "-H") && len(a) > 2:
+			appendHeaderIfCookie(a[2:])
+		case a == "-b" || a == "--cookie":
+			if i+1 < len(args) {
+				i++
+				if val := strings.TrimSpace(args[i]); val != "" {
+					cookies = append(cookies, val)
+				}
+			}
+		case strings.HasPrefix(a, "--cookie="):
+			if val := strings.TrimSpace(strings.TrimPrefix(a, "--cookie=")); val != "" {
+				cookies = append(cookies, val)
+			}
+		case strings.HasPrefix(a, "-b") && len(a) > 2:
+			if val := strings.TrimSpace(a[2:]); val != "" {
+				cookies = append(cookies, val)
+			}
+		}
+	}
+	return strings.Join(cookies, "; ")
+}
+
+func parseTSVCookies(raw string) []domainCookie {
+	var out []domainCookie
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if len(line) >= 10 && strings.EqualFold(line[:10], "#HttpOnly_") {
+			line = line[10:]
+		} else if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if !strings.Contains(line, "\t") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) >= 7 && essentialSet[strings.TrimSpace(fields[5])] {
+			exp, _ := strconv.ParseFloat(strings.TrimSpace(fields[4]), 64)
+			out = append(out, domainCookie{
+				Name:           strings.TrimSpace(fields[5]),
+				Value:          strings.TrimSpace(fields[6]),
+				Domain:         strings.TrimSpace(fields[0]),
+				Path:           strings.TrimSpace(fields[2]),
+				ExpirationDate: exp,
+			})
+			continue
+		}
+		if len(fields) >= 2 && essentialSet[strings.TrimSpace(fields[0])] {
+			dom := ""
+			if len(fields) >= 3 {
+				dom = strings.TrimSpace(fields[2])
+			}
+			path := ""
+			if len(fields) >= 4 {
+				path = strings.TrimSpace(fields[3])
+			}
+			var exp float64
+			if len(fields) >= 5 {
+				expStr := strings.TrimSpace(fields[4])
+				if expStr != "" && !strings.EqualFold(expStr, "Session") {
+					if t, err := time.Parse(time.RFC3339Nano, expStr); err == nil {
+						exp = float64(t.Unix())
+					} else if t, err := time.Parse(time.RFC3339, expStr); err == nil {
+						exp = float64(t.Unix())
+					}
+				}
+			}
+			out = append(out, domainCookie{
+				Name:           strings.TrimSpace(fields[0]),
+				Value:          strings.TrimSpace(fields[1]),
+				Domain:         dom,
+				Path:           path,
+				ExpirationDate: exp,
+			})
+		}
+	}
+	return out
 }
 
 func selectBestDomainCookies(list []domainCookie) string {
@@ -330,17 +575,37 @@ func hasEssentialCookieUpdate(setCookies []string) bool {
 func selectBestDomainCookieMap(list []domainCookie) (map[string]string, string) {
 	best := make(map[string]string)
 	bestScore := make(map[string]int)
+	bestPathScore := make(map[string]int)
+	now := time.Now()
 	for _, c := range list {
-		if !essentialSet[c.Name] || c.Value == "" {
+		name := strings.TrimSpace(c.Name)
+		val := strings.TrimSpace(c.Value)
+		if !essentialSet[name] || val == "" || strings.EqualFold(val, "deleted") || strings.EqualFold(val, `""`) {
 			continue
 		}
-		s := cookieDomainScore(c.Name, c.Domain)
-		if s == 0 {
+		exp := c.ExpirationDate
+		if exp <= 0 {
+			exp = c.Expiry
+		}
+		if isExpiredEpoch(exp, now) {
 			continue
 		}
-		if s > bestScore[c.Name] {
-			best[c.Name] = c.Value
-			bestScore[c.Name] = s
+		dom := resolveCookieDomain(c)
+		s := 1
+		if dom != "" {
+			s = cookieDomainScore(name, dom)
+			if s == 0 {
+				continue
+			}
+		}
+		ps := 0
+		if p := strings.TrimSpace(c.Path); p == "" || p == "/" {
+			ps = 1
+		}
+		if s > bestScore[name] || (s == bestScore[name] && ps >= bestPathScore[name]) {
+			best[name] = val
+			bestScore[name] = s
+			bestPathScore[name] = ps
 		}
 	}
 	return best, CanonicalHeader(best)

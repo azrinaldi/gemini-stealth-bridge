@@ -343,6 +343,7 @@ func main() {
 		switch mode {
 		case "3papisid_fallback":
 			cList = []cookieEntry{
+				{Name: "SAPISID", Value: "sapisid_ok", Domain: ".google.com"},
 				{Name: "__Secure-3PAPISID", Value: "3papisid_ok", Domain: ".google.com"},
 				{Name: "__Secure-1PSID", Value: "psid_3p", Domain: ".google.com"},
 				{Name: "__Secure-1PSIDTS", Value: "ts_3p", Domain: ".google.com"},

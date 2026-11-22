@@ -867,8 +867,21 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 			if strings.Contains(res.Body, "TOS_VIOLATION") || strings.Contains(res.Body, "PERMISSION_DENIED") {
 				return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", res.Headers, nil)
 			}
+			ac.mu.RLock()
+			curCookie := ac.cookieHeader
+			ac.mu.RUnlock()
+			parsed := cookies.ParseHeader(curCookie)
+			hint := ""
+			switch {
+			case parsed["__Secure-1PSID"] == "" && parsed["HSID"] == "":
+				hint = " (missing HttpOnly session cookies like __Secure-1PSID/HSID/OSID — do not use document.cookie from F12 Console; copy the Cookie header from F12 Network tab or export via Cookie-Editor on https://gemini.google.com/app)"
+			case parsed["OSID"] == "" && parsed["__Secure-OSID"] == "":
+				hint = " (missing gemini.google.com host cookie OSID / __Secure-OSID — export cookies while on https://gemini.google.com/app, not google.com or accounts.google.com)"
+			case parsed["__Secure-1PSIDTS"] == "":
+				hint = " (missing __Secure-1PSIDTS cookie — export all cookies from https://gemini.google.com/app or use gsb --login <name>)"
+			}
 			return transport.NewUpstreamError(
-				"could not extract SNlM0e (at token); the saved session is expired or incomplete — run `gsb --login <name>` to sign in again, then re-import (browser cookie exports copied without signing in usually expire immediately)",
+				"could not extract SNlM0e (at token); the saved session is expired or incomplete — run `gsb --login <name>` to sign in again, then re-import (browser cookie exports copied without signing in usually expire immediately)"+hint,
 				401,
 				"upstream_auth_error",
 				res.Headers,

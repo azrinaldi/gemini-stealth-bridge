@@ -438,13 +438,47 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	openBrowserURL(targetURL, browser, profileDir)
 	fmt.Println("1. Sign in to Google Gemini in an Incognito window (Ctrl+Shift+N) so it does not share a session with your daily Chrome.")
 	fmt.Println("2. Paste the raw Cookie header / Cookie-Editor JSON line and press Enter (then close the Incognito window):")
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	line = strings.TrimSpace(line)
+	line := readInteractiveCookieInput(os.Stdin)
 	if line != "" {
 		return runImportCookie(cfg, acctName, line, "")
 	}
 	return runImportChrome(cfg, acctName, explicitDB)
+}
+
+func readInteractiveCookieInput(r io.Reader) string {
+	br := bufio.NewReader(r)
+	first, err := br.ReadString('\n')
+	trimmed := strings.TrimSpace(first)
+	if trimmed == "" {
+		return ""
+	}
+	var buf strings.Builder
+	buf.WriteString(first)
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		for err == nil && !json.Valid([]byte(strings.TrimSpace(buf.String()))) {
+			next, nextErr := br.ReadString('\n')
+			if next != "" {
+				buf.WriteString(next)
+			}
+			err = nextErr
+		}
+	} else {
+		for err == nil {
+			noNL := strings.TrimRight(buf.String(), "\r\n")
+			if br.Buffered() == 0 && !strings.HasSuffix(noNL, `\`) && !strings.HasSuffix(noNL, `^`) && !strings.HasPrefix(trimmed, "#") {
+				break
+			}
+			next, nextErr := br.ReadString('\n')
+			if next != "" {
+				buf.WriteString(next)
+			}
+			err = nextErr
+			if strings.TrimSpace(next) == "" && br.Buffered() == 0 {
+				break
+			}
+		}
+	}
+	return strings.TrimSpace(buf.String())
 }
 
 const (
