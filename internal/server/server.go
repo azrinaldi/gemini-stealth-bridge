@@ -63,6 +63,7 @@ type AccountState struct {
 	Surfaces         map[string]string
 	NextRotateAt     time.Time
 	NextModelRefAt   time.Time
+	NextPrewarmAt    time.Time
 	QuotaBackoffStep int
 	QuotaNextAllowAt time.Time
 	reqTimestamps    []time.Time
@@ -1290,6 +1291,35 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 			a.NextModelRefAt = next
 			a.mu.Unlock()
 		}
+		a.mu.RLock()
+		disabled := a.Disabled
+		lastErr := a.LastError
+		nextPrewarm := a.NextPrewarmAt
+		modelsReady := !a.ModelsAt.IsZero()
+		rawClient := a.Client
+		a.mu.RUnlock()
+		if !disabled && modelsReady && !looksLikeAuthFailure(lastErr) && !looksLikeAccountBan(lastErr) && (nextPrewarm.IsZero() || !now.Before(nextPrewarm)) {
+			if ac, ok := rawClient.(*gemini.AccountClient); ok && ac.NeedsXSRFPrewarm(0) {
+				busy := false
+				if s.Pool != nil {
+					if sess := s.Pool.Existing(a.ID); sess != nil && sess.Busy() {
+						busy = true
+					}
+				}
+				if !busy {
+					pCtx, pCancel := context.WithTimeout(ctx, 20*time.Second)
+					pErr := ac.PrewarmXSRF(pCtx)
+					pCancel()
+					a.mu.Lock()
+					if pErr == nil {
+						a.NextPrewarmAt = now.Add(14*time.Minute + jitterDuration(15*time.Second, 90*time.Second))
+					} else {
+						a.NextPrewarmAt = now.Add(2 * time.Minute)
+					}
+					a.mu.Unlock()
+				}
+			}
+		}
 	}
 }
 
@@ -1413,6 +1443,93 @@ func setGSBHeaders(w http.ResponseWriter, headersSent bool, acctID, modelName st
 	}
 	if retryReason != "" {
 		w.Header().Set("X-GSB-Retry-Reason", retryReason)
+	}
+}
+
+type perfTelemetry struct {
+	CacheHit           bool
+	PreRequestMs       int64
+	BootstrapMs        int64
+	UpstreamTTFBMs     int64
+	FirstFrameMs       int64
+	BridgeHoldMs       int64
+	BridgeOverheadMs   int64
+	GenWindowMs        int64
+	FrameCount         int
+	OutputTokens       int
+	SustainedTokPerSec float64
+	E2ETokPerSec       float64
+}
+
+func computePerfTelemetry(cacheHit bool, preDispatchMs, firstUpstreamFrameMs, ttftMs, totalMs int64, upstream *gemini.StreamResponse, outputTokens int) perfTelemetry {
+	var bootMs, genWinMs int64
+	upstreamTTFBMs := int64(-1)
+	var frameCount int
+	if upstream != nil {
+		bootMs = upstream.BootstrapMs
+		upstreamTTFBMs = upstream.UpstreamTTFBMs
+		genWinMs = upstream.GenWindowMs
+		frameCount = upstream.FrameCount
+	}
+	preReqMs := preDispatchMs
+	if preReqMs < 0 {
+		preReqMs = 0
+	}
+	preReqMs += bootMs
+	var bridgeHoldMs int64
+	if ttftMs >= 0 && firstUpstreamFrameMs >= 0 && ttftMs > firstUpstreamFrameMs {
+		bridgeHoldMs = ttftMs - firstUpstreamFrameMs
+	}
+	bridgeOverheadMs := preReqMs + bridgeHoldMs
+	var sustainedTPS, e2eTPS float64
+	if outputTokens > 0 {
+		winMs := genWinMs
+		if winMs <= 0 && firstUpstreamFrameMs >= 0 && totalMs > firstUpstreamFrameMs {
+			winMs = totalMs - firstUpstreamFrameMs
+		}
+		if winMs > 0 {
+			sustainedTPS = float64(int64(float64(outputTokens)/(float64(winMs)/1000.0)*10+0.5)) / 10.0
+		}
+		if totalMs > 0 {
+			e2eTPS = float64(int64(float64(outputTokens)/(float64(totalMs)/1000.0)*10+0.5)) / 10.0
+		}
+	}
+	return perfTelemetry{
+		CacheHit:           cacheHit,
+		PreRequestMs:       preReqMs,
+		BootstrapMs:        bootMs,
+		UpstreamTTFBMs:     upstreamTTFBMs,
+		FirstFrameMs:       firstUpstreamFrameMs,
+		BridgeHoldMs:       bridgeHoldMs,
+		BridgeOverheadMs:   bridgeOverheadMs,
+		GenWindowMs:        genWinMs,
+		FrameCount:         frameCount,
+		OutputTokens:       outputTokens,
+		SustainedTokPerSec: sustainedTPS,
+		E2ETokPerSec:       e2eTPS,
+	}
+}
+
+func setGSBPerfHeaders(w http.ResponseWriter, headersSent bool, pt perfTelemetry) {
+	if headersSent || w == nil {
+		return
+	}
+	if pt.CacheHit {
+		w.Header().Set("X-GSB-Cache-Hit", "true")
+	} else {
+		w.Header().Set("X-GSB-Cache-Hit", "false")
+	}
+	if pt.PreRequestMs >= 0 {
+		w.Header().Set("X-GSB-Pre-Request-Ms", strconv.FormatInt(pt.PreRequestMs, 10))
+	}
+	if pt.UpstreamTTFBMs >= 0 {
+		w.Header().Set("X-GSB-Upstream-TTFB-Ms", strconv.FormatInt(pt.UpstreamTTFBMs, 10))
+	}
+	if pt.BridgeOverheadMs >= 0 {
+		w.Header().Set("X-GSB-Bridge-Overhead-Ms", strconv.FormatInt(pt.BridgeOverheadMs, 10))
+	}
+	if pt.SustainedTokPerSec > 0 {
+		w.Header().Set("X-GSB-Sustained-Tok-Per-Sec", strconv.FormatFloat(pt.SustainedTokPerSec, 'f', 1, 64))
 	}
 }
 

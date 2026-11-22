@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -2705,4 +2706,65 @@ func TestPollAsyncVideoGeneration_TimeoutReturns504UpstreamTimeout(t *testing.T)
 			t.Fatalf("expected 504 upstream_timeout, got %+v (%v)", ue, err)
 		}
 	})
+}
+
+func TestPrewarmXSRFRefreshesApproachingExpiryAndVerifiesDiskAT(t *testing.T) {
+	var appCalls, streamCalls atomic.Int32
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.Contains(u, "/app"):
+				n := appCalls.Add(1)
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"SNlM0e":"at_prewarm_%d","cfb2h":"bl_pw","FdrFJe":"123","oPEP7c":"pw@example.com"}`, n))),
+				}, nil
+			case strings.Contains(u, "StreamGenerate"):
+				streamCalls.Add(1)
+				body := ")]}'\n\n" + `[["wrb.fr",null,"[null,[\"c_pw\",\"r_pw\"],null,null,[[\"rc_pw\",[\"ok\"],null,null,null,null,null,null,[2]]],null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,[\"model_id\"]]"]]` + "\n"
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 200, Header: fhttp.Header{}, Body: io.NopCloser(strings.NewReader("[]"))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{ClientConfig: transport.ClientConfig{CustomDoer: doer}, MaxSessions: 2})
+	defer pool.Reset()
+	ac := NewAccountClient("pw_acct", "SAPISID=sap_pw; __Secure-1PSID=psid_pw", "", pool, cookies.NewRotator())
+	ac.SetTokens("at_old", "bl_old", "123")
+	ac.mu.Lock()
+	ac.fromDiskAT = false
+	ac.bootstrappedAt = time.Now().Add(-15 * time.Minute)
+	ac.mu.Unlock()
+
+	if !ac.NeedsXSRFPrewarm(0) {
+		t.Fatal("expected NeedsXSRFPrewarm(0) == true when bootstrappedAt is 15m old")
+	}
+	if err := ac.PrewarmXSRF(context.Background()); err != nil {
+		t.Fatalf("PrewarmXSRF failed: %v", err)
+	}
+	if ac.NeedsXSRFPrewarm(0) {
+		t.Fatal("expected NeedsXSRFPrewarm(0) == false immediately after PrewarmXSRF")
+	}
+	if appCalls.Load() != 1 {
+		t.Fatalf("expected 1 /app call during PrewarmXSRF, got %d", appCalls.Load())
+	}
+
+	resp, err := ac.StreamGenerateLive(context.Background(), "hello", StreamOptions{}, nil)
+	if err != nil {
+		t.Fatalf("StreamGenerateLive failed: %v", err)
+	}
+	if appCalls.Load() != 1 || streamCalls.Load() != 1 {
+		t.Fatalf("expected 0 extra /app calls on hot path after prewarm, got app=%d stream=%d", appCalls.Load(), streamCalls.Load())
+	}
+	if resp == nil || resp.UpstreamTTFBMs < 0 {
+		t.Fatalf("expected non-negative UpstreamTTFBMs on StreamResponse, got %+v", resp)
+	}
 }

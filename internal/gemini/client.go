@@ -22,9 +22,10 @@ import (
 const (
 	Origin        = "https://gemini.google.com"
 	DefaultBL     = "boq_assistant-bard-web-server_20260415.09_p0"
-	modelsTTL     = 10 * time.Minute
-	xsrfTTL       = 20 * time.Minute
-	defaultTenant = "bard-storage"
+	modelsTTL      = 10 * time.Minute
+	xsrfTTL        = 20 * time.Minute
+	xsrfPrewarmAge = 14 * time.Minute
+	defaultTenant  = "bard-storage"
 	defaultPushID = "feeds/mcudyrk2a4khkz"
 
 	quotaPayloadFlash    = "[[[1,11],[2,11],[6,11]]]"
@@ -975,6 +976,58 @@ func (ac *AccountClient) ensureBootstrapped(ctx context.Context, sc *transport.S
 		}
 	}
 	return ac.bootstrapOnClient(ctx, sc)
+}
+
+// NeedsXSRFPrewarm reports whether the account has a live session whose SNlM0e
+// token is approaching xsrfTTL (or was loaded from disk and never verified in
+// this process) and should be refreshed proactively in the background.
+func (ac *AccountClient) NeedsXSRFPrewarm(maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		maxAge = xsrfPrewarmAge
+	}
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+	if ac.persistRetired.Load() || strings.TrimSpace(ac.cookieHeader) == "" {
+		return false
+	}
+	if !ac.bootstrappedAt.IsZero() {
+		return time.Since(ac.bootstrappedAt) >= maxAge
+	}
+	return ac.fromDiskAT && ac.at != ""
+}
+
+// PrewarmXSRF refreshes or verifies the account's SNlM0e token off the hot path.
+func (ac *AccountClient) PrewarmXSRF(ctx context.Context) error {
+	sess, err := ac.acquireSession(ctx)
+	if err != nil {
+		return err
+	}
+	ac.bootMu.Lock()
+	defer ac.bootMu.Unlock()
+	ac.mu.RLock()
+	at := ac.at
+	bl := ac.bl
+	fSid := ac.fSid
+	fromDisk := ac.fromDiskAT
+	bootAt := ac.bootstrappedAt
+	ac.mu.RUnlock()
+	if at != "" && !fromDisk && !bootAt.IsZero() && time.Since(bootAt) < xsrfPrewarmAge {
+		return nil
+	}
+	if fromDisk && at != "" && bl != "" && fSid != "" {
+		if res, err := ac.doBatchExec(ctx, sess.Client, "otAQ7b", "[]"); err == nil && res != nil && res.Status == 200 {
+			entries := ParseBatch(res.Body)
+			p := findBatchPayload(entries, "otAQ7b")
+			if p != nil && !isStatus1016(p) {
+				ac.mu.Lock()
+				ac.fromDiskAT = false
+				ac.bootstrappedAt = time.Now()
+				ac.mu.Unlock()
+				return nil
+			}
+		}
+	}
+	return ac.bootstrapOnClient(ctx, sess.Client)
 }
 
 // RotateCookies runs the dual-path cookie rotation for this account and persists

@@ -588,6 +588,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	var ttftMs atomic.Int64
 	var headerMs, identityMs atomic.Int64
 	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
+	var preDispatchMs, firstUpstreamFrameMs atomic.Int64
 	var uploadMs, accountSwitches atomic.Int64
 	ttftMs.Store(-1)
 	headerMs.Store(-1)
@@ -595,6 +596,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	firstReasoningMs.Store(-1)
 	firstContentMs.Store(-1)
 	firstToolMs.Store(-1)
+	preDispatchMs.Store(-1)
+	firstUpstreamFrameMs.Store(-1)
 	curAttempt := 0
 	lastUpstreamStatus := 0
 	lastRetryReason := ""
@@ -695,6 +698,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		target := activeTarget.Load()
 		setGSBHeaders(w, false, target.accountID, target.modelName, attempt, upstreamStatus, retryReason)
+		setGSBPerfHeaders(w, false, computePerfTelemetry(cacheUsed, preDispatchMs.Load(), firstUpstreamFrameMs.Load(), ttftMs.Load(), time.Since(reqStartedAt).Milliseconds(), nil, 0))
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -921,7 +925,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		if streamErr == nil {
 			upstreamCalls++
+			preDispatchMs.Store(time.Since(reqStartedAt).Milliseconds())
+			firstUpstreamFrameMs.Store(-1)
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
+				if len(update.Frames) > 0 || update.AnsweredModelID != "" || strings.TrimSpace(update.Activity) != "" {
+					markPhase(&firstUpstreamFrameMs)
+				}
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
 					mediaToolUsed = true
@@ -1811,10 +1820,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if incompleteDetails != nil {
 			payload["incomplete_details"] = incompleteDetails
 		}
+		outTok, _ := chatUsage["completion_tokens"].(int)
+		totalMs := time.Since(reqStartedAt).Milliseconds()
+		pt := computePerfTelemetry(cacheUsed, preDispatchMs.Load(), firstUpstreamFrameMs.Load(), ttftMs.Load(), totalMs, upstream, outTok)
 		if stream {
 			emitSSE("response."+responseStatus, map[string]any{"response": payload})
 		} else {
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			setGSBPerfHeaders(w, headersSent, pt)
 			markPhase(&headerMs)
 			sendJSON(w, 200, payload, nil)
 		}
@@ -1823,7 +1836,6 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if d, ok := chatUsage["prompt_tokens_details"].(map[string]any); ok {
 			cachedTok, _ = d["cached_tokens"].(int)
 		}
-		totalMs := time.Since(reqStartedAt).Milliseconds()
 		s.logRequestJSON(map[string]any{
 			"req_id":             respID,
 			"endpoint":           "/v1/responses",
@@ -1851,12 +1863,23 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"first_reasoning_ms": firstReasoningMs.Load(),
 			"first_content_ms":   firstContentMs.Load(),
 			"first_tool_ms":      firstToolMs.Load(),
-			"done_ms":            totalMs,
-			"account_switches":   accountSwitches.Load(),
-			"requested_model":    mid,
-			"served_model":       servedID,
-			"served_label":       servedLabel,
-			"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
+			"done_ms":               totalMs,
+			"account_switches":      accountSwitches.Load(),
+			"requested_model":       mid,
+			"served_model":          servedID,
+			"served_label":          servedLabel,
+			"label_mismatch":        gemini.ServedLabelMismatch(*model, servedID, servedLabel),
+			"pre_request_ms":        pt.PreRequestMs,
+			"bootstrap_ms":          pt.BootstrapMs,
+			"upstream_ttfb_ms":      pt.UpstreamTTFBMs,
+			"first_frame_ms":        pt.FirstFrameMs,
+			"bridge_hold_ms":        pt.BridgeHoldMs,
+			"bridge_overhead_ms":    pt.BridgeOverheadMs,
+			"gen_window_ms":         pt.GenWindowMs,
+			"frame_count":           pt.FrameCount,
+			"output_tokens":         pt.OutputTokens,
+			"sustained_tok_per_sec": pt.SustainedTokPerSec,
+			"e2e_tok_per_sec":       pt.E2ETokPerSec,
 		})
 
 		account.mu.Lock()

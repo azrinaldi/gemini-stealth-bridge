@@ -2782,3 +2782,78 @@ func TestSchedulerMarksExpiredWhenRotationRejected(t *testing.T) {
 		t.Fatal("expected RotatedAt to record the successful rotation")
 	}
 }
+
+func TestChatAndResponsesPerfTelemetryHeaders(t *testing.T) {
+	srv, _ := newTestHarness(false, false)
+	up := &mockUpstream{
+		streamFn: func(ctx context.Context, p string, opts gemini.StreamOptions, onFrame func(*gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c_perf", RID: "r_perf", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("Telemetry response payload for throughput check.", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{
+				Status:         200,
+				CID:            "c_perf",
+				RID:            "r_perf",
+				BootstrapMs:    12,
+				UpstreamTTFBMs: 45,
+				FirstFrameMs:   48,
+				GenWindowMs:    250,
+				FrameCount:     1,
+			}, nil
+		},
+	}
+	srv.SetAccounts([]*AccountState{{
+		ID:       "a_perf",
+		Email:    "perf@example.com",
+		Models:   []gemini.ModelInfo{testModel},
+		Capacity: 2,
+		ModelsAt: time.Now(),
+		Client:   up,
+	}})
+
+	for _, tc := range []struct {
+		path string
+		body map[string]any
+	}{
+		{
+			path: "/v1/chat/completions",
+			body: map[string]any{
+				"model":    testModel.ModelName,
+				"stream":   false,
+				"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			},
+		},
+		{
+			path: "/v1/responses",
+			body: map[string]any{
+				"model":  testModel.ModelName,
+				"stream": false,
+				"input":  "hi",
+			},
+		},
+	} {
+		raw, _ := json.Marshal(tc.body)
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(string(raw)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s returned %d: %s", tc.path, rec.Code, rec.Body.String())
+		}
+		for _, hdr := range []string{
+			"X-GSB-Cache-Hit",
+			"X-GSB-Pre-Request-Ms",
+			"X-GSB-Upstream-TTFB-Ms",
+			"X-GSB-Bridge-Overhead-Ms",
+			"X-GSB-Sustained-Tok-Per-Sec",
+		} {
+			if strings.TrimSpace(rec.Header().Get(hdr)) == "" {
+				t.Fatalf("%s missing telemetry header %s (headers=%v)", tc.path, hdr, rec.Header())
+			}
+		}
+		if got := rec.Header().Get("X-GSB-Upstream-TTFB-Ms"); got != "45" {
+			t.Fatalf("%s X-GSB-Upstream-TTFB-Ms = %q, want 45", tc.path, got)
+		}
+	}
+}

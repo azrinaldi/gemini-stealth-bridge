@@ -65,6 +65,11 @@ type StreamResponse struct {
 	RID              string
 	Body             string
 	GroundingSources []GroundingSource
+	BootstrapMs      int64
+	UpstreamTTFBMs   int64
+	FirstFrameMs     int64
+	GenWindowMs      int64
+	FrameCount       int
 }
 
 // UploadFile uploads a binary file or image to Google's content-push service
@@ -378,9 +383,11 @@ func (ac *AccountClient) streamGenerateLocked(
 	opts StreamOptions,
 	onFrame func(update *LineParseResult) error,
 ) (*StreamResponse, error) {
+	bootStart := time.Now()
 	if err := ac.ensureBootstrapped(ctx, sc); err != nil {
 		return nil, err
 	}
+	bootstrapMs := time.Since(bootStart).Milliseconds()
 
 	innerJSON, uuidVal, modelHeader := ac.BuildInnerRequest(prompt, opts)
 
@@ -452,6 +459,8 @@ func (ac *AccountClient) streamGenerateLocked(
 		sawStreamEnd     bool
 		stoppedEarly     bool
 		grounding        []GroundingSource
+		firstFrameAt     time.Time
+		lastFrameAt      time.Time
 	)
 
 	// Transport timers see bytes, not content. Bound the wait for the first
@@ -537,6 +546,15 @@ func (ac *AccountClient) streamGenerateLocked(
 			frameWatch.Reset(firstFrameTimeout)
 		}
 		frameCount += len(parsed.Frames)
+		if sawCandidate || progress || parsed.AnsweredModelID != "" || strings.TrimSpace(parsed.Activity) != "" {
+			nowFrame := time.Now()
+			if firstFrameAt.IsZero() {
+				firstFrameAt = nowFrame
+			}
+			if progress || sawDone || sawCandidate {
+				lastFrameAt = nowFrame
+			}
+		}
 		grounding = MergeGroundingSources(grounding, parsed.GroundingSources)
 		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.Activity != "" || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
 			return onFrame(parsed)
@@ -544,6 +562,7 @@ func (ac *AccountClient) streamGenerateLocked(
 		return nil
 	}
 
+	postStartedAt := time.Now()
 	res, err := sc.Do(noFrameCtx, transport.RequestOptions{
 		Method:      "POST",
 		URL:         Origin + "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?" + q.Encode(),
@@ -681,6 +700,15 @@ func (ac *AccountClient) streamGenerateLocked(
 		}
 	}
 
+	firstFrameMs := int64(-1)
+	var genWindowMs int64
+	if !firstFrameAt.IsZero() {
+		firstFrameMs = firstFrameAt.Sub(postStartedAt).Milliseconds()
+		if !lastFrameAt.IsZero() && lastFrameAt.After(firstFrameAt) {
+			genWindowMs = lastFrameAt.Sub(firstFrameAt).Milliseconds()
+		}
+	}
+
 	return &StreamResponse{
 		Status:           res.Status,
 		Headers:          res.Headers,
@@ -689,6 +717,11 @@ func (ac *AccountClient) streamGenerateLocked(
 		RID:              rid,
 		Body:             res.Body,
 		GroundingSources: grounding,
+		BootstrapMs:      bootstrapMs,
+		UpstreamTTFBMs:   res.TTFBMs,
+		FirstFrameMs:     firstFrameMs,
+		GenWindowMs:      genWindowMs,
+		FrameCount:       frameCount,
 	}, nil
 }
 
