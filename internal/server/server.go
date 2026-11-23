@@ -163,9 +163,9 @@ type Server struct {
 	rotateMu     sync.Mutex
 	rotateCursor string
 
-	adminAuthMu    sync.Mutex
-	adminAuthFails map[string][]time.Time
-	adminImportMu  sync.Mutex
+	adminAuthMu          sync.Mutex
+	adminAuthFails       map[string][]time.Time
+	adminImportMu        sync.Mutex
 	browserLoginInFlight atomic.Bool
 
 	mediaMu    sync.RWMutex
@@ -189,6 +189,7 @@ func New(cfg config.Config) *Server {
 		ClientConfig: transport.ClientConfig{
 			ProfileName:      cfg.ImpersonateProfile,
 			ProxyURL:         cfg.ProxyURL,
+			MediaPlainFetch:  cfg.MediaPlainFetch,
 			UserAgent:        cfg.UserAgent,
 			SecCHUA:          cfg.SecCHUA,
 			SecCHUAPlatform:  cfg.SecCHUAPlatform,

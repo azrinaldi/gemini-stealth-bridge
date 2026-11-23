@@ -53,6 +53,7 @@ type Config struct {
 	MaxQueueDepth           int
 	SessionWaitTimeout      time.Duration
 	ProxyURL                string
+	MediaPlainFetch         bool
 	ImpersonateProfile      string
 	DefaultThinking         int
 	UserAgent               string
@@ -336,6 +337,7 @@ func FromEnv() *Config {
 		MaxQueueDepth:           lookupPositiveInt("BRIDGE_MAX_QUEUE", 4, 1),
 		SessionWaitTimeout:      time.Duration(lookupPositiveInt("BRIDGE_SESSION_WAIT_MS", 10000, 100)) * time.Millisecond,
 		ProxyURL:                lookup("BRIDGE_PROXY_SERVER"),
+		MediaPlainFetch:         lookupBool("BRIDGE_MEDIA_PLAIN_FETCH", false),
 		ImpersonateProfile:      impersonate,
 		DefaultThinking:         defThink,
 		UserAgent:               ua,

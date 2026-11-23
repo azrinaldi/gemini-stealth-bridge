@@ -52,6 +52,27 @@ func TestAbsorbSetCookieAndSAPISIDHash(t *testing.T) {
 	}
 }
 
+func TestModernSessionCookiesSurviveUnrelatedRotationAndDeletion(t *testing.T) {
+	initial := "SID=fixture; SAPISID=fixture; __Secure-1PSID=fixture; __Secure-1PSIDRTS=rts1; __Secure-3PSIDRTS=rts3; COMPASS=compass; SEARCH_SAMESITE=same; UNRELATED_COOKIE=junk"
+	merged, changed := AbsorbSetCookie(initial, []string{"SIDCC=fresh; Path=/; Secure; Domain=.google.com"})
+	if !changed {
+		t.Fatal("expected SIDCC update")
+	}
+	got := ParseHeader(merged)
+	for name, want := range map[string]string{"__Secure-1PSIDRTS": "rts1", "__Secure-3PSIDRTS": "rts3", "COMPASS": "compass", "SEARCH_SAMESITE": "same"} {
+		if got[name] != want {
+			t.Errorf("session cookie %s lost during unrelated rotation", name)
+		}
+	}
+	if got["UNRELATED_COOKIE"] != "" {
+		t.Fatal("unrelated cookie entered canonical account state")
+	}
+	merged, changed = AbsorbSetCookie(merged, []string{"__Secure-1PSIDRTS=deleted; Max-Age=0; Path=/; Secure"})
+	if !changed || ParseHeader(merged)["__Secure-1PSIDRTS"] != "" || ParseHeader(merged)["__Secure-3PSIDRTS"] != "rts3" {
+		t.Fatal("RTS cookie deletion or independent-cookie retention failed")
+	}
+}
+
 func TestDualPathCookieRotator(t *testing.T) {
 	var seenBodies []string
 	var seenURLs []string

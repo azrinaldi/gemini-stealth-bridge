@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -127,6 +129,7 @@ type Doer interface {
 type ClientConfig struct {
 	ProfileName            string
 	ProxyURL               string
+	MediaPlainFetch        bool
 	UserAgent              string
 	SecCHUA                string
 	SecCHUAPlatform        string
@@ -148,10 +151,11 @@ type ClientConfig struct {
 // StealthClient is an isolated, per-account HTTP/2 + uTLS client that reproduces
 // a single Chrome BrowserContext's network stack without launching a browser.
 type StealthClient struct {
-	mu      sync.Mutex
-	cfg     ClientConfig
-	client  Doer
-	dumpSeq atomic.Uint64
+	mu          sync.Mutex
+	cfg         ClientConfig
+	client      Doer
+	mediaClient *http.Client
+	dumpSeq     atomic.Uint64
 }
 
 // NewStealthClient creates an isolated StealthClient for one Google account.
@@ -213,6 +217,9 @@ func (sc *StealthClient) ResetConnections() {
 	if sc.client != nil {
 		sc.client.CloseIdleConnections()
 	}
+	if sc.mediaClient != nil {
+		sc.mediaClient.CloseIdleConnections()
+	}
 	if sc.cfg.CustomDoer == nil {
 		if c, err := buildTLSClient(sc.cfg); err == nil {
 			sc.client = c
@@ -242,6 +249,103 @@ func (sc *StealthClient) CloseIdleConnections() {
 	if sc.client != nil {
 		sc.client.CloseIdleConnections()
 	}
+	if sc.mediaClient != nil {
+		sc.mediaClient.CloseIdleConnections()
+	}
+}
+
+// plainMediaClient belongs to this session, including its resolved account or
+// pool proxy. Never let ambient HTTP_PROXY/HTTPS_PROXY change account egress.
+func (sc *StealthClient) plainMediaClient() (*http.Client, error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.mediaClient != nil {
+		return sc.mediaClient, nil
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
+	tr := &http.Transport{
+		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if network == "tcp" && sc.cfg.IPv6Mode == "off" {
+				network = "tcp4"
+			}
+			return dialer.DialContext(ctx, network, address)
+		},
+	}
+	if sc.cfg.ProxyURL != "" {
+		proxy, err := url.Parse(sc.cfg.ProxyURL)
+		if err != nil || proxy.Hostname() == "" || (proxy.Scheme != "http" && proxy.Scheme != "https" && proxy.Scheme != "socks5" && proxy.Scheme != "socks5h") {
+			return nil, NewUpstreamError("invalid proxy for plain media download", 502, "media_download_failed", nil, nil)
+		}
+		tr.Proxy = http.ProxyURL(proxy)
+	}
+	sc.mediaClient = &http.Client{
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return sc.mediaClient, nil
+}
+
+// DoMedia changes only media fetching; generation, uploads and cookie rotation
+// continue to use Do's uTLS client even when the experimental flag is enabled.
+func (sc *StealthClient) DoMedia(ctx context.Context, opts RequestOptions) (*Response, error) {
+	if !sc.cfg.MediaPlainFetch {
+		return sc.Do(ctx, opts)
+	}
+	client, err := sc.plainMediaClient()
+	if err != nil {
+		return nil, err
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, opts.Method, opts.URL, bytes.NewReader(opts.Body))
+	if err != nil {
+		return nil, NewUpstreamError("invalid media HTTP request", 502, "media_download_failed", nil, err)
+	}
+	ua := sc.cfg.UserAgent
+	if ua == "" {
+		ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	for key, value := range opts.Headers {
+		req.Header.Set(key, value)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		// net/http's url.Error includes the signed URL. Keep its cause for
+		// errors.Is, but never expose that URL in logs or API errors.
+		return nil, NewUpstreamError("media HTTP request failed", 502, "media_download_failed", nil, err)
+	}
+	defer res.Body.Close()
+	limit := opts.MaxBodyBytes
+	if limit <= 0 {
+		limit = DefaultMaxBodyBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	if err != nil {
+		return nil, NewUpstreamError("media HTTP response read failed", 502, "media_download_failed", nil, err)
+	}
+	if int64(len(body)) > limit {
+		return nil, NewUpstreamError("media HTTP response exceeds size limit", 502, "upstream_response_too_large", nil, nil)
+	}
+	ct := strings.ToLower(strings.TrimSpace(res.Header.Get("Content-Type")))
+	if res.StatusCode == http.StatusOK && !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(ct, "video/") && !strings.HasPrefix(ct, "text/plain") {
+		return nil, NewUpstreamError("media HTTP response is not image or video content", 502, "media_download_failed", nil, nil)
+	}
+	headers := make(map[string]string, len(res.Header))
+	for key := range res.Header {
+		headers[strings.ToLower(key)] = res.Header.Get(key)
+	}
+	return &Response{Status: res.StatusCode, Headers: headers, SetCookies: res.Header.Values("Set-Cookie"), Body: string(body)}, nil
 }
 
 // RequestOptions specifies parameters for an outbound HTTP request.
