@@ -48,6 +48,7 @@ type UpstreamClient interface {
 type AccountState struct {
 	mu               sync.RWMutex
 	ID               string
+	Guest            bool
 	Email            string
 	FilePath         string
 	CapturedAt       time.Time
@@ -92,6 +93,7 @@ type AuthScope struct {
 	AccountID string
 	Group     string
 	Admin     bool
+	Pool      bool
 }
 
 // canStreamVerified is the single commit predicate for model output in both
@@ -103,6 +105,9 @@ func canStreamVerified(eagerStream, rejectDowngrade, identityConflict bool, mode
 }
 
 func canStreamVerifiedWithConfig(cfg config.Config, eagerStream, identityConflict bool, model gemini.ModelInfo, servedID, servedLabel string) bool {
+	if gemini.IsGuestModel(model) {
+		return !identityConflict
+	}
 	if cfg.RejectLabelMismatch && (servedID == "" || gemini.ServedLabelMismatch(model, servedID, servedLabel)) {
 		return false
 	}
@@ -120,7 +125,7 @@ func canStreamVerifiedWithConfig(cfg config.Config, eagerStream, identityConflic
 // the answer at the end, and on the eager path the answer would already be on
 // the wire.
 func shouldAbortForModelRejection(cfg config.Config, mediaToolUsed bool, model gemini.ModelInfo, servedID, servedLabel string) bool {
-	if mediaToolUsed || servedID == "" && servedLabel == "" {
+	if gemini.IsGuestModel(model) || mediaToolUsed || servedID == "" && servedLabel == "" {
 		return false
 	}
 	if cfg.RejectDowngrade && !gemini.IsMatchingServedModel(model, servedID, servedLabel) {
@@ -142,6 +147,7 @@ type Server struct {
 
 	mu                sync.RWMutex
 	accounts          []*AccountState
+	guest             *AccountState
 	tokenToAcct       map[string]string
 	sessionCache      map[string][]any
 	sessionCacheAt    map[string]time.Time
@@ -185,7 +191,7 @@ func New(cfg config.Config) *Server {
 	}
 	toolbridge.SetCompactOptions(cfg.ToolSchemaCompact, cfg.ToolDescMaxChars)
 
-	pool := transport.NewPool(transport.PoolOptions{
+	poolOpts := transport.PoolOptions{
 		ClientConfig: transport.ClientConfig{
 			ProfileName:      cfg.ImpersonateProfile,
 			ProxyURL:         cfg.ProxyURL,
@@ -204,7 +210,8 @@ func New(cfg config.Config) *Server {
 		MaxSessions: maxSessions,
 		MaxQueue:    cfg.MaxQueueDepth,
 		WaitTimeout: cfg.SessionWaitTimeout,
-	})
+	}
+	pool := transport.NewPool(poolOpts)
 	rotator := cookies.NewRotator()
 
 	cloned := cfg.Clone()
@@ -219,6 +226,10 @@ func New(cfg config.Config) *Server {
 		clock:          time.Now,
 	}
 	s.cfgPtr.Store(&cloned)
+	s.guest = &AccountState{
+		ID: "guest", Guest: true, Models: []gemini.ModelInfo{gemini.GuestModel()},
+		Client: gemini.NewGuestClient(poolOpts.ClientConfig, prompt.EstimateTokens),
+	}
 	s.loadSessionCacheFromDisk()
 	return s
 }
@@ -325,9 +336,9 @@ func (s *Server) resolveToken(token string, allowReload bool) AuthScope {
 	isPoolKey := matchesSecret(token, cfg.APIKey) || public && (token == "" || token == poolToken(cfg.HomeDir))
 	s.mu.RLock()
 	if isPoolKey {
-		scope := AuthScope{OK: true, Admin: true}
+		scope := AuthScope{OK: true, Admin: true, Pool: true}
 		if len(s.accounts) == 1 {
-			scope = AuthScope{OK: true, AccountID: s.accounts[0].ID}
+			scope = AuthScope{OK: true, AccountID: s.accounts[0].ID, Pool: true}
 		}
 		s.mu.RUnlock()
 		return scope
@@ -473,7 +484,7 @@ func splitRequestAuthority(authority string) (host, port string, ok bool) {
 var requestHostname = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 func (s *Server) beginAuxStream(a *AccountState) (func(), error) {
-	maxStreams := s.cfgSnapshot().MaxConcurrentPerAccount
+	_, maxStreams := accountRateLimits(s.cfgSnapshot(), a)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := accountBlockedErrorLocked(a); err != nil {
@@ -532,7 +543,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.Method == http.MethodGet && (p == "/health" || p == "/"):
-		accts := s.Accounts()
+		accts := s.scopedAccounts(AuthScope{})
 		models := len(s.allModels())
 		sendJSON(w, 200, map[string]any{
 			"status":    "ok",
@@ -546,9 +557,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.Method == http.MethodGet && p == "/readyz":
-		accts := s.Accounts()
+		accts := s.scopedAccounts(AuthScope{})
 		acctReports := make([]map[string]any, 0, len(accts))
 		healthyCount := 0
+		realCount, healthyRealCount := 0, 0
 		quarantinedCount := 0
 		refInterval := cfg.ModelRefreshEvery
 		if refInterval <= 0 {
@@ -557,6 +569,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		now := s.now()
 		for _, a := range accts {
 			a.mu.RLock()
+			if a.Guest {
+				healthyCount++
+				acctReports = append(acctReports, map[string]any{"id": a.ID, "guest": true, "models_fresh": true, "auth_ok": true, "quarantined": false})
+				a.mu.RUnlock()
+				continue
+			}
+			realCount++
 			mFresh := !a.ModelsAt.IsZero() && now.Sub(a.ModelsAt) < 2*refInterval
 			qFresh := !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < 30*time.Minute
 			authOK := a.ModelsError == nil && !a.Quarantined && !looksLikeAuthFailure(a.LastError) && !looksLikeAccountBan(a.LastError)
@@ -570,6 +589,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if authOK && !disabled && hasModels {
 				healthyCount++
+				healthyRealCount++
 			}
 			acctReports = append(acctReports, map[string]any{
 				"id":           id,
@@ -583,7 +603,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpCode := 200
 		if len(accts) == 0 || healthyCount == 0 || quarantinedCount > 0 || healthyCount < len(accts) {
 			statusStr = "degraded"
-			if len(accts) == 0 || healthyCount == 0 {
+			// Synthetic guest readiness must not hide an unusable real pool.
+			if len(accts) == 0 || healthyCount == 0 || realCount > 0 && healthyRealCount == 0 {
 				if r.URL.Query().Get("strict") == "1" {
 					httpCode = 503
 				}
@@ -633,7 +654,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		freshReq := r.URL.Query().Get("fresh") == "1"
-		pool := s.scopedAccounts(scope)
+		pool := generationAccounts(s.scopedAccounts(scope), false)
 		allCold := true
 		for _, a := range pool {
 			a.mu.RLock()
@@ -690,11 +711,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		accts := s.Accounts()
-		if len(accts) == 0 {
+		pool := s.scopedAccounts(scope)
+		if len(accts) == 0 && len(pool) == 0 {
 			sendJSON(w, 503, map[string]any{"error": map[string]any{"message": "no accounts configured", "type": "auth_unavailable"}}, nil)
 			return
 		}
-		pool := s.scopedAccounts(scope)
 		freshReq := r.URL.Query().Get("fresh") == "1"
 		hasWarmModels := false
 		needsBgRefresh := false
@@ -706,7 +727,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.mu.RLock()
 			if len(a.Models) > 0 {
 				hasWarmModels = true
-				if !a.ModelsAt.IsZero() && time.Since(a.ModelsAt) >= refEvery {
+				if !a.Guest && !a.ModelsAt.IsZero() && time.Since(a.ModelsAt) >= refEvery {
 					needsBgRefresh = true
 				}
 			}
@@ -884,7 +905,7 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 		lastFailStr = a.LastFail.UTC().Format(time.RFC3339)
 	}
 	lastError := a.LastError
-	return map[string]any{
+	statusMap := map[string]any{
 		"id":               a.ID,
 		"email":            a.Email,
 		"status":           status,
@@ -916,6 +937,13 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 		"offloadRequests":  a.offloadRequests,
 		"surfaces":         surfCopy,
 	}
+	if a.Guest {
+		statusMap["guest"] = true
+		statusMap["plan"] = "guest"
+		delete(statusMap, "quotaWindow")
+		delete(statusMap, "quotaAt")
+	}
+	return statusMap
 }
 
 func readJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
@@ -1075,6 +1103,17 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 				// page; "config" means it is the operator's configured fallback.
 				"limitsSource": limitsSource,
 			},
+		}
+		if gemini.IsGuestModel(x) {
+			entry["guest"] = true
+			entry["supported_parameters"] = []string{"tools", "tool_choice", "max_tokens", "max_completion_tokens", "max_output_tokens", "stop", "response_format"}
+			entry["served_model_mutable"] = true
+			entry["usage_estimated"] = true
+			entry["architecture"] = map[string]any{"modality": "text->text", "input_modalities": []string{"text"}, "output_modalities": []string{"text"}}
+			entry["prompt_limits"] = map[string]any{
+				"safe_chars": gemini.GuestSafePromptChars, "safe_tokens": gemini.GuestSafePromptTokens,
+				"hard_chars": gemini.GuestHardPromptChars, "hard_tokens": gemini.GuestHardPromptTokens,
+			}
 		}
 		data = append(data, entry)
 	}

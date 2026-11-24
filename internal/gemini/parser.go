@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -42,6 +43,10 @@ type Frame struct {
 	GeneratedImages    []GeneratedImage  `json:"generatedImages,omitempty"`
 	GeneratedVideos    []GeneratedVideo  `json:"generatedVideos,omitempty"`
 	GroundingSources   []GroundingSource `json:"groundingSources,omitempty"`
+	// Clean EOF may complete a guest turn without a final candidate status. Keep
+	// the inputs so final sanitation can release withheld literals, never raw text.
+	rawCandidateText     string
+	rawCandidateThoughts string
 }
 
 // LineParseResult holds the parsed contents of one StreamGenerate line.
@@ -179,6 +184,8 @@ var (
 	)
 	harnessReminderRe = regexp.MustCompile(`(?is)^\s*\[(?:Harness|Tool) reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
 	assistantPrefixRe = regexp.MustCompile(`(?i)^\s*Assistant:\s*`)
+	citationMarkerRe  = regexp.MustCompile(`^\[cite(?::[ \t]*\d+(?:[ \t]*,[ \t]*\d+)*[ \t]*|_(?:start|end))\]`)
+	citationPartialRe = regexp.MustCompile(`^\[cite:[ \t]*(?:\d+[ \t]*(?:,[ \t]*\d+[ \t]*)*(?:,[ \t]*)?)?$`)
 )
 
 const (
@@ -303,15 +310,18 @@ func utf8SafeLowerHead(s string, maxRunes int) string {
 // SanitizeCandidateTextAndThoughts strips any inline <think>/<thinking>/<thought>
 // blocks, inline thought-bubble monologues (💭), or echoed prompt markers from
 // candidate text and merges extracted inline thoughts into the thoughts channel
-// so reasoning never leaks into or duplicates chat content.
+// so reasoning never leaks into or duplicates chat content. Web citation
+// scaffolding is removed from the answer after that routing.
 func SanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string, string) {
 	return sanitizeCandidateTextAndThoughts(text, thoughts, done)
 }
 
-func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string, string) {
+func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (answer, reasoning string) {
 	if text == "" {
 		return "", thoughts
 	}
+	// Clean the answer after all reasoning extraction, including early returns.
+	defer func() { answer = stripCitationArtifacts(answer, done) }()
 
 	var extraThoughts []string
 	appendThought := func(t string) {
@@ -444,6 +454,286 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 	}
 
 	return text, joinThoughts(thoughts, extraThoughts)
+}
+
+// stripCitationArtifacts operates on cumulative snapshots. Ambiguous suffixes
+// (including spaces before a possible marker/link) must wait: emitting them now
+// could require retracting them when the next frame supplies closing punctuation.
+func stripCitationArtifacts(text string, done bool) string {
+	out := make([]byte, 0, len(text))
+	gap, afterGap := "", ""
+	removed, inURL := false, false
+	codeChar, codeRun, codeFence := byte(0), 0, false
+	for i := 0; i < len(text); {
+		c := text[i]
+		if c == ' ' || c == '\t' {
+			inURL = false
+			j := i + 1
+			for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
+				j++
+			}
+			if removed {
+				afterGap += text[i:j]
+			} else {
+				gap += text[i:j]
+			}
+			i = j
+			continue
+		}
+
+		end, label, pending := 0, "", false
+		possibleMarker := c == '[' && (strings.HasPrefix(text[i:], "[cite") || strings.HasPrefix("[cite", text[i:]))
+		if codeRun == 0 && (!inURL || possibleMarker) && (c == '[' || c == '<' || c == '(' || c == 'h' || c == 'H') {
+			// Do not mistake a URL embedded in another URL/path for a bare link.
+			boundary := true
+			if (c == 'h' || c == 'H') && i > 0 {
+				prev, _ := utf8.DecodeLastRuneInString(text[:i])
+				boundary = removed || unicode.IsSpace(prev) || strings.ContainsRune("([{<\"'`", prev)
+			}
+			if boundary {
+				end, label, pending = citationArtifactSpan(text[i:], done)
+			}
+		}
+		if pending {
+			break
+		}
+		if end > 0 {
+			inURL = false
+			if label != "" {
+				label = stripCitationArtifacts(label, true)
+			}
+			if label == "" {
+				if removed && afterGap != "" {
+					gap = afterGap
+				}
+				afterGap, removed = "", true
+				i += end
+				continue
+			}
+		}
+
+		rest := text[i:]
+		if label != "" {
+			rest = label
+		}
+		if removed {
+			closes, stable := citationPhraseCloses(rest, done || label != "")
+			if !stable {
+				break
+			}
+			if closes {
+				gap = ""
+			} else if afterGap != "" {
+				gap = afterGap
+			}
+		}
+		out = append(out, gap...)
+		gap, afterGap, removed = "", "", false
+		if label != "" {
+			body := strings.TrimRight(label, " \t")
+			out = append(out, body...)
+			gap = label[len(body):]
+			i += end
+			continue
+		}
+
+		r, width := utf8.DecodeRuneInString(text[i:])
+		j := i + width
+		if c == ':' && strings.HasPrefix(text[i:], "://") {
+			inURL = true
+		} else if unicode.IsSpace(r) || strings.ContainsRune("<>\"'`", r) {
+			inURL = false
+		}
+		if c == '\\' && j < len(text) {
+			_, width = utf8.DecodeRuneInString(text[j:])
+			j += width
+		} else if c == '`' || c == '~' {
+			// Deliberate code literals are not web-UI citation control syntax.
+			for j < len(text) && text[j] == c {
+				j++
+			}
+			run := j - i
+			lineStart := strings.LastIndexByte(text[:i], '\n') + 1
+			fence := i-lineStart <= 3 && strings.Trim(text[lineStart:i], " ") == "" && run >= 3
+			if codeRun == 0 && (c == '`' || fence) {
+				codeChar, codeRun = c, run
+				codeFence = fence
+			} else if c == codeChar && ((!codeFence && run == codeRun) || (codeFence && fence && run >= codeRun)) {
+				codeChar, codeRun, codeFence = 0, 0, false
+			}
+		}
+		out = append(out, text[i:j]...)
+		i = j
+	}
+	if done && !removed {
+		out = append(out, gap...)
+	}
+	return string(out)
+}
+
+// citationArtifactSpan recognizes only known markers and the exact internal URL
+// path. Markdown links retain meaningful labels, not dead destination syntax.
+func citationArtifactSpan(s string, done bool) (end int, label string, pending bool) {
+	if s[0] == '[' {
+		close, depth := -1, 0
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\\' {
+				i++
+			} else if s[i] == '[' {
+				depth++
+			} else if s[i] == ']' {
+				depth--
+				if depth == 0 {
+					close = i
+					break
+				}
+			}
+		}
+		if close >= 0 && close+1 < len(s) && s[close+1] == '(' {
+			start := close + 2
+			for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
+				start++
+			}
+			angle := start < len(s) && s[start] == '<'
+			if angle {
+				start++
+			}
+			urlEnd, internal := citationURLSpan(s[start:], done)
+			if urlEnd > 0 && internal {
+				end = start + urlEnd
+				if angle && end < len(s) && s[end] == '>' {
+					end++
+				}
+				// An optional quoted Markdown title belongs to the discarded link.
+				j := end
+				for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+					j++
+				}
+				if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+					quote := s[j]
+					j++
+					for j < len(s) && s[j] != quote {
+						if s[j] == '\\' {
+							j++
+						}
+						j++
+					}
+					if j < len(s) {
+						j++
+					} else if !done {
+						j = len(s)
+					}
+					for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+						j++
+					}
+				}
+				if j < len(s) && s[j] == ')' {
+					end = j + 1
+				} else if !done && j >= len(s) {
+					end = len(s)
+				}
+				label = s[1:close]
+				if isDigits(strings.TrimSpace(label)) || strings.TrimSpace(label) == "" || citationMarkerRe.MatchString(s[:close+1]) {
+					label = ""
+				}
+				return end, label, false
+			}
+			if !done && (urlEnd > 0 || start == len(s)) {
+				return 0, "", true
+			}
+		}
+		if strings.HasPrefix(s, "[cite") {
+			if loc := citationMarkerRe.FindStringIndex(s); loc != nil {
+				return loc[1], "", false
+			}
+			if citationPartialRe.MatchString(s) || strings.HasPrefix("[cite_start]", s) || strings.HasPrefix("[cite_end]", s) {
+				return len(s), "", !done
+			}
+		}
+		if !done && (close < 0 || close+1 == len(s)) {
+			return 0, "", true
+		}
+		return 0, "", false
+	}
+	if s[0] == '<' || s[0] == '(' {
+		urlEnd, internal := citationURLSpan(s[1:], done)
+		if internal {
+			end = urlEnd + 1
+			closer := byte('>')
+			if s[0] == '(' {
+				closer = ')'
+			}
+			if end < len(s) && s[end] == closer {
+				end++
+			}
+			return end, "", false
+		}
+		return 0, "", !done && (urlEnd > 0 || len(s) == 1)
+	}
+	end, internal := citationURLSpan(s, done)
+	if !internal {
+		return 0, "", end > 0
+	}
+	// Unlike \S+, do not swallow sentence punctuation after a bare URL. At
+	// EOF mid-stream it could still be part of a longer URL, so withhold it.
+	if done || end < len(s) {
+		for end > 0 {
+			r, width := utf8.DecodeLastRuneInString(s[:end])
+			if !strings.ContainsRune(".,;:!?…。、，．；：！？", r) {
+				break
+			}
+			end -= width
+		}
+	}
+	return end, "", false
+}
+
+func citationURLSpan(s string, done bool) (end int, internal bool) {
+	for _, prefix := range []string{"https://googleusercontent.com/lmdx_content/", "http://googleusercontent.com/lmdx_content/"} {
+		hostLen := len(prefix) - len("/lmdx_content/")
+		n := min(len(s), len(prefix))
+		if !asciiHasPrefixFold(s[:n], prefix[:min(n, hostLen)]) || (n > hostLen && s[hostLen:n] != prefix[hostLen:n]) {
+			continue
+		}
+		if n < len(prefix) {
+			if n > 0 && (!done || n == len(prefix)-1) {
+				return n, done
+			}
+			continue
+		}
+		end = n
+		for end < len(s) {
+			r, width := utf8.DecodeRuneInString(s[end:])
+			if unicode.IsSpace(r) || unicode.Is(unicode.Pe, r) || unicode.Is(unicode.Pf, r) || strings.ContainsRune("<>[](){}\"'`*~", r) {
+				break
+			}
+			end += width
+		}
+		return end, true
+	}
+	return 0, false
+}
+
+func citationPhraseCloses(s string, done bool) (closes, stable bool) {
+	for s != "" {
+		r, width := utf8.DecodeRuneInString(s)
+		if strings.ContainsRune("*_~`\"'", r) {
+			s = s[width:]
+			continue
+		}
+		if r == '[' || r == '<' || r == '(' || r == 'h' || r == 'H' {
+			end, label, pending := citationArtifactSpan(s, done)
+			if pending {
+				return false, false
+			}
+			if end > 0 && label == "" {
+				s = s[end:]
+				continue
+			}
+		}
+		return unicode.IsSpace(r) || unicode.Is(unicode.Pe, r) || unicode.Is(unicode.Pf, r) || strings.ContainsRune(".,;:!?…。、，．；：！？", r), true
+	}
+	return done, done
 }
 
 func findInlineToolBlockStart(s string) int {
@@ -933,7 +1223,16 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		}
 	}
 	if !keepCardLink && googleGenContentPlaceholderRe.MatchString(text) {
-		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
+		stripped := googleGenContentPlaceholderRe.ReplaceAllStringFunc(text, func(link string) string {
+			path := strings.Index(link, "://") + len("://googleusercontent.com")
+			if strings.HasPrefix(link[path:], "/lmdx_content/") {
+				return link // The shared citation sanitizer owns these, including wrappers.
+			}
+			return ""
+		})
+		if stripped != text {
+			text = strings.TrimSpace(stripped)
+		}
 	}
 
 	var thoughts string
@@ -944,11 +1243,9 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 	}
 
 	done := false
-	if len(c) > 8 {
-		if stArr, ok := c[8].([]any); ok && len(stArr) > 0 {
-			if f, ok := stArr[0].(float64); ok && int(f) == 2 {
-				done = true
-			}
+	if stArr, ok := jspbField(c, 8).([]any); ok && len(stArr) > 0 {
+		if f, ok := stArr[0].(float64); ok && int(f) == 2 {
+			done = true
 		}
 	}
 
@@ -958,6 +1255,7 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		answeredID = ""
 		answeredLabel = ""
 	}
+	rawText, rawThoughts := text, thoughts
 	text, thoughts = sanitizeCandidateTextAndThoughts(text, thoughts, done)
 
 	grounding := extractGroundingSources(c)
@@ -1000,15 +1298,17 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 	}
 
 	return Frame{
-		RCID:               rcid,
-		Text:               text,
-		Thoughts:           thoughts,
-		Done:               done,
-		AnsweredModelID:    answeredID,
-		AnsweredModelLabel: answeredLabel,
-		GeneratedImages:    images,
-		GeneratedVideos:    videos,
-		GroundingSources:   grounding,
+		RCID:                 rcid,
+		Text:                 text,
+		Thoughts:             thoughts,
+		Done:                 done,
+		AnsweredModelID:      answeredID,
+		AnsweredModelLabel:   answeredLabel,
+		GeneratedImages:      images,
+		GeneratedVideos:      videos,
+		GroundingSources:     grounding,
+		rawCandidateText:     rawText,
+		rawCandidateThoughts: rawThoughts,
 	}, true
 }
 

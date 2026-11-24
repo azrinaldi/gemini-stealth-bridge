@@ -74,6 +74,21 @@ It provides:
 
 Default listener: `127.0.0.1:20133`. Default pool key: `public` (unauthenticated).
 
+### 2.1 Anonymous guest model
+
+`BRIDGE_GUEST_ACCOUNT` defaults to enabled. The daemon exposes a synthetic, in-memory `guest` account with exactly one model, `guest-free` (display: `Guest (no account)`), even with no saved Google accounts. Set `BRIDGE_GUEST_ACCOUNT=0` to opt out.
+
+- Guest is selected only by an explicit `model: "guest-free"` request. It is never the default model or an automatic fallback for an account-backed request.
+- Use the pool/admin key and the normal `/v1` base URL. Account and group keys do not grant access to the guest scope.
+- Chat Completions and Responses support text, streaming/non-streaming, flattened multi-turn history, and the existing prompt-based tool bridge. The backing model is chosen by Google and its served label can change; do not describe it as pinned Flash-Lite.
+- Guest requests send no account cookies, access tokens, model-selection headers, or server-side conversation IDs. They perform no login bootstrap, registry refresh, cookie rotation, or quota RPCs, and never persist a guest credential file.
+- `/v1/accounts` reports `guest: true` and status `ok`; this is synthetic readiness, not evidence that the upstream anonymous endpoint just succeeded. `/v1/quota` omits guest rather than inventing allowance numbers.
+- Guest does not support input images, image/video generation, or MCP web search. Do not inject or recommend `generate_media` for it.
+- Local validation rejects empty prompts, more than 500,000 Unicode code points, or more than 128,000 estimated tokens. Above 350,000 code points or 100,000 estimated tokens it logs a warning without logging the prompt. Account for system messages, history, and tool schemas in these totals.
+- Model metadata uses the documented Flash-Lite context/output limits (1,048,576/65,536), but those do not override the stricter anonymous prompt ceiling. Usage is locally estimated, never upstream-reported. Rate limits are opaque per-IP and shared with browser traffic; guest uses conservative local RPM/concurrency limits.
+
+User-visible candidate text for both guest and signed-in accounts is sanitized to remove web citation scaffolding such as `[cite: 1]`, `[cite_start]`/`[cite_end]`, and internal `lmdx_content` links. Real grounding sources remain separate; incomplete artifacts must not leak through streaming chunks.
+
 ---
 
 ## 3. Mental model: accounts, keys, and routing
@@ -95,7 +110,7 @@ When a user reports that a request failed while another account had quota, **che
 ### 3.2 Key resolution details
 
 - `BRIDGE_API_KEY=public` accepts requests with **no** key, the literal `public`, or the derived `gsb-pool-<hash>` token shown in the Web UI.
-- With exactly one loaded account, the pool key resolves to that account's scope.
+- With exactly one loaded real account, the pool key resolves to that account's scope for account-backed requests; the synthetic guest does not change account pinning.
 - Filename aliases (`gsb-<name>` and `<name>`) work only when `BRIDGE_API_KEY=public` and `BRIDGE_ACCOUNT_TOKENS` is unset. They are routing aliases, not secrets.
 - `BRIDGE_ACCOUNT_TOKENS="token:account_id"` configures explicit account keys. Use it for account pinning with a private pool key.
 - `BRIDGE_ADMIN_KEY` grants the admin scope: all accounts, plus `/v1/admin/*`.
@@ -264,7 +279,7 @@ Statuses are computed in this precedence order and are shared by `/v1/accounts`,
 | `503 upstream_transient` with `code 1013` | Random temporary model error | Retried automatically; no action |
 | `no SAPISID cookie found` | Selected browser profile is not signed in | Use `gsb --login` |
 | `401 authentication_error` from `gsb` | Wrong API key, not a Google problem | Check pool/group/account key |
-| `503 auth_unavailable` | No accounts loaded | Check `BRIDGE_HOME`, import an account, `/v1/refresh` |
+| `503 auth_unavailable` | No real accounts loaded for an account-backed request | Check `BRIDGE_HOME`, import an account, `/v1/refresh`; explicit `guest-free` is separate |
 | `403 remote_web_ui_locked` | Remote UI with no admin key | Set `BRIDGE_ADMIN_KEY` or use an SSH tunnel |
 
 ### 6.3 Distinguishing causes
@@ -754,6 +769,7 @@ Everything else is environment-only.
 | `BRIDGE_GROUP_TOKENS` | empty | `token:group_name` |
 | `BRIDGE_ACCOUNT_GROUP` | empty | `account_id:group_name` |
 | `BRIDGE_WEB_UI` | `false` (`1` in start.sh/Docker) | Enable UI/admin |
+| `BRIDGE_GUEST_ACCOUNT` | `true` | Enable explicit anonymous `guest-free`; `0` disables |
 | `WEB_CRED_FILE` | `$BRIDGE_HOME/web-credentials.json` | Parsed but unused; the loader always reads `$BRIDGE_HOME/web-credentials.json` and `accounts/*.json` |
 
 ### 15.3 Credentials and protocol
@@ -1005,7 +1021,7 @@ What does change the outcome is account selection. Per-account success rates for
 
 | Symptom | Action |
 |---|---|
-| `503 auth_unavailable` | Import an account; verify `BRIDGE_HOME`; `/v1/refresh` |
+| `503 auth_unavailable` | Import a real account; verify `BRIDGE_HOME`; `/v1/refresh`. Guest works only when explicitly requested and enabled |
 | `401 authentication_error` | Fix the API key |
 | `401 upstream_auth_error` / `code 1016` | `gsb --login <name>` |
 | `403 account_banned` | Stop retrying; review the account |

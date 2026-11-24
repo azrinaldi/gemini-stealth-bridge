@@ -12,6 +12,8 @@ OpenAI-compatible HTTP proxy for [Gemini Web](https://gemini.google.com/app). Us
 
 > **Unofficial.** `gsb` authenticates with Google session cookies over a browserless uTLS/HTTP2 transport (no headless Chrome at runtime). Upstream changes, sign-in checks, and account quotas can change without notice.
 
+The explicit `guest-free` model also supports anonymous text and tool calls without signing in. It never replaces a requested account-backed model.
+
 ---
 
 ## Features
@@ -20,6 +22,7 @@ OpenAI-compatible HTTP proxy for [Gemini Web](https://gemini.google.com/app). Us
 |---|---|
 | **Chat & Responses API** | `POST /v1/chat/completions` and `POST /v1/responses` (JSON & SSE), reasoning effort (`low`/`medium`/`high`), vision inputs, and session continuation caching |
 | **Function Calling** | Prompt-based tool calling with JSON Schema validation, automatic type coercion, and protection against mid-stream tool block leaks |
+| **Guest Free** | Default-enabled anonymous `guest-free` model for text and prompt-based tools, with no account credentials or quota RPCs |
 | **Account Pool & Failover** | Automatic rotation (`rotate`, `lru`, `fill-first`) across Google accounts with 5-hour and 7-day weekly quota tracking, group keys, and per-account proxies |
 | **Native Image & Video** | Imagen / Nano Banana images and Veo MP4 videos via `/v1/images/generations`, `/v1/videos/generations`, or agent `generate_media` tool calls, served at `/v1/media/<id>` |
 | **Web Search & MCP** | Appends Google Search citations (`Sources:`) and exposes `web_search` over Streamable HTTP MCP at `POST /mcp` |
@@ -51,6 +54,8 @@ go build -o gsb ./cmd/gsb
 ```
 
 ### 2. Sign In & Verify
+
+Skip this step when using only `guest-free`; account-backed models and media still require sign-in.
 
 ```sh
 ./gsb --login acc1
@@ -94,6 +99,25 @@ curl -sS http://127.0.0.1:20133/v1/chat/completions \
   Open `http://127.0.0.1:20133/ui` and click **+ Add Account → Launch**.
 - **Incognito cookie paste**: Sign in via a new Incognito window, export cookies (Cookie-Editor JSON or `Cookie` header), **close the Incognito window immediately without signing out**, and paste into **+ Add Account** or `./gsb --import-cookie <name> < cookies.json`.
 - **Existing signed-in profile**: `./gsb --import-chrome <name> --chrome-profile "Profile 1"`.
+
+---
+
+## Guest Free
+
+`guest-free` is enabled by default, including when no Google accounts are loaded. Use the same API base URL and pool key, but request this model explicitly:
+
+```sh
+curl -sS http://127.0.0.1:20133/v1/chat/completions \
+  -H 'Authorization: Bearer public' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"guest-free","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
+```
+
+Chat Completions and Responses support streaming, flattened multi-turn history, and prompt-based tool calling. The backing model is selected by Google, not pinned by `gsb`; usage is estimated locally. Guest requests never carry account cookies or reuse an account conversation. Images, video generation, and MCP search are not supported for guest requests, and guest quota buckets are omitted.
+
+Prompts above 350,000 Unicode characters or 100,000 estimated tokens produce a warning; above 500,000 characters or 128,000 estimated tokens they are rejected locally. The catalogue's documented context size is not permission to exceed these anonymous-endpoint limits. Upstream per-IP limits are opaque and shared with other use of that IP.
+
+Set `BRIDGE_GUEST_ACCOUNT=0` to disable the synthetic guest account. Guest is never selected by default or used as failover for an account-backed request.
 
 ---
 
@@ -153,6 +177,7 @@ Settings load from environment variables, then `$BRIDGE_HOME/config.env`, then d
 | `BRIDGE_HOME` | `~/.gemini-stealth-bridge` | Data directory for `accounts/`, `config.env`, and `session-cache.json` |
 | `BRIDGE_API_KEY` / `BRIDGE_ADMIN_KEY` | `public` / empty | Pool API key and admin key for remote `/ui` & `/v1/admin/*` |
 | `BRIDGE_WEB_UI` | `false` (`1` in `start.sh`/Docker) | Enable `/ui` and `/v1/admin/*` |
+| `BRIDGE_GUEST_ACCOUNT` | `true` | Enable the explicit anonymous `guest-free` model; set `0` to disable |
 | `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing strategy: `rotate`, `lru`, or `fill-first` |
 | `BRIDGE_ACCOUNT_PRIORITY` | empty | Comma-separated account order for `fill-first` and UI ranking |
 | `BRIDGE_QUOTA_PREFLIGHT` | `strict` | Skip spent accounts (`strict`, `advisory`, `off`) |

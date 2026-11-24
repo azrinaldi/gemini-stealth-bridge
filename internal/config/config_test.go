@@ -55,6 +55,32 @@ func TestConfigCloneDeepCopiesReferenceFields(t *testing.T) {
 	}
 }
 
+func TestGuestAccountDefaultsOnAndHonorsOptOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BRIDGE_HOME", dir)
+	t.Setenv("BRIDGE_GUEST_ACCOUNT", "")
+	if cfg := Load(); !cfg.GuestAccount || cfg.FieldSources["BRIDGE_GUEST_ACCOUNT"] != "default" {
+		t.Fatal("anonymous guest must be enabled by default")
+	}
+	for _, value := range []string{"0", "false", "no", "off"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("BRIDGE_GUEST_ACCOUNT", value)
+			if cfg := Load(); cfg.GuestAccount || cfg.FieldSources["BRIDGE_GUEST_ACCOUNT"] != "env" {
+				t.Fatal("explicit guest opt-out was not applied")
+			}
+		})
+	}
+	if err := SaveEnvFile(filepath.Join(dir, "config.env"), map[string]string{"BRIDGE_GUEST_ACCOUNT": "0"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := Load(); cfg.GuestAccount || cfg.FieldSources["BRIDGE_GUEST_ACCOUNT"] != "file" {
+		t.Fatal("config.env guest opt-out was not applied")
+	}
+	t.Setenv("BRIDGE_GUEST_ACCOUNT", "yes")
+	if cfg := Load(); !cfg.GuestAccount || cfg.FieldSources["BRIDGE_GUEST_ACCOUNT"] != "env" {
+		t.Fatal("process guest setting must override config.env")
+	}
+}
 func TestSaveEnvFileMergesConcurrentUpdates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.env")
