@@ -13,6 +13,7 @@ import (
 // GeneratedImage represents a generated image returned inside a StreamGenerate frame.
 type GeneratedImage struct {
 	URL           string `json:"url"`
+	RawURL        string `json:"-"`
 	DownloadURL   string `json:"downloadUrl,omitempty"`
 	Title         string `json:"title,omitempty"`
 	Alt           string `json:"alt,omitempty"`
@@ -1110,7 +1111,7 @@ func extractGeneratedImages(c []any) []GeneratedImage {
 			continue
 		}
 		baseURL := imageSizeSuffixRe.ReplaceAllString(rawURL, "")
-		fullURL := baseURL + "=s0-d"
+		fullURL := baseURL + "=s1024-rw"
 		var title, alt string
 		var width, height int
 		if len(sub0_3) > 2 {
@@ -1135,7 +1136,8 @@ func extractGeneratedImages(c []any) []GeneratedImage {
 		}
 		images = append(images, GeneratedImage{
 			URL:           fullURL,
-			DownloadURL:   baseURL + "=s0-d",
+			RawURL:        rawURL,
+			DownloadURL:   baseURL + "=s1024-rw",
 			Title:         title,
 			Alt:           alt,
 			RevisedPrompt: alt,

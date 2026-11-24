@@ -17,10 +17,10 @@ func zzCookieEditorExport() string {
 		"SID", "HSID", "SSID", "APISID", "SAPISID",
 		"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 		"__Secure-1PSIDTS", "__Secure-3PSIDTS", "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",
-		"NID", "AEC",
+		"NID", "AEC", "__Secure-1PSIDRTS", "__Secure-3PSIDRTS", "COMPASS", "SEARCH_SAMESITE",
 		// things a real browser carries that are NOT in EssentialNames
 		"OSID", "LSID", "ACCOUNT_CHOOSER", "__Host-GAPS", "__Host-1PLSID", "__Host-3PLSID",
-		"__Secure-BUCKET", "__Secure-OSID", "SMSV", "SEARCH_SAMESITE", "CONSENT", "SOCS",
+		"__Secure-BUCKET", "__Secure-OSID", "SMSV", "CONSENT", "SOCS",
 		"1P_JAR", "SIDTS", "AID", "UV", "_gcl_au",
 	}
 	var list []c
@@ -38,12 +38,12 @@ func TestZZAuditImportDropsNonEssentialCookies(t *testing.T) {
 		t.Fatalf("ParseImportPayload: %v", err)
 	}
 	got := ParseHeader(hdr)
-	for _, n := range []string{"__Secure-1PSID", "OSID", "__Secure-OSID", "LSID", "__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS", "ACCOUNT_CHOOSER"} {
+	for _, n := range []string{"__Secure-1PSID", "OSID", "__Secure-OSID", "LSID", "__Host-1PLSID", "__Host-3PLSID", "__Host-GAPS", "ACCOUNT_CHOOSER", "__Secure-1PSIDRTS", "__Secure-3PSIDRTS", "COMPASS", "SEARCH_SAMESITE"} {
 		if got[n] == "" {
 			t.Errorf("expected session/rotation cookie %s to be preserved", n)
 		}
 	}
-	for _, n := range []string{"__Secure-BUCKET", "SIDTS", "AID", "UV", "_gcl_au", "1P_JAR", "CONSENT", "SOCS", "SEARCH_SAMESITE", "SMSV"} {
+	for _, n := range []string{"__Secure-BUCKET", "SIDTS", "AID", "UV", "_gcl_au", "1P_JAR", "CONSENT", "SOCS", "SMSV"} {
 		if _, ok := got[n]; ok {
 			t.Errorf("expected tracking/non-essential cookie %s to be dropped", n)
 		}

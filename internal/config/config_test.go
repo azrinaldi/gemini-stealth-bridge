@@ -55,6 +55,25 @@ func TestConfigCloneDeepCopiesReferenceFields(t *testing.T) {
 	}
 }
 
+func TestMediaPlainFetchIsOptInAndHonorsConfigPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BRIDGE_HOME", dir)
+	t.Setenv("BRIDGE_MEDIA_PLAIN_FETCH", "")
+	if Load().MediaPlainFetch {
+		t.Fatal("plain media fetching must be disabled by default")
+	}
+	if err := SaveEnvFile(filepath.Join(dir, "config.env"), map[string]string{"BRIDGE_MEDIA_PLAIN_FETCH": "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := Load(); !cfg.MediaPlainFetch || cfg.FieldSources["BRIDGE_MEDIA_PLAIN_FETCH"] != "file" {
+		t.Fatal("config.env flag was not loaded")
+	}
+	t.Setenv("BRIDGE_MEDIA_PLAIN_FETCH", "off")
+	if cfg := Load(); cfg.MediaPlainFetch || cfg.FieldSources["BRIDGE_MEDIA_PLAIN_FETCH"] != "env" {
+		t.Fatal("process environment must override config.env")
+	}
+}
+
 func TestSaveEnvFileMergesConcurrentUpdates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.env")

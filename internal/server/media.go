@@ -13,6 +13,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"log"
 	"math"
 	"mime"
 	"net/http"
@@ -69,7 +70,7 @@ type mediaEntry struct {
 
 	fetchMu sync.Mutex // Allows only one upstream download per entry at a time.
 	// Guarded by Server.mediaMu, including byte accounting on eviction.
-	data []byte
+	data        []byte
 	contentType string
 }
 
@@ -79,8 +80,8 @@ type mediaDownloader interface {
 
 const (
 	maxCachedMediaEntries = 96
-	maxCachedMediaBytes = 128 << 20
-	mediaTTL = 24 * time.Hour
+	maxCachedMediaBytes   = 128 << 20
+	mediaTTL              = 24 * time.Hour
 )
 
 var errMediaExpired = errors.New("media not found or expired")
@@ -156,7 +157,7 @@ func (s *Server) registerMedia(ctx context.Context, accountID, upstreamURL, fall
 			MimeType:    mimeType,
 			Ext:         ext,
 			Title:       title,
-			CreatedAt: now,
+			CreatedAt:   now,
 		}
 		s.mediaItems[id] = entry
 		s.mediaOrder = append(s.mediaOrder, id)
@@ -216,9 +217,13 @@ func (s *Server) ensureMediaBytes(ctx context.Context, entry *mediaEntry) ([]byt
 		return nil, "", fmt.Errorf("upstream client does not support media download")
 	}
 
-	data, ct, err := dl.DownloadMedia(ctx, entry.UpstreamURL, entry.FallbackURL)
+	var err error
+	data, ct, err = dl.DownloadMedia(ctx, entry.UpstreamURL, entry.FallbackURL)
 	if err != nil {
 		return nil, "", err
+	}
+	if len(data) == 0 {
+		return nil, "", fmt.Errorf("media download returned an empty body")
 	}
 	ct = safeMediaContentType(data, ct)
 	s.mediaMu.Lock()
@@ -267,6 +272,13 @@ func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errMediaExpired) {
 			status = http.StatusNotFound
 		}
+		if !errors.Is(err, errMediaExpired) {
+			host := ""
+			if u, perr := url.Parse(entry.UpstreamURL); perr == nil {
+				host = u.Hostname()
+			}
+			log.Printf("[media] fetch failed id=%s account=%s upstream_host=%s: %v", entry.ID, entry.AccountID, host, err)
+		}
 		sendJSON(w, status, map[string]any{"error": map[string]any{"message": http.StatusText(status)}}, nil)
 		return
 	}
@@ -306,9 +318,16 @@ func (s *Server) rewriteFrameMedia(ctx context.Context, accountID string, frame 
 		if rawURL == "" || strings.Contains(rawURL, "/v1/media/") {
 			continue
 		}
-		proxyURL, _ := s.registerMedia(ctx, accountID, rawURL, "", "image/jpeg", "jpg", frame.GeneratedImages[i].Title)
+		upstreamURL := rawURL
+		if frame.GeneratedImages[i].RawURL != "" {
+			upstreamURL = frame.GeneratedImages[i].RawURL
+		}
+		proxyURL, _ := s.registerMedia(ctx, accountID, upstreamURL, "", "image/jpeg", "jpg", frame.GeneratedImages[i].Title)
 		if proxyURL != "" {
 			frame.Text = strings.ReplaceAll(frame.Text, rawURL, proxyURL)
+			if frame.GeneratedImages[i].RawURL != "" {
+				frame.Text = strings.ReplaceAll(frame.Text, frame.GeneratedImages[i].RawURL, proxyURL)
+			}
 			frame.GeneratedImages[i].URL = proxyURL
 		}
 	}
@@ -350,6 +369,7 @@ type generatedMediaResult struct {
 	AspectRatio   string      `json:"aspect_ratio,omitempty"`
 	Markdown      string      `json:"markdown"`
 	Entry         *mediaEntry `json:"-"`
+	DownloadError error       `json:"-"`
 }
 
 type mediaGenParams struct {
@@ -483,16 +503,20 @@ func resolveAspectRatio(ar, size string) (string, error) {
 
 func applyGoogleImageURLFormat(rawURL, format string) (string, string, string) {
 	base := rawURL
+	query := ""
+	if idx := strings.IndexByte(base, '?'); idx >= 0 {
+		base, query = base[:idx], base[idx:]
+	}
 	if idx := strings.LastIndex(base, "=s"); idx > strings.LastIndex(base, "/") {
 		base = base[:idx]
 	}
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "png":
-		return base + "=s0-rp", "image/png", "png"
+		return base + "=s0-rp" + query, "image/png", "png"
 	case "gif":
-		return base, "image/gif", "gif"
+		return base + query, "image/gif", "gif"
 	default:
-		return base + "=s0-d", "image/jpeg", "jpg"
+		return base + "=s1024-rw" + query, "image/jpeg", "jpg"
 	}
 }
 
@@ -567,10 +591,17 @@ func (s *Server) runMediaGenerationOnAccount(
 				for i := range f.GeneratedImages {
 					raw := f.GeneratedImages[i].URL
 					if raw != "" && !strings.Contains(raw, "/v1/media/") {
-						formattedURL, mime, ext := applyGoogleImageURLFormat(raw, fmtHint)
-						proxyURL, _ := s.registerMedia(ctx, account.ID, formattedURL, raw, mime, ext, f.GeneratedImages[i].Title)
+						upstreamURL := raw
+						if f.GeneratedImages[i].RawURL != "" {
+							upstreamURL = f.GeneratedImages[i].RawURL
+						}
+						formattedURL, mime, ext := applyGoogleImageURLFormat(upstreamURL, fmtHint)
+						proxyURL, _ := s.registerMedia(ctx, account.ID, formattedURL, upstreamURL, mime, ext, f.GeneratedImages[i].Title)
 						if proxyURL != "" {
 							f.Text = strings.ReplaceAll(f.Text, raw, proxyURL)
+							if f.GeneratedImages[i].RawURL != "" {
+								f.Text = strings.ReplaceAll(f.Text, f.GeneratedImages[i].RawURL, proxyURL)
+							}
 							f.GeneratedImages[i].URL = proxyURL
 						}
 					}
@@ -596,8 +627,13 @@ func (s *Server) runMediaGenerationOnAccount(
 		entry := s.mediaItems[id]
 		s.mediaMu.RUnlock()
 		mime := "image/jpeg"
+		var downloadErr error
 		if entry != nil {
-			_, detectedMime, _ := s.ensureMediaBytes(ctx, entry)
+			_, detectedMime, fetchErr := s.ensureMediaBytes(ctx, entry)
+			downloadErr = fetchErr
+			if fetchErr != nil {
+				log.Printf("[media] image download failed account=%s: %v", account.ID, fetchErr)
+			}
 			if detectedMime != "" {
 				mime = detectedMime
 			} else if entry.MimeType != "" {
@@ -623,6 +659,7 @@ func (s *Server) runMediaGenerationOnAccount(
 			AspectRatio:   ar,
 			Markdown:      fmt.Sprintf("![%s](%s)", alt, img.URL),
 			Entry:         entry,
+			DownloadError: downloadErr,
 		})
 	}
 	for _, vid := range lastFrame.GeneratedVideos {
@@ -956,6 +993,10 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 
 	dataList := make([]map[string]any, 0, len(items))
 	for _, it := range items {
+		if respFormat == "b64_json" && it.DownloadError != nil {
+			sendChatError(w, false, transport.NewUpstreamError("generated media could not be downloaded for b64_json", 502, "media_download_failed", nil, nil))
+			return
+		}
 		revPrompt := it.RevisedPrompt
 		if revPrompt == "" {
 			revPrompt = promptStr
@@ -965,7 +1006,10 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 			"revised_prompt": revPrompt,
 			"mime_type":      it.MimeType,
 		}
-		width, height, actualRatio := s.describeActualAspectRatio(ctx, it.Entry, it.AspectRatio)
+		width, height, actualRatio := 0, 0, it.AspectRatio
+		if it.DownloadError == nil {
+			width, height, actualRatio = s.describeActualAspectRatio(ctx, it.Entry, it.AspectRatio)
+		}
 		if actualRatio != "" {
 			itemMap["aspect_ratio"] = actualRatio
 		}
@@ -977,10 +1021,14 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		if it.ThumbnailURL != "" {
 			itemMap["thumbnail_url"] = it.ThumbnailURL
 		}
-		if respFormat == "b64_json" && it.Entry != nil {
-			if rawBytes, _, bErr := s.ensureMediaBytes(ctx, it.Entry); bErr == nil && len(rawBytes) > 0 {
-				itemMap["b64_json"] = base64.StdEncoding.EncodeToString(rawBytes)
+		if respFormat == "b64_json" {
+			rawBytes, _, bErr := s.ensureMediaBytes(ctx, it.Entry)
+			if bErr != nil || len(rawBytes) == 0 {
+				log.Printf("[media] base64 download failed account=%s: %v", prep.account.ID, bErr)
+				sendChatError(w, false, transport.NewUpstreamError("generated media could not be downloaded for b64_json", 502, "media_download_failed", nil, nil))
+				return
 			}
+			itemMap["b64_json"] = base64.StdEncoding.EncodeToString(rawBytes)
 		}
 		dataList = append(dataList, itemMap)
 	}

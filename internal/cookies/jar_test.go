@@ -159,3 +159,29 @@ func TestParseImportPayload_AllUserFormats(t *testing.T) {
 		}
 	})
 }
+
+func TestModernSessionCookiesPreservedAcrossImportFormats(t *testing.T) {
+	const header = "SAPISID=fixture; __Secure-1PSID=fixture; __Secure-1PSIDRTS=rts1; __Secure-3PSIDRTS=rts3; COMPASS=compass; SEARCH_SAMESITE=same; UNRELATED_COOKIE=junk"
+	for name, input := range map[string]string{
+		"header":   header,
+		"curl":     "curl 'https://gemini.google.com/app' -b '" + header + "'",
+		"json":     `[{"name":"SAPISID","value":"fixture","domain":".google.com"},{"name":"__Secure-1PSID","value":"fixture","domain":".google.com"},{"name":"__Secure-1PSIDRTS","value":"rts1","domain":".google.com"},{"name":"__Secure-3PSIDRTS","value":"rts3","domain":".google.com"},{"name":"COMPASS","value":"compass","domain":".google.com"},{"name":"SEARCH_SAMESITE","value":"same","domain":".google.com"},{"name":"UNRELATED_COOKIE","value":"junk","domain":".google.com"}]`,
+		"netscape": ".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tfixture\n.google.com\tTRUE\t/\tTRUE\t0\t__Secure-1PSID\tfixture\n.google.com\tTRUE\t/\tTRUE\t0\t__Secure-1PSIDRTS\trts1\n.google.com\tTRUE\t/\tTRUE\t0\t__Secure-3PSIDRTS\trts3\n.google.com\tTRUE\t/\tTRUE\t0\tCOMPASS\tcompass\n.google.com\tTRUE\t/\tTRUE\t0\tSEARCH_SAMESITE\tsame\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			parsed, _, err := ParseImportPayload(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ParseHeader(parsed)
+			for key, want := range map[string]string{"__Secure-1PSIDRTS": "rts1", "__Secure-3PSIDRTS": "rts3", "COMPASS": "compass", "SEARCH_SAMESITE": "same"} {
+				if got[key] != want {
+					t.Errorf("modern session cookie %s was lost", key)
+				}
+			}
+			if got["UNRELATED_COOKIE"] != "" {
+				t.Fatal("unrelated cookie retained")
+			}
+		})
+	}
+}

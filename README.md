@@ -161,6 +161,7 @@ Settings load from environment variables, then `$BRIDGE_HOME/config.env`, then d
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Max concurrent streams per account (`0` disables) |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject silent upstream model substitution and fail over |
 | `BRIDGE_PROXY_SERVER` / `BRIDGE_EGRESS_PER_ACCOUNT` | empty | Global or per-account (`id:url`) HTTP/SOCKS5 proxy |
+| `BRIDGE_MEDIA_PLAIN_FETCH` | `false` | Experimental standard HTTP media downloads; preserves account egress and leaves generation on uTLS |
 
 ---
 
