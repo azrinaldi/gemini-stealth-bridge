@@ -373,6 +373,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			grounding             []gemini.GroundingSource
 		)
 		observeIdentity := func(ansID, ansLabel string) {
+			if ansLabel != "" && (ansID != "" || account.Guest) {
+				servedLabel = ansLabel
+			}
 			if ansID == "" {
 				return
 			}
@@ -380,9 +383,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				identityConflict = true
 			}
 			servedID = ansID
-			if ansLabel != "" {
-				servedLabel = ansLabel
-			}
 		}
 
 		attemptStartedAt := time.Now()
@@ -417,7 +417,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		var attemptStateMu sync.Mutex
 		c := s.clientFor(account)
 		opts.FreshSocket = freshSocketNext
-		if rebootstrapNext {
+		if rebootstrapNext && !account.Guest {
 			_ = c.Bootstrap(ctx)
 		}
 		freshSocketNext = false
@@ -444,6 +444,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			firstUpstreamFrameMs.Store(-1)
 			// Capacity and operator state are checked again at dispatch.
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
+				if account.Guest && update.MediaToolActive {
+					return transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil)
+				}
 				if len(update.Frames) > 0 || update.AnsweredModelID != "" || strings.TrimSpace(update.Activity) != "" {
 					markPhase(&firstUpstreamFrameMs)
 				}
@@ -493,6 +496,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
 				for _, frame := range update.Frames {
+					if account.Guest && (len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0) {
+						return transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil)
+					}
 					if !selected {
 						candidateID = frame.RCID
 						selected = true
@@ -948,7 +954,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						case <-time.After(100 * time.Millisecond):
 						case <-ctx.Done():
 						}
-						if len(fullPrompt) > 120000 {
+						if !account.Guest && len(fullPrompt) > 120000 {
 							if compacted, extraOverflow, cErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 								StartIndex:      0,
 								MaxPromptChars:  100000,
@@ -1140,14 +1146,20 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		// instead of letting "gemini-carbon" silently answer as "4 Argon".
 		labelMismatch := gemini.ServedLabelMismatch(*model, servedID, servedLabel)
 		var served map[string]any
-		if servedID != "" {
+		if servedID != "" || account.Guest && servedLabel != "" {
 			served = map[string]any{"id": servedID, "label": servedLabel}
 			if labelMismatch {
 				served["label_mismatch"] = true
 			}
 		}
 
-		usage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
+		var usage map[string]any
+		if account.Guest {
+			usage = prompt.BuildUsage(curPrompt, text, thoughts)
+			usage["estimated"] = true
+		} else {
+			usage = s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
+		}
 		s.clearModelExhausted(account, model.ModelName)
 		stopGrace()
 		stopKeepalive()
@@ -1222,7 +1234,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 			}
-			if served != nil && (servedID != model.ModelID || labelMismatch) {
+			if served != nil && (account.Guest || servedID != model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
 			emit(sseDeltaEmpty{}, finish, usage)
@@ -1259,7 +1271,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				},
 				"usage": usage,
 			}
-			if served != nil && (servedID != model.ModelID || labelMismatch) {
+			if served != nil && (account.Guest || servedID != model.ModelID || labelMismatch) {
 				payload["requested_model"] = mid
 				payload["model_served"] = served
 			}
@@ -1279,32 +1291,32 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		totalMs := time.Since(reqStartedAt).Milliseconds()
 		pt := computePerfTelemetry(cacheUsed, preDispatchMs.Load(), firstUpstreamFrameMs.Load(), ttftMs.Load(), totalMs, upstream, outTok)
 		s.logRequestJSON(map[string]any{
-			"req_id":             cmplID,
-			"endpoint":           "/v1/chat/completions",
-			"model":              mid,
-			"account":            account.ID,
-			"effort":             effortStr,
-			"prompt_bytes":       len(curPrompt),
-			"header_bytes":       flattenStats.HeaderBytes,
-			"body_bytes":         flattenStats.BodyBytes,
-			"footer_bytes":       flattenStats.FooterBytes,
-			"tool_bytes":         flattenStats.ToolSchemaBytes,
-			"ttft_ms":            ttftMs.Load(),
-			"total_ms":           totalMs,
-			"status":             200,
-			"error_code":         "",
-			"cached_tokens":      cachedTok,
-			"attempts":           curAttempt + 1,
-			"retry_reason":       lastRetryReason,
-			"prepare_ms":         prepareMs,
-			"cache_hit":          cacheUsed,
-			"cache_prefix_split": prep.cacheSplit,
-			"upload_ms":          uploadMs.Load(),
-			"identity_ms":        identityMs.Load(),
-			"header_ms":          headerMs.Load(),
-			"first_reasoning_ms": firstReasoningMs.Load(),
-			"first_content_ms":   firstContentMs.Load(),
-			"first_tool_ms":      firstToolMs.Load(),
+			"req_id":                cmplID,
+			"endpoint":              "/v1/chat/completions",
+			"model":                 mid,
+			"account":               account.ID,
+			"effort":                effortStr,
+			"prompt_bytes":          len(curPrompt),
+			"header_bytes":          flattenStats.HeaderBytes,
+			"body_bytes":            flattenStats.BodyBytes,
+			"footer_bytes":          flattenStats.FooterBytes,
+			"tool_bytes":            flattenStats.ToolSchemaBytes,
+			"ttft_ms":               ttftMs.Load(),
+			"total_ms":              totalMs,
+			"status":                200,
+			"error_code":            "",
+			"cached_tokens":         cachedTok,
+			"attempts":              curAttempt + 1,
+			"retry_reason":          lastRetryReason,
+			"prepare_ms":            prepareMs,
+			"cache_hit":             cacheUsed,
+			"cache_prefix_split":    prep.cacheSplit,
+			"upload_ms":             uploadMs.Load(),
+			"identity_ms":           identityMs.Load(),
+			"header_ms":             headerMs.Load(),
+			"first_reasoning_ms":    firstReasoningMs.Load(),
+			"first_content_ms":      firstContentMs.Load(),
+			"first_tool_ms":         firstToolMs.Load(),
 			"done_ms":               totalMs,
 			"account_switches":      accountSwitches.Load(),
 			"requested_model":       mid,
@@ -1426,7 +1438,7 @@ func (s *Server) evaluateAttemptCompletion(
 	if identityConflict {
 		return nil, transport.NewUpstreamError("upstream reported conflicting served models", 502, "model_identity_conflict", nil, nil)
 	}
-	if cfg.RejectDowngrade && servedID == "" {
+	if cfg.RejectDowngrade && servedID == "" && !account.Guest {
 		return nil, transport.NewUpstreamError("upstream did not identify the served model", 502, "model_identity_unknown", nil, nil)
 	}
 	if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {

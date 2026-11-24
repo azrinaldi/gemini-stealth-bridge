@@ -45,7 +45,8 @@ func (s *Server) registerAccountTokensLocked(rawID, targetID string) {
 	s.tokenToAcct[rawID] = targetID
 }
 
-// Accounts returns a snapshot of the loaded accounts.
+// Accounts returns credential-backed accounts only. The anonymous guest lives
+// outside credential reload, rotation, probing, aliases and account counts.
 func (s *Server) Accounts() []*AccountState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -60,6 +61,9 @@ func (s *Server) Accounts() []*AccountState {
 func (s *Server) scopedAccounts(scope AuthScope) []*AccountState {
 	accts := s.Accounts()
 	if scope.AccountID == "" && scope.Group == "" {
+		if s.cfgSnapshot().GuestAccount {
+			accts = append(accts, s.guest)
+		}
 		return accts
 	}
 	var out []*AccountState
@@ -77,6 +81,21 @@ func (s *Server) scopedAccounts(scope AuthScope) []*AccountState {
 		group := a.AccountGroup
 		a.mu.RUnlock()
 		if group == scope.Group {
+			out = append(out, a)
+		}
+	}
+	if scope.Pool && s.cfgSnapshot().GuestAccount {
+		out = append(out, s.guest)
+	}
+	return out
+}
+
+// generationAccounts separates anonymous and credentialed routing even when a
+// caller supplies an unfiltered list. Neither partition can fail over to the other.
+func generationAccounts(accts []*AccountState, guest bool) []*AccountState {
+	out := make([]*AccountState, 0, len(accts))
+	for _, a := range accts {
+		if a != nil && a.Guest == guest {
 			out = append(out, a)
 		}
 	}
@@ -356,6 +375,9 @@ func dedupeAccounts(list []*AccountState, credFile string) []*AccountState {
 func (s *Server) clientFor(a *AccountState) UpstreamClient {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.Guest {
+		return a.Client
+	}
 	if s.clientFactory != nil {
 		c := s.clientFactory(a)
 		if c != nil {
@@ -390,6 +412,9 @@ func shouldClearTransientFailure(lastError string) bool {
 // RefreshAccount refreshes the live model list and quota for a single account,
 // preserving the last known good state on failure.
 func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool) *AccountState {
+	if a == nil || a.Guest {
+		return a
+	}
 	a.mu.RLock()
 	hasModels := len(a.Models) > 0
 	fresh := !a.ModelsAt.IsZero() && time.Since(a.ModelsAt) < 10*time.Minute
@@ -471,7 +496,7 @@ func modelNames(models []gemini.ModelInfo) []string {
 }
 
 func (s *Server) allModels() []gemini.ModelInfo {
-	accts := s.Accounts()
+	accts := s.scopedAccounts(AuthScope{})
 	seen := make(map[string]bool)
 	var out []gemini.ModelInfo
 	for _, a := range accts {
@@ -490,6 +515,9 @@ func (s *Server) allModels() []gemini.ModelInfo {
 func resolveModelOnAccount(a *AccountState, wanted string) *gemini.ModelInfo {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	if a.Guest != gemini.IsGuestModelRequest(wanted) {
+		return nil
+	}
 	w := strings.TrimSpace(wanted)
 	if w == "" {
 		if len(a.Models) > 0 {
@@ -508,7 +536,7 @@ func resolveModelOnAccount(a *AccountState, wanted string) *gemini.ModelInfo {
 }
 
 func (s *Server) markAccountQuarantined(a *AccountState, reason string) {
-	if a == nil {
+	if a == nil || a.Guest {
 		return
 	}
 	a.mu.Lock()
@@ -532,13 +560,14 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 		return nil
 	}
 	cfg := s.cfgSnapshot()
+	maxRPM, maxConcurrent := accountRateLimits(cfg, a)
 	now := s.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := accountBlockedErrorLocked(a); err != nil {
 		return err
 	}
-	if cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= cfg.MaxConcurrentPerAccount {
+	if maxConcurrent > 0 && a.activeStreams >= maxConcurrent {
 		return transport.NewUpstreamError("account concurrent stream limit reached", 429, "rate_limit_error", map[string]string{"retry-after": "2"}, nil)
 	}
 	cutoff := now.Add(-60 * time.Second)
@@ -549,13 +578,13 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 		}
 	}
 	a.reqTimestamps = kept
-	if cfg.MaxRPMPerAccount > 0 && len(a.reqTimestamps) >= cfg.MaxRPMPerAccount {
+	if maxRPM > 0 && len(a.reqTimestamps) >= maxRPM {
 		waitSec := int(math.Ceil(a.reqTimestamps[0].Add(60 * time.Second).Sub(now).Seconds()))
 		if waitSec < 1 {
 			waitSec = 1
 		}
 		return transport.NewUpstreamError(
-			fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, cfg.MaxRPMPerAccount),
+			fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, maxRPM),
 			429,
 			"rate_limit_error",
 			map[string]string{"retry-after": strconv.Itoa(waitSec)},
@@ -568,6 +597,19 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 	}
 	a.totalRequests++
 	return nil
+}
+
+func accountRateLimits(cfg config.Config, a *AccountState) (rpm, concurrent int) {
+	rpm, concurrent = cfg.MaxRPMPerAccount, cfg.MaxConcurrentPerAccount
+	if a != nil && a.Guest {
+		if source := cfg.FieldSources["BRIDGE_MAX_RPM_PER_ACCOUNT"]; source == "" || source == "default" {
+			rpm = 10
+		}
+		if source := cfg.FieldSources["BRIDGE_MAX_CONCURRENT_PER_ACCOUNT"]; source == "" || source == "default" {
+			concurrent = 2
+		}
+	}
+	return rpm, concurrent
 }
 
 func accountBlockedError(a *AccountState) error {
@@ -591,7 +633,7 @@ func (s *Server) checkPreFlightQuota(a *AccountState, model gemini.ModelInfo, mi
 }
 
 func (s *Server) checkPreFlightQuotaInternal(a *AccountState, model gemini.ModelInfo, mid string, forSelection bool) error {
-	if a == nil {
+	if a == nil || a.Guest {
 		return nil
 	}
 	cfg := s.cfgSnapshot()
@@ -750,6 +792,9 @@ func (s *Server) poolAvailabilityError(accts []*AccountState, requested string, 
 }
 
 func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName string) error {
+	if a.Guest {
+		return transport.NewUpstreamError("anonymous upstream returned no candidate answer", 502, "empty_upstream_response", nil, nil)
+	}
 	c := s.clientFor(a)
 	qCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	quota := c.GetQuota(qCtx)
@@ -878,7 +923,7 @@ func quotaExhaustionCooldown(strikes int) time.Duration {
 }
 
 func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
-	if a == nil || modelName == "" {
+	if a == nil || a.Guest || modelName == "" {
 		return
 	}
 	subID := "sub:" + strings.ToLower(strings.TrimSpace(modelName))
@@ -1056,7 +1101,7 @@ func (s *Server) isAccountBusy(acctID string) bool {
 }
 
 func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *prompt.HistoryHasher) bool {
-	if !s.cfgSnapshot().SessionCache || a == nil || modelName == "" || hasher == nil || hasher.Len() < 3 {
+	if !s.cfgSnapshot().SessionCache || a == nil || a.Guest || modelName == "" || hasher == nil || hasher.Len() < 3 {
 		return false
 	}
 	for split := hasher.Len() - 1; split >= 2; split-- {
@@ -1115,7 +1160,7 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 }
 
 func canTryFallback(a *AccountState, tried map[string]bool, originGroup string) bool {
-	if a == nil || tried[a.ID] {
+	if a == nil || a.Guest || tried[a.ID] {
 		return false
 	}
 	a.mu.RLock()
@@ -1241,6 +1286,9 @@ func (s *Server) markAccountFailure(a *AccountState, msg string) {
 }
 
 func (s *Server) markAccountFailureSnapshot(a *AccountState, msg string) accountFailureSnapshot {
+	if a == nil || a.Guest {
+		return accountFailureSnapshot{}
+	}
 	now := s.now()
 	a.mu.Lock()
 	snap := accountFailureSnapshot{
@@ -1342,12 +1390,12 @@ func noFrameTimeoutForAttempt(cfg config.Config, model gemini.ModelInfo, effort 
 	if cfg.NoFrameTimeout <= 0 {
 		return 0
 	}
-	if cfg.NoFrameTimeoutExplicit || effort != "low" {
+	if cfg.NoFrameTimeoutExplicit || !gemini.IsGuestModel(model) && effort != "low" {
 		return cfg.NoFrameTimeout
 	}
 	name := strings.ToLower(model.ModelName + " " + model.ModelID)
 	capDur := 45 * time.Second
-	if strings.Contains(name, "hydrogen") || strings.Contains(name, "flash") || strings.Contains(name, "lite") || strings.Contains(name, "adapts") || strings.Contains(name, "auto") {
+	if gemini.IsGuestModel(model) || strings.Contains(name, "hydrogen") || strings.Contains(name, "flash") || strings.Contains(name, "lite") || strings.Contains(name, "adapts") || strings.Contains(name, "auto") {
 		capDur = 30 * time.Second
 	}
 	if cfg.NoFrameTimeout > capDur {
@@ -1431,23 +1479,24 @@ func (s *Server) accountRateLimited(a *AccountState) bool {
 		return false
 	}
 	cfg := s.cfgSnapshot()
-	if cfg.MaxConcurrentPerAccount <= 0 && cfg.MaxRPMPerAccount <= 0 {
+	maxRPM, maxConcurrent := accountRateLimits(cfg, a)
+	if maxConcurrent <= 0 && maxRPM <= 0 {
 		return false
 	}
 	cutoff := s.now().Add(-60 * time.Second)
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= cfg.MaxConcurrentPerAccount {
+	if maxConcurrent > 0 && a.activeStreams >= maxConcurrent {
 		return true
 	}
-	if cfg.MaxRPMPerAccount > 0 {
+	if maxRPM > 0 {
 		n := 0
 		for _, ts := range a.reqTimestamps {
 			if ts.After(cutoff) {
 				n++
 			}
 		}
-		if n >= cfg.MaxRPMPerAccount {
+		if n >= maxRPM {
 			return true
 		}
 	}
@@ -1561,6 +1610,19 @@ func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool
 }
 
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
+	guestRequest := gemini.IsGuestModelRequest(requested)
+	accts = generationAccounts(accts, guestRequest)
+	if guestRequest {
+		if !s.cfgSnapshot().GuestAccount || scope.Group != "" || scope.AccountID != "" && !scope.Pool {
+			return nil
+		}
+		if !scope.Admin && !scope.Pool && len(s.cfgSnapshot().AccountTokens) > 0 {
+			return nil
+		}
+		// Anonymous selection must not move the real pool's sticky cursor or
+		// inspect its transport/continuation affinity.
+		return diagnosticChatAccount(accts, requested, 0)
+	}
 	if scope.AccountID != "" {
 		for _, a := range accts {
 			if a != nil && a.ID == scope.AccountID {
@@ -1611,7 +1673,7 @@ func diagnosticChatAccount(accts []*AccountState, requested string, start int) *
 	var unprobed, missing *AccountState
 	for i := range len(accts) {
 		a := accts[(start+i)%len(accts)]
-		if a == nil {
+		if a == nil || a.Guest != gemini.IsGuestModelRequest(requested) {
 			continue
 		}
 		a.mu.RLock()
@@ -1642,7 +1704,7 @@ func diagnosticChatAccount(accts []*AccountState, requested string, start int) *
 const quotaRefreshCooldown = 45 * time.Second
 
 func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
-	if a == nil || c == nil {
+	if a == nil || a.Guest || c == nil {
 		return
 	}
 	now := s.now()
@@ -1748,28 +1810,71 @@ func (s *Server) prepareGeneration(
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
 	requested, inlineThink := gemini.ParseModelRequest(rawModel)
+	guestRequest := gemini.IsGuestModelRequest(requested)
+	if guestRequest && scope.Pool {
+		// A single-real-account pool key remains pinned for normal requests;
+		// only the explicit anonymous model escapes that credentialed scope.
+		scope.AccountID, scope.Group, scope.Admin = "", "", true
+	}
 
 	// The scope decides which accounts this request may touch: an account key
 	// sees only its own account, a group key only its group, the pool key all
 	// of them. Scoping the list here keeps failover inside the same boundary.
-	accts := s.scopedAccounts(scope)
+	accts := generationAccounts(s.scopedAccounts(scope), guestRequest)
 	if len(accts) == 0 {
+		if guestRequest {
+			return nil, transport.NewUpstreamError("model guest-free is not available for this api key or BRIDGE_GUEST_ACCOUNT is disabled", 404, "model_not_found", nil, nil)
+		}
 		return nil, transport.NewUpstreamError("no accounts configured", 503, "auth_unavailable", nil, nil)
 	}
 
-	if toolbridge.ShouldAugmentMediaTool(messages) {
+	if !guestRequest && toolbridge.ShouldAugmentMediaTool(messages) {
 		toolsRaw = toolbridge.AugmentToolsWithMediaGenerator(toolsRaw, toolChoiceRaw)
 	}
 
 	cfg := s.cfgSnapshot()
 	var hasher *prompt.HistoryHasher
-	if cfg.SessionCache && len(messages) >= 3 {
+	if !guestRequest && cfg.SessionCache && len(messages) >= 3 {
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
 	}
 
 	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
 	if err != nil {
 		return nil, err
+	}
+	if guestRequest {
+		hasText := false
+		for _, tool := range contract.Tools {
+			if tool.Name == toolbridge.BuiltinMediaToolName {
+				return nil, transport.NewUpstreamError("guest-free does not support generate_media", 400, "unsupported_guest_feature", nil, nil)
+			}
+		}
+		for _, message := range messages {
+			if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
+				hasText = true
+			}
+			if calls, _ := message["tool_calls"].([]any); len(calls) > 0 {
+				hasText = true
+			}
+			parts, _ := message["content"].([]any)
+			for _, part := range parts {
+				if text, ok := part.(string); ok && strings.TrimSpace(text) != "" {
+					hasText = true
+				}
+				if p, ok := part.(map[string]any); ok {
+					if text, _ := p["text"].(string); strings.TrimSpace(text) != "" {
+						hasText = true
+					}
+					kind, _ := p["type"].(string)
+					if kind != "" && kind != "text" && kind != "input_text" && kind != "output_text" && kind != "thinking" && kind != "reasoning" {
+						return nil, transport.NewUpstreamError("guest-free supports text and function tools only; images and media are unavailable", 400, "unsupported_guest_feature", nil, nil)
+					}
+				}
+			}
+		}
+		if !hasText {
+			return nil, transport.NewUpstreamError("guest-free prompt must not be empty", 400, "invalid_request_error", nil, nil)
+		}
 	}
 
 	candidatePool := accts
@@ -1863,12 +1968,14 @@ func (s *Server) prepareGeneration(
 			}
 			continue
 		}
-		if rErr := s.checkAccountRateLimit(cand); rErr != nil {
-			lastErr = rErr
-			if scope.AccountID != "" {
-				return nil, rErr
+		if !cand.Guest {
+			if rErr := s.checkAccountRateLimit(cand); rErr != nil {
+				lastErr = rErr
+				if scope.AccountID != "" {
+					return nil, rErr
+				}
+				continue
 			}
-			continue
 		}
 		account = cand
 		model = m
@@ -1912,14 +2019,40 @@ func (s *Server) prepareGeneration(
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
 	}
 
-	fullPrompt, overflowParts, flattenStats, err := prompt.FlattenMessagesWithStats(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+	flattenOpts := prompt.FlattenOptions{
 		StartIndex:      0,
 		MaxPromptChars:  cfg.MaxPromptChars,
 		MaxOldToolChars: cfg.MaxOldToolChars,
 		AllowOverflow:   cfg.HistoryOffload,
-	})
+	}
+	flattenMessages := messages
+	if guestRequest {
+		// No guest history is compacted or offloaded. Move all system/developer
+		// instructions ahead of the transcript before validating the whole prompt.
+		flattenOpts = prompt.FlattenOptions{}
+		flattenMessages = make([]map[string]any, 0, len(messages))
+		for _, message := range messages {
+			if message["role"] == "system" || message["role"] == "developer" {
+				flattenMessages = append(flattenMessages, message)
+			}
+		}
+		for _, message := range messages {
+			if message["role"] != "system" && message["role"] != "developer" {
+				flattenMessages = append(flattenMessages, message)
+			}
+		}
+	}
+	fullPrompt, overflowParts, flattenStats, err := prompt.FlattenMessagesWithStats(flattenMessages, toolsRaw, toolChoiceRaw, flattenOpts)
 	if err != nil {
 		return nil, err
+	}
+	if guestRequest {
+		if err := gemini.ValidateGuestPrompt(fullPrompt, prompt.EstimateTokens(fullPrompt)); err != nil {
+			return nil, err
+		}
+		if err := s.checkAccountRateLimit(account); err != nil {
+			return nil, err
+		}
 	}
 
 	imageParts := prompt.ExtractImageParts(messages)
@@ -1955,7 +2088,7 @@ func (s *Server) prepareGeneration(
 	opts := gemini.StreamOptions{
 		Model:           model,
 		ThinkingLevel:   thinkLvl,
-		Temporary:       tempReq || cfg.Temporary,
+		Temporary:       guestRequest || tempReq || cfg.Temporary,
 		Language:        cfg.Locale,
 		DisableTools:    false,
 		HasTools:        hasTools,

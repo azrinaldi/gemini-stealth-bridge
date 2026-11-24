@@ -117,6 +117,9 @@ func DocumentedModelKey(m ModelInfo) string {
 // reports which of the two was used so callers can tell a verified number from a
 // configured guess.
 func ResolveModelLimits(m ModelInfo, fallbackContext, fallbackOutput int) (ModelLimits, string) {
+	if IsGuestModel(m) {
+		return documentedModelLimits["gemini-3.5-flash-lite"], "documented"
+	}
 	for _, key := range DocumentedModelKeys(m) {
 		if lim, ok := documentedModelLimits[key]; ok {
 			return lim, "documented"
@@ -287,6 +290,9 @@ func IsReasoningModel(modelName string) bool {
 // because its name contains "flash". Name heuristics remain as a fallback only
 // for registries that carry no thinking policy at all, and for the static list.
 func ResolveModelCapabilities(m ModelInfo) ModelCapabilities {
+	if IsGuestModel(m) {
+		return ModelCapabilities{Tools: true, DefaultEffort: "low"}
+	}
 	base := ModelCapabilities{
 		Vision:        true,
 		Tools:         true,
@@ -525,6 +531,11 @@ func labelMatches(served string, names []string) bool {
 // IsMatchingServedModel checks whether the upstream frame's answeredModelId /
 // answeredModelLabel matches the requested ModelInfo (preventing silent downgrades).
 func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
+	if IsGuestModel(m) {
+		// Anonymous generation cannot pin an upstream model. Its label is a fact,
+		// not a downgrade verdict against a fabricated registry entry.
+		return true
+	}
 	if servedID != "" && m.ModelID != "" {
 		if strings.EqualFold(servedID, m.ModelID) {
 			return true
@@ -571,7 +582,7 @@ func isRouterTier(m ModelInfo) bool {
 // "4 Argon". The id comparison alone accepted that silently, so a client asking
 // for the new tier could not tell it was still served the old one.
 func ServedLabelMismatch(m ModelInfo, servedID, servedLabel string) bool {
-	if servedLabel == "" || isRouterTier(m) {
+	if servedLabel == "" || IsGuestModel(m) || isRouterTier(m) {
 		return false
 	}
 	if servedID != "" && m.ModelID != "" && !strings.EqualFold(servedID, m.ModelID) {

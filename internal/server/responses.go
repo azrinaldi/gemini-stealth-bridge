@@ -510,6 +510,9 @@ func buildResponsesUsage(chatUsage map[string]any) map[string]any {
 			}
 		}
 	}
+	if estimated, _ := chatUsage["estimated"].(bool); estimated {
+		res["estimated"] = true
+	}
 	return res
 }
 
@@ -889,6 +892,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			attemptStateMu        sync.Mutex
 		)
 		observeIdentity := func(ansID, ansLabel string) {
+			if ansLabel != "" && (ansID != "" || account.Guest) {
+				servedLabel = ansLabel
+			}
 			if ansID == "" {
 				return
 			}
@@ -896,13 +902,10 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				identityConflict = true
 			}
 			servedID = ansID
-			if ansLabel != "" {
-				servedLabel = ansLabel
-			}
 		}
 		c := s.clientFor(account)
 		opts.FreshSocket = freshSocketNext
-		if rebootstrapNext {
+		if rebootstrapNext && !account.Guest {
 			_ = c.Bootstrap(ctx)
 		}
 		freshSocketNext = false
@@ -928,6 +931,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			preDispatchMs.Store(time.Since(reqStartedAt).Milliseconds())
 			firstUpstreamFrameMs.Store(-1)
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
+				if account.Guest && update.MediaToolActive {
+					return transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil)
+				}
 				if len(update.Frames) > 0 || update.AnsweredModelID != "" || strings.TrimSpace(update.Activity) != "" {
 					markPhase(&firstUpstreamFrameMs)
 				}
@@ -976,6 +982,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				}
 				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
 				for _, frame := range update.Frames {
+					if account.Guest && (len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0) {
+						return transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil)
+					}
 					if !selected {
 						candidateID = frame.RCID
 						selected = true
@@ -1394,7 +1403,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						case <-time.After(100 * time.Millisecond):
 						case <-ctx.Done():
 						}
-						if len(fullPrompt) > 120000 {
+						if !account.Guest && len(fullPrompt) > 120000 {
 							if compacted, extraOverflow, cErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 								StartIndex:      0,
 								MaxPromptChars:  100000,
@@ -1573,7 +1582,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 		oaCalls := toolbridge.ToOpenAIToolCalls(calls)
 
-		chatUsage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, contentStr, thoughts)
+		var chatUsage map[string]any
+		if account.Guest {
+			chatUsage = prompt.BuildUsage(curPrompt, text, thoughts)
+			chatUsage["estimated"] = true
+		} else {
+			chatUsage = s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, contentStr, thoughts)
+		}
 		respUsage := buildResponsesUsage(chatUsage)
 		s.clearModelExhausted(account, model.ModelName)
 		if !opts.Temporary {
@@ -1826,6 +1841,10 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"output":     outputItems,
 			"usage":      respUsage,
 		}
+		if account.Guest && (servedID != "" || servedLabel != "") {
+			payload["requested_model"] = mid
+			payload["model_served"] = map[string]any{"id": servedID, "label": servedLabel}
+		}
 		if incompleteDetails != nil {
 			payload["incomplete_details"] = incompleteDetails
 		}
@@ -1846,32 +1865,32 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			cachedTok, _ = d["cached_tokens"].(int)
 		}
 		s.logRequestJSON(map[string]any{
-			"req_id":             respID,
-			"endpoint":           "/v1/responses",
-			"model":              mid,
-			"account":            account.ID,
-			"effort":             effortStr,
-			"prompt_bytes":       len(curPrompt),
-			"header_bytes":       flattenStats.HeaderBytes,
-			"body_bytes":         flattenStats.BodyBytes,
-			"footer_bytes":       flattenStats.FooterBytes,
-			"tool_bytes":         flattenStats.ToolSchemaBytes,
-			"ttft_ms":            ttftMs.Load(),
-			"total_ms":           totalMs,
-			"status":             200,
-			"error_code":         "",
-			"cached_tokens":      cachedTok,
-			"attempts":           curAttempt + 1,
-			"retry_reason":       lastRetryReason,
-			"prepare_ms":         prepareMs,
-			"cache_hit":          cacheUsed,
-			"cache_prefix_split": prep.cacheSplit,
-			"upload_ms":          uploadMs.Load(),
-			"identity_ms":        identityMs.Load(),
-			"header_ms":          headerMs.Load(),
-			"first_reasoning_ms": firstReasoningMs.Load(),
-			"first_content_ms":   firstContentMs.Load(),
-			"first_tool_ms":      firstToolMs.Load(),
+			"req_id":                respID,
+			"endpoint":              "/v1/responses",
+			"model":                 mid,
+			"account":               account.ID,
+			"effort":                effortStr,
+			"prompt_bytes":          len(curPrompt),
+			"header_bytes":          flattenStats.HeaderBytes,
+			"body_bytes":            flattenStats.BodyBytes,
+			"footer_bytes":          flattenStats.FooterBytes,
+			"tool_bytes":            flattenStats.ToolSchemaBytes,
+			"ttft_ms":               ttftMs.Load(),
+			"total_ms":              totalMs,
+			"status":                200,
+			"error_code":            "",
+			"cached_tokens":         cachedTok,
+			"attempts":              curAttempt + 1,
+			"retry_reason":          lastRetryReason,
+			"prepare_ms":            prepareMs,
+			"cache_hit":             cacheUsed,
+			"cache_prefix_split":    prep.cacheSplit,
+			"upload_ms":             uploadMs.Load(),
+			"identity_ms":           identityMs.Load(),
+			"header_ms":             headerMs.Load(),
+			"first_reasoning_ms":    firstReasoningMs.Load(),
+			"first_content_ms":      firstContentMs.Load(),
+			"first_tool_ms":         firstToolMs.Load(),
 			"done_ms":               totalMs,
 			"account_switches":      accountSwitches.Load(),
 			"requested_model":       mid,

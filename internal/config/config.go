@@ -31,6 +31,7 @@ type Config struct {
 	APIKey                  string
 	AccountTokens           map[string]string
 	GroupTokens             map[string]string
+	GuestAccount            bool
 	IncludeGrounding        bool
 	SearchTimeout           time.Duration
 	Temporary               bool
@@ -313,6 +314,7 @@ func FromEnv() *Config {
 		APIKey:                  lookupStr("BRIDGE_API_KEY", "public"),
 		AccountTokens:           tokens,
 		GroupTokens:             groupTokens,
+		GuestAccount:            lookupBool("BRIDGE_GUEST_ACCOUNT", true),
 		IncludeGrounding:        lookupBool("BRIDGE_INCLUDE_GROUNDING", true),
 		SearchTimeout:           time.Duration(lookupPositiveInt("BRIDGE_SEARCH_TIMEOUT_MS", 180000, 10000)) * time.Millisecond,
 		Temporary:               lookupBool("BRIDGE_TEMPORARY", false),

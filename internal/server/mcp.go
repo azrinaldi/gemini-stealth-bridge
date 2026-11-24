@@ -286,7 +286,7 @@ func mcpWebSearchToolDef() map[string]any {
 				},
 				"model": map[string]any{
 					"type":        "string",
-					"description": "Optional model override. Omit to use the account's default model; any id from GET /v1/models is accepted.",
+					"description": "Optional model override. Omit to use the real account's default model; guest-free is not supported by web_search.",
 				},
 				"timeout_seconds": map[string]any{
 					"type":        "integer",
@@ -305,6 +305,9 @@ func mcpWebSearchToolDef() map[string]any {
 // written-out list of names here. A caller that wants a specific tier passes it
 // as the tool's `model` argument.
 func resolveSearchModel(a *AccountState, requested string) *gemini.ModelInfo {
+	if a.Guest {
+		return nil
+	}
 	return resolveModelOnAccount(a, requested)
 }
 
@@ -319,6 +322,9 @@ func resolveSearchModel(a *AccountState, requested string) *gemini.ModelInfo {
 // the whole call, including failover, and every attempt is logged with its own
 // timing so a slow search can be told apart from a stuck one.
 func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, requestedModel string, timeout time.Duration) (string, error) {
+	if gemini.IsGuestModelRequest(requestedModel) {
+		return "", transport.NewUpstreamError("guest-free does not support MCP web_search; use a real account model", 400, "unsupported_guest_feature", nil, nil)
+	}
 	startedAt := time.Now()
 	if timeout <= 0 {
 		timeout = s.mcpSearchTimeout(0)
@@ -326,7 +332,7 @@ func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, reque
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	accts := s.scopedAccounts(scope)
+	accts := generationAccounts(s.scopedAccounts(scope), false)
 	if len(accts) == 0 {
 		return "", transport.NewUpstreamError("no accounts available for this api key", 503, "auth_unavailable", nil, nil)
 	}
@@ -426,6 +432,7 @@ func mcpErrorStatus(err error) int {
 // selection decides the head of the list; the remaining accounts follow as
 // failover targets.
 func (s *Server) orderSearchAccounts(accts []*AccountState, scope AuthScope, requestedModel string) []*AccountState {
+	accts = generationAccounts(accts, false)
 	ordered := make([]*AccountState, 0, len(accts))
 	seen := make(map[string]bool, len(accts))
 

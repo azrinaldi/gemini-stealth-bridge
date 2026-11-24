@@ -1,8 +1,8 @@
 package server
 
 import (
-	"strconv"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +67,9 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 func accountStatusLocked(a *AccountState, now time.Time) (status string, reason string) {
 	if a == nil {
 		return StatusUnknown, "account unavailable"
+	}
+	if a.Guest {
+		return StatusOK, "anonymous; upstream model and per-IP availability may change"
 	}
 	if a.Disabled {
 		return StatusDisabled, "paused by operator"

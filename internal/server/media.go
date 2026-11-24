@@ -504,6 +504,9 @@ func (s *Server) runMediaGenerationOnAccount(
 	userPrompt string,
 	extra ...mediaGenParams,
 ) ([]generatedMediaResult, string, error) {
+	if account.Guest {
+		return nil, "", transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil)
+	}
 	var params mediaGenParams
 	if len(extra) > 0 {
 		params = extra[0]
@@ -875,6 +878,10 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		return
 	}
 	requestedModel, _ := body["model"].(string)
+	if gemini.IsGuestModelRequest(requestedModel) {
+		sendChatError(w, false, transport.NewUpstreamError("guest-free does not support media generation", 400, "unsupported_guest_feature", nil, nil))
+		return
+	}
 	respFormat, _ := body["response_format"].(string)
 	respFormat = strings.ToLower(strings.TrimSpace(respFormat))
 	sizeStr, _ := body["size"].(string)
